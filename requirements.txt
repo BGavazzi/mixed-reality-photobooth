@@ -3,3 +3,7 @@ python-osc
 Pillow
 SpoutGL
 PyOpenGL
+
+# generation backends (backends/) — only the one(s) you use with --backend
+runwayml
+PyJWT

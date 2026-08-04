@@ -4,6 +4,7 @@ Simulate OSC triggers so you can exercise the bridge without Resolume open.
 Examples:
     python test_trigger.py --clip 1 1        # simulate Resolume layer 1 / clip 1 connect
     python test_trigger.py --prompt "a cat made of stained glass"
+    python test_trigger.py --resync           # pull live state from Resolume's REST API
 """
 
 import argparse
@@ -17,6 +18,8 @@ group = parser.add_mutually_exclusive_group(required=True)
 group.add_argument("--clip", nargs=2, type=int, metavar=("LAYER", "CLIP"),
                     help="simulate Resolume's own clip-connect OSC address")
 group.add_argument("--prompt", type=str, help="send freeform prompt text directly")
+group.add_argument("--resync", action="store_true",
+                    help="trigger a regeneration from Resolume's current live state")
 args = parser.parse_args()
 
 client = SimpleUDPClient(args.host, args.port)
@@ -26,6 +29,9 @@ if args.clip:
     address = f"/composition/layers/{layer}/clips/{clip}/connect"
     client.send_message(address, 1.0)
     print(f"sent {address} 1.0")
+elif args.resync:
+    client.send_message("/comfybridge/resync", 1)
+    print("sent /comfybridge/resync")
 else:
     client.send_message("/comfybridge/generate", args.prompt)
     print(f"sent /comfybridge/generate {args.prompt!r}")
