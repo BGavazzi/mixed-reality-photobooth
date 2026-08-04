@@ -6,7 +6,7 @@ without Resolume open. Displays whatever sender name you point it at
     python spout_viewer.py
     python spout_viewer.py --sender ComfyBridge
 
-Press q or Esc to close.
+Press q, Esc, or close the window to quit.
 """
 
 import argparse
@@ -38,15 +38,24 @@ with SpoutGL.SpoutReceiver() as receiver:
             buffer = array("B", repeat(0, width * height * 4))
             print(f"[viewer] connected: {width}x{height}")
 
+        window_created = False
         if buffer and result and not SpoutGL.helpers.isBufferEmpty(buffer):
             width = receiver.getSenderWidth()
             height = receiver.getSenderHeight()
             frame = np.frombuffer(buffer, dtype=np.uint8).reshape((height, width, 4))
             bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
             cv2.imshow(window_name, bgr)
+            window_created = True
 
         key = cv2.waitKey(1) & 0xFF
         if key in (ord("q"), 27):  # q or Esc
+            break
+
+        # cv2 doesn't wire the window's own close (X) button to anything by
+        # default — clicking it just hides the window and the loop above
+        # would silently recreate it on the next frame. Checking visibility
+        # here is what actually makes the X button work.
+        if window_created and cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
             break
 
         receiver.waitFrameSync(args.sender, 10)
