@@ -42,6 +42,7 @@ OSC_LISTEN_IP = "0.0.0.0"
 OSC_LISTEN_PORT = 9000
 MANUAL_TRIGGER_ADDRESS = "/comfybridge/generate"  # arg0: freeform prompt text
 VIDEO_TRIGGER_ADDRESS = "/comfybridge/generate_video"  # arg0: freeform prompt text (ComfyUI backend only)
+PLAY_FILE_ADDRESS = "/comfybridge/play_file"  # arg0: local video file path, played as-is (no generation)
 RESYNC_TRIGGER_ADDRESS = "/comfybridge/resync"  # no args: pull Resolume state
 
 RESYNC_STYLE_SUFFIX = "digital generative art, VJ visual, vivid colors, high detail"
@@ -123,8 +124,8 @@ class VideoLoopPlayer:
             if not ok:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop back to start
                 continue
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            self.frame_buffer.set_image(Image.fromarray(rgb))
+            rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA)
+            self.frame_buffer.set_image(Image.fromarray(rgba))
             time.sleep(delay)
         cap.release()
 
@@ -137,16 +138,19 @@ class VideoPlaybackManager:
         self.frame_buffer = frame_buffer
         self.lock = threading.Lock()
         self.current: VideoLoopPlayer = None
+        self.current_owned = False  # whether the bridge created current.path (and should delete it)
 
-    def play(self, path: str):
+    def play(self, path: str, delete_on_replace: bool = True):
         with self.lock:
             if self.current is not None:
                 self.current.stop()
-                try:
-                    os.remove(self.current.path)
-                except OSError:
-                    pass
+                if self.current_owned:
+                    try:
+                        os.remove(self.current.path)
+                    except OSError:
+                        pass
             self.current = VideoLoopPlayer(self.frame_buffer, path)
+            self.current_owned = delete_on_replace
             self.current.start()
 
 
@@ -247,6 +251,21 @@ def make_video_trigger_handler(backend, frame_buffer, video_manager):
     return handler
 
 
+def make_play_file_handler(video_manager):
+    def handler(address: str, *args):
+        if not args:
+            print("[osc] play_file trigger with no path, ignoring")
+            return
+        path = str(args[0])
+        if not os.path.isfile(path):
+            print(f"[osc] play_file: no such file {path!r}")
+            return
+        print(f"[osc] playing local file -> {path!r}")
+        video_manager.play(path, delete_on_replace=False)
+
+    return handler
+
+
 def make_resync_handler(backend, frame_buffer, resolume_url: str):
     def handler(address: str, *args):
         try:
@@ -290,6 +309,7 @@ def main():
     disp.map("/composition/layers/*/clips/*/connect", make_clip_trigger_handler(backend, frame_buffer, args.prompts))
     disp.map(MANUAL_TRIGGER_ADDRESS, make_manual_trigger_handler(backend, frame_buffer))
     disp.map(VIDEO_TRIGGER_ADDRESS, make_video_trigger_handler(backend, frame_buffer, video_manager))
+    disp.map(PLAY_FILE_ADDRESS, make_play_file_handler(video_manager))
     disp.map(RESYNC_TRIGGER_ADDRESS, make_resync_handler(backend, frame_buffer, args.resolume_url))
 
     server = osc_server.ThreadingOSCUDPServer((OSC_LISTEN_IP, args.osc_port), disp)
