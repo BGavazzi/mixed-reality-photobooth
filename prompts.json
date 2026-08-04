@@ -1,0 +1,8 @@
+{
+    "_comment": "Keys are 'L<layer>C<clip>' matching Resolume's OSC clip-connect address (/composition/layers/<layer>/clips/<clip>/connect). Trigger any of these clips in Resolume and the bridge generates that look. '_default' is used when a triggered clip has no mapping.",
+    "_default": "abstract generative art, colorful, high detail",
+    "L1C1": "neon jellyfish, cyberpunk city, glowing, night, high detail",
+    "L1C2": "molten lava landscape, cracked obsidian, abstract, dramatic lighting",
+    "L1C3": "geometric kaleidoscope, vaporwave gradient, symmetrical",
+    "L1C4": "bioluminescent forest, fog, particles, cinematic"
+}
