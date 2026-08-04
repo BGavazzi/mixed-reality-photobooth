@@ -24,7 +24,9 @@ Quick-and-dirty demo, not production code:
 """
 
 import argparse
+import os
 import re
+import tempfile
 import threading
 import time
 
@@ -39,6 +41,7 @@ from backends import BACKENDS
 OSC_LISTEN_IP = "0.0.0.0"
 OSC_LISTEN_PORT = 9000
 MANUAL_TRIGGER_ADDRESS = "/comfybridge/generate"  # arg0: freeform prompt text
+VIDEO_TRIGGER_ADDRESS = "/comfybridge/generate_video"  # arg0: freeform prompt text (ComfyUI backend only)
 RESYNC_TRIGGER_ADDRESS = "/comfybridge/resync"  # no args: pull Resolume state
 
 RESYNC_STYLE_SUFFIX = "digital generative art, VJ visual, vivid colors, high detail"
@@ -93,6 +96,60 @@ def spout_sender_loop(frame_buffer: FrameBuffer, stop_event: threading.Event):
             time.sleep(1.0 / SPOUT_FPS)
 
 
+# --- video playback (loops a generated clip's frames into the FrameBuffer) --
+
+class VideoLoopPlayer:
+    def __init__(self, frame_buffer: FrameBuffer, path: str):
+        self.frame_buffer = frame_buffer
+        self.path = path
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=2)
+
+    def _run(self):
+        import cv2
+
+        cap = cv2.VideoCapture(self.path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 24
+        delay = 1.0 / fps
+        while not self.stop_event.is_set():
+            ok, frame_bgr = cap.read()
+            if not ok:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop back to start
+                continue
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            self.frame_buffer.set_image(Image.fromarray(rgb))
+            time.sleep(delay)
+        cap.release()
+
+
+class VideoPlaybackManager:
+    """Owns whatever video is currently looping into the FrameBuffer, so a
+    new generation can cleanly replace the previous one."""
+
+    def __init__(self, frame_buffer: FrameBuffer):
+        self.frame_buffer = frame_buffer
+        self.lock = threading.Lock()
+        self.current: VideoLoopPlayer = None
+
+    def play(self, path: str):
+        with self.lock:
+            if self.current is not None:
+                self.current.stop()
+                try:
+                    os.remove(self.current.path)
+                except OSError:
+                    pass
+            self.current = VideoLoopPlayer(self.frame_buffer, path)
+            self.current.start()
+
+
 # --- trigger -> generation plumbing -----------------------------------------
 
 CLIP_CONNECT_RE = re.compile(r"/composition/layers/(\d+)/clips/(\d+)/connect")
@@ -142,6 +199,30 @@ def make_clip_trigger_handler(backend, frame_buffer, prompts_path):
     return handler
 
 
+def run_video_generation(backend, frame_buffer: FrameBuffer, video_manager: VideoPlaybackManager, prompt_text: str):
+    if not hasattr(backend, "generate_video"):
+        print(f"[bridge] backend {backend.__class__.__name__} does not support generate_video, ignoring trigger")
+        return
+    if not frame_buffer.busy.acquire(blocking=False):
+        print("[bridge] busy generating, ignoring trigger")
+        return
+
+    def worker():
+        try:
+            video_bytes = backend.generate_video(prompt_text)
+            fd, tmp_path = tempfile.mkstemp(suffix=".mp4", prefix="comfybridge_")
+            with os.fdopen(fd, "wb") as f:
+                f.write(video_bytes)
+            video_manager.play(tmp_path)
+            print("[bridge] video playback started")
+        except Exception as exc:
+            print(f"[bridge] video generation failed: {exc}")
+        finally:
+            frame_buffer.busy.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def make_manual_trigger_handler(backend, frame_buffer):
     def handler(address: str, *args):
         if not args:
@@ -150,6 +231,18 @@ def make_manual_trigger_handler(backend, frame_buffer):
         prompt_text = str(args[0])
         print(f"[osc] manual trigger -> {prompt_text!r}")
         run_generation(backend, frame_buffer, prompt_text)
+
+    return handler
+
+
+def make_video_trigger_handler(backend, frame_buffer, video_manager):
+    def handler(address: str, *args):
+        if not args:
+            print("[osc] video trigger with no prompt text, ignoring")
+            return
+        prompt_text = str(args[0])
+        print(f"[osc] video trigger -> {prompt_text!r}")
+        run_video_generation(backend, frame_buffer, video_manager, prompt_text)
 
     return handler
 
@@ -185,6 +278,7 @@ def main():
         backend = BACKENDS[args.backend]()
 
     frame_buffer = FrameBuffer(SPOUT_WIDTH, SPOUT_HEIGHT)
+    video_manager = VideoPlaybackManager(frame_buffer)
     stop_event = threading.Event()
 
     spout_thread = threading.Thread(
@@ -195,6 +289,7 @@ def main():
     disp = dispatcher.Dispatcher()
     disp.map("/composition/layers/*/clips/*/connect", make_clip_trigger_handler(backend, frame_buffer, args.prompts))
     disp.map(MANUAL_TRIGGER_ADDRESS, make_manual_trigger_handler(backend, frame_buffer))
+    disp.map(VIDEO_TRIGGER_ADDRESS, make_video_trigger_handler(backend, frame_buffer, video_manager))
     disp.map(RESYNC_TRIGGER_ADDRESS, make_resync_handler(backend, frame_buffer, args.resolume_url))
 
     server = osc_server.ThreadingOSCUDPServer((OSC_LISTEN_IP, args.osc_port), disp)

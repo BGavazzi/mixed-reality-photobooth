@@ -1,6 +1,8 @@
 requests
 python-osc
 Pillow
+numpy
+opencv-python
 SpoutGL
 PyOpenGL
 

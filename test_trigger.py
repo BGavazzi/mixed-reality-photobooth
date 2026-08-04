@@ -4,6 +4,7 @@ Simulate OSC triggers so you can exercise the bridge without Resolume open.
 Examples:
     python test_trigger.py --clip 1 1        # simulate Resolume layer 1 / clip 1 connect
     python test_trigger.py --prompt "a cat made of stained glass"
+    python test_trigger.py --video "a cat made of stained glass, slow pan"  # ComfyUI backend only
     python test_trigger.py --resync           # pull live state from Resolume's REST API
 """
 
@@ -17,7 +18,8 @@ parser.add_argument("--port", type=int, default=9000)
 group = parser.add_mutually_exclusive_group(required=True)
 group.add_argument("--clip", nargs=2, type=int, metavar=("LAYER", "CLIP"),
                     help="simulate Resolume's own clip-connect OSC address")
-group.add_argument("--prompt", type=str, help="send freeform prompt text directly")
+group.add_argument("--prompt", type=str, help="send freeform prompt text directly (still image)")
+group.add_argument("--video", type=str, help="send freeform prompt text for video generation (ComfyUI backend only)")
 group.add_argument("--resync", action="store_true",
                     help="trigger a regeneration from Resolume's current live state")
 args = parser.parse_args()
@@ -32,6 +34,9 @@ if args.clip:
 elif args.resync:
     client.send_message("/comfybridge/resync", 1)
     print("sent /comfybridge/resync")
+elif args.video:
+    client.send_message("/comfybridge/generate_video", args.video)
+    print(f"sent /comfybridge/generate_video {args.video!r}")
 else:
     client.send_message("/comfybridge/generate", args.prompt)
     print(f"sent /comfybridge/generate {args.prompt!r}")
