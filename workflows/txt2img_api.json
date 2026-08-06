@@ -2,30 +2,30 @@
     "3": {
         "class_type": "KSampler",
         "inputs": {
-            "cfg": 7,
+            "cfg": 6,
             "denoise": 1,
             "latent_image": ["5", 0],
             "model": ["4", 0],
             "negative": ["7", 0],
             "positive": ["6", 0],
-            "sampler_name": "euler",
-            "scheduler": "normal",
+            "sampler_name": "dpmpp_2m",
+            "scheduler": "karras",
             "seed": 0,
-            "steps": 20
+            "steps": 30
         }
     },
     "4": {
         "class_type": "CheckpointLoaderSimple",
         "inputs": {
-            "ckpt_name": "v1-5-pruned-emaonly.safetensors"
+            "ckpt_name": "RealVisXL_V5.0_fp16.safetensors"
         }
     },
     "5": {
         "class_type": "EmptyLatentImage",
         "inputs": {
             "batch_size": 1,
-            "height": 512,
-            "width": 512
+            "height": 1024,
+            "width": 1024
         }
     },
     "6": {
@@ -39,7 +39,7 @@
         "class_type": "CLIPTextEncode",
         "inputs": {
             "clip": ["4", 1],
-            "text": "blurry, low quality, watermark, text"
+            "text": "blurry, low quality, watermark, text, deformed face, disfigured, bad anatomy, extra limbs, mutated hands, poorly drawn face, asymmetric eyes"
         }
     },
     "8": {

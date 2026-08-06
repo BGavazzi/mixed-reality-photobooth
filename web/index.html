@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Mixed-Reality Photo Booth</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --border: #2a2f3a;
+    --text: #e8eaed; --dim: #8b93a3; --accent: #6ea8fe; --accent2: #d88bff;
+    --good: #4fd18b; --warn: #f5b942; --bad: #f56a6a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header span { color: var(--dim); font-size: 12px; }
+  main { flex: 1; display: grid; grid-template-columns: 300px 1fr 300px; gap: 1px; background: var(--border); overflow: hidden; }
+  .col { background: var(--bg); overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 14px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); margin: 0 0 10px; }
+  .dropzone {
+    border: 2px dashed var(--border); border-radius: 8px; padding: 24px 10px; text-align: center;
+    color: var(--dim); cursor: pointer; font-size: 13px; transition: border-color .15s;
+  }
+  .dropzone:hover, .dropzone.drag { border-color: var(--accent); color: var(--text); }
+  .thumb-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .thumb { background: var(--panel2); border-radius: 6px; overflow: hidden; aspect-ratio: 1; position: relative; }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb label {
+    position: absolute; bottom: 0; left: 0; right: 0; padding: 3px 6px; font-size: 10px;
+    background: rgba(0,0,0,.6); color: #fff;
+  }
+  .illum-line { font-size: 12px; color: var(--text); margin: 3px 0; }
+  .illum-line b { color: var(--accent2); font-weight: 600; }
+  textarea, input[type=text] {
+    width: 100%; background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 8px; font-size: 13px; font-family: inherit; resize: vertical;
+  }
+  label.field { font-size: 11px; color: var(--dim); display: block; margin: 10px 0 4px; }
+  input[type=range] { width: 100%; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row .val { font-size: 11px; color: var(--dim); width: 34px; text-align: right; }
+  button {
+    background: var(--accent); color: #0b0d12; border: none; border-radius: 6px;
+    padding: 9px 14px; font-size: 13px; font-weight: 600; cursor: pointer; width: 100%;
+  }
+  button:disabled { background: var(--border); color: var(--dim); cursor: not-allowed; }
+  button.secondary { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
+  button.small { width: auto; padding: 5px 10px; font-size: 11px; }
+  button.active-toggle { background: var(--accent2); color: #1a0620; }
+  .stage-canvas-wrap { flex: 1; display: flex; align-items: center; justify-content: center; padding: 20px; overflow: auto; background: repeating-conic-gradient(#1a1d24 0% 25%, #14161c 0% 50%) 50% / 20px 20px; }
+  #compositeCanvas { max-width: 100%; max-height: 100%; box-shadow: 0 4px 24px rgba(0,0,0,.5); cursor: default; }
+  #compositeCanvas.moving { cursor: grab; }
+  #compositeCanvas.moving:active { cursor: grabbing; }
+  #compositeCanvas.drawing { cursor: crosshair; }
+  .progress-bar { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 8px; }
+  .progress-bar > div { height: 100%; background: var(--accent); width: 0%; transition: width .15s; }
+  .layer-row {
+    display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 6px 4px; border-bottom: 1px solid var(--border);
+    border-radius: 4px; cursor: pointer;
+  }
+  .layer-row:last-child { border-bottom: none; }
+  .layer-row.active { background: rgba(110,168,254,.12); }
+  .layer-row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .layer-row input[type=range] { width: 54px; }
+  .layer-row .reorder { display: flex; flex-direction: column; gap: 1px; }
+  .layer-row .reorder button, .layer-row .del button {
+    width: auto; padding: 0 4px; font-size: 9px; background: var(--panel2); color: var(--dim); border: 1px solid var(--border);
+  }
+  .log { font-family: "SF Mono", Consolas, monospace; font-size: 10.5px; color: var(--dim); max-height: 140px; overflow-y: auto; line-height: 1.5; }
+  .log .ev-done { color: var(--good); }
+  .log .ev-error { color: var(--bad); }
+  .badge { display: inline-block; font-size: 10px; padding: 2px 6px; border-radius: 10px; background: var(--panel2); color: var(--dim); }
+  .badge.on { background: var(--good); color: #06210f; }
+  footer { padding: 8px 20px; border-top: 1px solid var(--border); font-size: 11px; color: var(--dim); display: flex; justify-content: space-between; }
+  input[type=file] { display: none; }
+  .hint { font-size: 11px; color: var(--dim); margin-top: 6px; line-height: 1.4; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Mixed-Reality Photo Booth</h1>
+  <span>ComfyUI + SDXL ControlNet · rotoscope → pose → depth → relight → regenerate</span>
+  <span id="connStatus" style="margin-left:auto" class="badge">connecting…</span>
+</header>
+
+<main>
+  <!-- LEFT: upload + pipeline stages -->
+  <div class="col">
+    <div class="panel">
+      <h2>1. Subject Photo</h2>
+      <div class="dropzone" id="dropzone">Click or drop a photo<br>(the model to keep untouched)</div>
+      <input type="file" id="fileInput" accept="image/*">
+    </div>
+
+    <div class="panel" id="stagesPanel" style="display:none">
+      <h2>2. Extracted Layers</h2>
+      <div class="thumb-grid">
+        <div class="thumb"><img id="thumbCutout"><label>Rotoscope</label></div>
+        <div class="thumb"><img id="thumbPose"><label>Pose</label></div>
+        <div class="thumb"><img id="thumbDepth"><label>Depth</label></div>
+        <div class="thumb" id="thumbIllumBox"><label>Illumination</label></div>
+      </div>
+      <div id="illumText" style="margin-top:10px"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Project</h2>
+      <button class="secondary small" id="btnExportJson" style="width:100%;margin-bottom:6px" disabled>Export Project (.json)</button>
+      <button class="secondary small" id="btnImportJson" style="width:100%">Import Project (.json)</button>
+      <input type="file" id="importInput" accept="application/json">
+    </div>
+  </div>
+
+  <!-- CENTER: canvas + progress -->
+  <div class="col" style="padding:0">
+    <div class="stage-canvas-wrap">
+      <canvas id="compositeCanvas" width="768" height="768"></canvas>
+    </div>
+    <div class="panel" style="margin:14px;border-radius:8px" id="progressPanel">
+      <h2>Live Generation</h2>
+      <div id="progressText" style="font-size:12px;color:var(--dim)">idle</div>
+      <div class="progress-bar"><div id="progressFill"></div></div>
+      <div class="log" id="eventLog"></div>
+    </div>
+  </div>
+
+  <!-- RIGHT: scene prompt + layers + export -->
+  <div class="col">
+    <div class="panel">
+      <h2>3. Generate Background</h2>
+      <label class="field">Scene prompt (respects, or overrides, the detected lighting)</label>
+      <textarea id="scenePrompt" rows="3" placeholder="e.g. sunlit rooftop terrace at golden hour, city skyline"></textarea>
+      <label class="field">ControlNet depth strength <span class="val" id="cnVal">0.75</span></label>
+      <input type="range" id="cnStrength" min="0" max="1.5" step="0.05" value="0.75">
+      <label class="field">Denoise <span class="val" id="dnVal">0.85</span></label>
+      <input type="range" id="denoise" min="0.3" max="1" step="0.05" value="0.85">
+      <div style="margin-top:12px">
+        <button id="btnGenerate" disabled>Generate Background</button>
+      </div>
+      <button class="secondary small" id="btnAddObject" style="width:100%;margin-top:8px" disabled>+ Add Object (draw region): OFF</button>
+      <div class="hint">Draws a box on the canvas, asks what goes there, and inpaints just that region onto its own layer — the rest of the composite is untouched.</div>
+    </div>
+
+    <div class="panel">
+      <h2>4. Layers &amp; Composition</h2>
+      <div id="layerList"></div>
+      <button class="secondary small" id="btnAddImageLayer" style="width:100%;margin-top:10px">+ Add Image Layer</button>
+      <input type="file" id="layerFileInput" accept="image/*">
+      <label class="field">Selected layer scale <span class="val" id="scaleVal">1.00</span></label>
+      <input type="range" id="layerScale" min="0.3" max="2" step="0.01" value="1">
+      <button class="secondary small" id="btnMove" style="width:100%;margin-top:8px">Drag to reposition selected layer: OFF</button>
+    </div>
+
+    <div class="panel">
+      <h2>Export</h2>
+      <button id="btnExportPng" disabled>Flatten &amp; Download PNG</button>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <span id="footerStatus">no subject loaded</span>
+  <span>quick text sandbox: <input type="text" id="quickPrompt" placeholder="type + enter for a plain live-preview test" style="width:340px;display:inline-block;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:3px 6px;font-size:11px"></span>
+</footer>
+
+<script>
+let nextLayerId = 1;
+const state = {
+  original: null, cutout: null, mask: null, pose: null, depth: null,
+  illumination: null,
+  layers: [], // bottom-to-top: {id, name, kind, src, visible, opacity, x, y, scale}
+  activeLayerId: null,
+  lastPrompt: '', lastControlnetStrength: 0.75, lastDenoise: 0.85,
+  drawingRect: null, // {x0,y0,x1,y1} in canvas space, while drawing a region
+};
+const imgCache = {};
+
+function loadImg(src) {
+  return new Promise((resolve) => {
+    if (imgCache[src]) return resolve(imgCache[src]);
+    const im = new Image();
+    im.onload = () => { imgCache[src] = im; resolve(im); };
+    im.src = src;
+  });
+}
+
+function findLayer(id) { return state.layers.find(l => l.id === id); }
+function activeLayer() { return state.activeLayerId ? findLayer(state.activeLayerId) : null; }
+
+const canvas = document.getElementById('compositeCanvas');
+const ctx = canvas.getContext('2d');
+
+async function redraw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (const layer of state.layers) {
+    if (!layer.visible || !layer.src) continue;
+    const im = await loadImg(layer.src);
+    ctx.globalAlpha = layer.opacity;
+    const w = canvas.width * layer.scale, h = canvas.height * layer.scale;
+    const x = (canvas.width - w) / 2 + layer.x, y = (canvas.height - h) / 2 + layer.y;
+    ctx.drawImage(im, x, y, w, h);
+  }
+  ctx.globalAlpha = 1;
+
+  if (state.drawingRect) {
+    const r = state.drawingRect;
+    ctx.save();
+    ctx.strokeStyle = '#d88bff';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(Math.min(r.x0, r.x1), Math.min(r.y0, r.y1), Math.abs(r.x1 - r.x0), Math.abs(r.y1 - r.y0));
+    ctx.restore();
+  }
+}
+
+async function getCompositeDataUrl() {
+  await redraw();
+  const flat = document.createElement('canvas');
+  flat.width = canvas.width; flat.height = canvas.height;
+  const fctx = flat.getContext('2d');
+  fctx.drawImage(canvas, 0, 0);
+  return flat.toDataURL('image/png');
+}
+
+// --- websocket -------------------------------------------------------------
+
+let ws;
+function connectWs() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => setConn(true);
+  ws.onclose = () => { setConn(false); setTimeout(connectWs, 1500); };
+  ws.onerror = () => setConn(false);
+  ws.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) {
+      const blob = new Blob([ev.data], { type: 'image/jpeg' });
+      previewUrl = URL.createObjectURL(blob);
+      document.getElementById('progressPanel').style.display = 'block';
+      drawLivePreview();
+      return;
+    }
+    handleServerEvent(JSON.parse(ev.data));
+  };
+}
+function setConn(ok) {
+  const el = document.getElementById('connStatus');
+  el.textContent = ok ? 'connected' : 'reconnecting…';
+  el.className = 'badge' + (ok ? ' on' : '');
+}
+
+let previewUrl = null;
+async function drawLivePreview() {
+  if (!previewUrl) return;
+  const im = await loadImg(previewUrl);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(im, 0, 0, canvas.width, canvas.height);
+}
+
+function logEvent(text, cls) {
+  const log = document.getElementById('eventLog');
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = text;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+let pendingGeneration = null; // {kind, regionMask} — context for the in-flight job
+
+function handleServerEvent(msg) {
+  const panel = document.getElementById('progressPanel');
+  if (msg.type === 'status') {
+    if (msg.queue_remaining != null) logEvent(`queue remaining: ${msg.queue_remaining}`);
+  } else if (msg.type === 'queued') {
+    panel.style.display = 'block';
+    document.getElementById('progressText').textContent = 'queued…';
+    document.getElementById('eventLog').innerHTML = '';
+    previewUrl = null;
+    logEvent(`queued prompt_id=${msg.prompt_id}`);
+  } else if (msg.type === 'executing') {
+    document.getElementById('progressText').textContent = `executing node ${msg.node}`;
+    logEvent(`executing node ${msg.node}`);
+  } else if (msg.type === 'progress') {
+    const pct = msg.max ? Math.round(100 * msg.value / msg.max) : 0;
+    document.getElementById('progressFill').style.width = pct + '%';
+    document.getElementById('progressText').textContent = `sampling step ${msg.value}/${msg.max}`;
+  } else if (msg.type === 'done') {
+    document.getElementById('progressFill').style.width = '100%';
+    document.getElementById('progressText').textContent = 'done';
+    logEvent('generation complete', 'ev-done');
+    handleGenerationDone(msg);
+  } else if (msg.type === 'error') {
+    logEvent('error: ' + msg.message, 'ev-error');
+    document.getElementById('progressText').textContent = 'error — see log';
+    setBusy(false);
+    redraw();
+  }
+}
+
+async function handleGenerationDone(msg) {
+  const resultUrl = 'data:image/png;base64,' + msg.image_base64;
+
+  if (msg.kind === 'region' && pendingGeneration) {
+    const clipped = await clipToMask(resultUrl, pendingGeneration.regionMaskUrl);
+    state.layers.push({
+      id: 'obj_' + (nextLayerId++), name: pendingGeneration.label, kind: 'object',
+      src: clipped, visible: true, opacity: 1, x: 0, y: 0, scale: 1,
+    });
+    state.activeLayerId = state.layers[state.layers.length - 1].id;
+  } else {
+    // plain background regen (or quick-sandbox image) replaces the base background layer
+    const bg = findLayer('background');
+    if (bg) bg.src = resultUrl;
+  }
+
+  pendingGeneration = null;
+  document.getElementById('btnExportPng').disabled = false;
+  document.getElementById('btnExportJson').disabled = false;
+  setBusy(false);
+  renderLayerPanel();
+  redraw();
+}
+
+function clipToMask(imageUrl, maskUrl) {
+  return Promise.all([loadImg(imageUrl), loadImg(maskUrl)]).then(([im, maskIm]) => {
+    const c = document.createElement('canvas');
+    c.width = canvas.width; c.height = canvas.height;
+    const cctx = c.getContext('2d');
+    cctx.drawImage(im, 0, 0, c.width, c.height);
+    cctx.globalCompositeOperation = 'destination-in';
+    cctx.drawImage(maskIm, 0, 0, c.width, c.height);
+    return c.toDataURL('image/png');
+  });
+}
+
+function setBusy(busy) {
+  document.getElementById('btnGenerate').disabled = busy || !state.cutout;
+  document.getElementById('btnAddObject').disabled = busy || !state.cutout;
+}
+
+// --- upload + analyze --------------------------------------------------------
+
+const fileInput = document.getElementById('fileInput');
+const dropzone = document.getElementById('dropzone');
+dropzone.onclick = () => fileInput.click();
+dropzone.ondragover = (e) => { e.preventDefault(); dropzone.classList.add('drag'); };
+dropzone.ondragleave = () => dropzone.classList.remove('drag');
+dropzone.ondrop = (e) => {
+  e.preventDefault(); dropzone.classList.remove('drag');
+  if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+};
+fileInput.onchange = () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); };
+
+async function handleFile(file) {
+  dropzone.textContent = 'analyzing… (rotoscope takes ~20s)';
+  const form = new FormData();
+  form.append('file', file);
+  const resp = await fetch('/api/analyze', { method: 'POST', body: form });
+  if (!resp.ok) { dropzone.textContent = 'analysis failed — click to retry'; return; }
+  const data = await resp.json();
+
+  state.original = 'data:image/png;base64,' + data.original;
+  state.cutout = 'data:image/png;base64,' + data.cutout;
+  state.mask = 'data:image/png;base64,' + data.mask;
+  state.pose = 'data:image/png;base64,' + data.pose;
+  state.depth = 'data:image/png;base64,' + data.depth;
+  state.illumination = data.illumination;
+
+  state.layers = [
+    { id: 'background', name: 'Background', kind: 'background', src: state.original, visible: true, opacity: 1, x: 0, y: 0, scale: 1 },
+    { id: 'depth', name: 'Depth (debug)', kind: 'debug', src: state.depth, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1 },
+    { id: 'pose', name: 'Pose (debug)', kind: 'debug', src: state.pose, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1 },
+    { id: 'subject', name: 'Subject', kind: 'subject', src: state.cutout, visible: true, opacity: 1, x: 0, y: 0, scale: 1 },
+  ];
+  state.activeLayerId = 'subject';
+
+  document.getElementById('thumbCutout').src = state.cutout;
+  document.getElementById('thumbPose').src = state.pose;
+  document.getElementById('thumbDepth').src = state.depth;
+  document.getElementById('thumbIllumBox').style.background =
+    `linear-gradient(135deg, hsl(${data.illumination.warmth === 'warm' ? 35 : data.illumination.warmth === 'cool' ? 210 : 200}, 40%, 30%), #14161c)`;
+  document.getElementById('illumText').innerHTML =
+    `<div class="illum-line"><b>${data.illumination.descriptor}</b></div>` +
+    `<div class="illum-line">direction: ${data.illumination.direction} · contrast: ${data.illumination.contrast}</div>`;
+
+  document.getElementById('stagesPanel').style.display = 'block';
+  document.getElementById('scenePrompt').value =
+    `${data.illumination.descriptor}, editorial photography backdrop, high detail`;
+  dropzone.textContent = 'Click or drop a photo (the model to keep untouched)';
+  document.getElementById('footerStatus').textContent = 'subject analyzed — ready to generate a background';
+  setBusy(false);
+  renderLayerPanel();
+  redraw();
+}
+
+// --- generate background -----------------------------------------------------
+
+document.getElementById('cnStrength').oninput = (e) => document.getElementById('cnVal').textContent = e.target.value;
+document.getElementById('denoise').oninput = (e) => document.getElementById('dnVal').textContent = e.target.value;
+
+document.getElementById('btnGenerate').onclick = () => {
+  if (!state.cutout) return;
+  const prompt = document.getElementById('scenePrompt').value.trim();
+  const controlnet_strength = parseFloat(document.getElementById('cnStrength').value);
+  const denoise = parseFloat(document.getElementById('denoise').value);
+  state.lastPrompt = prompt; state.lastControlnetStrength = controlnet_strength; state.lastDenoise = denoise;
+  setBusy(true);
+  ws.send(JSON.stringify({
+    action: 'generate_background',
+    subject: state.original.split(',')[1],
+    mask: state.mask.split(',')[1],
+    depth: state.depth.split(',')[1],
+    prompt, controlnet_strength, denoise,
+  }));
+};
+
+document.getElementById('quickPrompt').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.target.value.trim()) {
+    document.getElementById('progressPanel').style.display = 'block';
+    ws.send(JSON.stringify({ action: 'generate_image', prompt: e.target.value.trim() }));
+  }
+});
+
+// --- layer panel ---------------------------------------------------------------
+
+function renderLayerPanel() {
+  const list = document.getElementById('layerList');
+  list.innerHTML = '';
+  // render top layer first (end of array = top of stack, visually on top of the list too)
+  for (let i = state.layers.length - 1; i >= 0; i--) {
+    const layer = state.layers[i];
+    const row = document.createElement('div');
+    row.className = 'layer-row' + (layer.id === state.activeLayerId ? ' active' : '');
+
+    const vis = document.createElement('input');
+    vis.type = 'checkbox'; vis.checked = layer.visible;
+    vis.onchange = (e) => { layer.visible = e.target.checked; redraw(); };
+
+    const name = document.createElement('span');
+    name.className = 'name'; name.textContent = layer.name;
+    name.onclick = () => selectLayer(layer.id);
+
+    const op = document.createElement('input');
+    op.type = 'range'; op.min = 0; op.max = 1; op.step = 0.05; op.value = layer.opacity;
+    op.oninput = (e) => { layer.opacity = parseFloat(e.target.value); redraw(); };
+
+    const reorder = document.createElement('div');
+    reorder.className = 'reorder';
+    const up = document.createElement('button'); up.className = 'small'; up.textContent = '▲';
+    up.onclick = (e) => { e.stopPropagation(); moveLayer(layer.id, 1); };
+    const down = document.createElement('button'); down.className = 'small'; down.textContent = '▼';
+    down.onclick = (e) => { e.stopPropagation(); moveLayer(layer.id, -1); };
+    reorder.append(up, down);
+
+    row.append(vis, name, op, reorder);
+
+    if (layer.kind === 'object' || layer.kind === 'image') {
+      const del = document.createElement('button');
+      del.className = 'small'; del.textContent = '×'; del.style.width = 'auto';
+      del.onclick = (e) => { e.stopPropagation(); deleteLayer(layer.id); };
+      row.appendChild(del);
+    }
+
+    row.onclick = () => selectLayer(layer.id);
+    list.appendChild(row);
+  }
+}
+
+function selectLayer(id) {
+  state.activeLayerId = id;
+  const layer = findLayer(id);
+  document.getElementById('layerScale').value = layer ? layer.scale : 1;
+  document.getElementById('scaleVal').textContent = (layer ? layer.scale : 1).toFixed(2);
+  renderLayerPanel();
+}
+
+function moveLayer(id, delta) {
+  const idx = state.layers.findIndex(l => l.id === id);
+  const newIdx = idx + delta;
+  if (newIdx < 0 || newIdx >= state.layers.length) return;
+  [state.layers[idx], state.layers[newIdx]] = [state.layers[newIdx], state.layers[idx]];
+  renderLayerPanel(); redraw();
+}
+
+function deleteLayer(id) {
+  state.layers = state.layers.filter(l => l.id !== id);
+  if (state.activeLayerId === id) state.activeLayerId = state.layers.length ? state.layers[state.layers.length - 1].id : null;
+  renderLayerPanel(); redraw();
+}
+
+document.getElementById('layerScale').oninput = (e) => {
+  const layer = activeLayer();
+  if (!layer) return;
+  layer.scale = parseFloat(e.target.value);
+  document.getElementById('scaleVal').textContent = e.target.value;
+  redraw();
+};
+
+document.getElementById('btnAddImageLayer').onclick = () => document.getElementById('layerFileInput').click();
+document.getElementById('layerFileInput').onchange = (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const id = 'img_' + (nextLayerId++);
+    state.layers.push({ id, name: file.name, kind: 'image', src: reader.result, visible: true, opacity: 1, x: 0, y: 0, scale: 1 });
+    state.activeLayerId = id;
+    renderLayerPanel(); redraw();
+  };
+  reader.readAsDataURL(file);
+};
+
+// --- drag to reposition selected layer -----------------------------------------
+
+let moveMode = false;
+document.getElementById('btnMove').onclick = () => {
+  moveMode = !moveMode;
+  if (moveMode) drawMode = false, updateDrawBtn();
+  document.getElementById('btnMove').textContent = 'Drag to reposition selected layer: ' + (moveMode ? 'ON' : 'OFF');
+  document.getElementById('btnMove').classList.toggle('active-toggle', moveMode);
+  canvas.classList.toggle('moving', moveMode);
+};
+let dragging = false, dragStart = null;
+canvas.addEventListener('pointerdown', (e) => {
+  if (moveMode) {
+    const layer = activeLayer();
+    if (!layer) return;
+    dragging = true;
+    dragStart = { clientX: e.clientX, clientY: e.clientY, ox: layer.x, oy: layer.y };
+  } else if (drawMode) {
+    const rect = canvas.getBoundingClientRect();
+    const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
+    const x = (e.clientX - rect.left) * sx, y = (e.clientY - rect.top) * sy;
+    state.drawingRect = { x0: x, y0: y, x1: x, y1: y };
+  }
+});
+window.addEventListener('pointermove', (e) => {
+  if (dragging) {
+    const layer = activeLayer();
+    if (!layer) return;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width, scaleY = canvas.height / rect.height;
+    layer.x = dragStart.ox + (e.clientX - dragStart.clientX) * scaleX;
+    layer.y = dragStart.oy + (e.clientY - dragStart.clientY) * scaleY;
+    redraw();
+  } else if (state.drawingRect) {
+    const rect = canvas.getBoundingClientRect();
+    const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
+    state.drawingRect.x1 = (e.clientX - rect.left) * sx;
+    state.drawingRect.y1 = (e.clientY - rect.top) * sy;
+    redraw();
+  }
+});
+window.addEventListener('pointerup', async () => {
+  dragging = false;
+  if (drawMode && state.drawingRect) {
+    const r = state.drawingRect;
+    state.drawingRect = null;
+    const w = Math.abs(r.x1 - r.x0), h = Math.abs(r.y1 - r.y0);
+    // SDXL can't render a recognizable object into a small masked patch —
+    // tested empirically down to ~30% of the canvas per side before shapes
+    // stopped forming distinctly (a squat/low-contrast object like a stool
+    // needs more room than a tall one like a plant, so this errs generous).
+    const minSize = Math.min(canvas.width, canvas.height) * 0.3;
+    if (w < minSize || h < minSize) {
+      alert(`That region is too small to generate a recognizable object into — draw at least ${Math.round(minSize)}×${Math.round(minSize)}px. Larger, simpler objects (furniture, plants, props) work best.`);
+      redraw();
+    } else {
+      await startRegionEdit(Math.min(r.x0, r.x1), Math.min(r.y0, r.y1), w, h);
+    }
+  }
+});
+
+// --- region draw tool (add object) ----------------------------------------------
+
+let drawMode = false;
+function updateDrawBtn() {
+  document.getElementById('btnAddObject').textContent = '+ Add Object (draw region): ' + (drawMode ? 'ON' : 'OFF');
+  document.getElementById('btnAddObject').classList.toggle('active-toggle', drawMode);
+  canvas.classList.toggle('drawing', drawMode);
+}
+document.getElementById('btnAddObject').onclick = () => {
+  drawMode = !drawMode;
+  if (drawMode) moveMode = false, canvas.classList.remove('moving');
+  updateDrawBtn();
+};
+
+async function startRegionEdit(x, y, w, h) {
+  const label = window.prompt('What goes in this region? (e.g. "a large potted plant")', '');
+  if (!label || !label.trim()) { redraw(); return; }
+
+  const maskCanvas = document.createElement('canvas');
+  maskCanvas.width = canvas.width; maskCanvas.height = canvas.height;
+  const mctx = maskCanvas.getContext('2d');
+  mctx.fillStyle = 'black';
+  mctx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
+  mctx.fillStyle = 'white';
+  mctx.fillRect(x, y, w, h);
+  const regionMaskUrl = maskCanvas.toDataURL('image/png');
+
+  const compositeUrl = await getCompositeDataUrl();
+  pendingGeneration = { kind: 'region', label: label.trim(), regionMaskUrl };
+  setBusy(true);
+  ws.send(JSON.stringify({
+    action: 'edit_region',
+    subject: compositeUrl.split(',')[1],
+    mask: regionMaskUrl.split(',')[1],
+    depth: state.depth.split(',')[1],
+    prompt: label.trim(),
+    // Deliberately not reusing the background-gen ControlNet slider — that
+    // strength is tuned for staying anchored to existing geometry, which
+    // fights inserting a new object where the depth map is currently flat.
+    // The server defaults this low on its own; omitted here on purpose.
+  }));
+}
+
+// --- export / import -----------------------------------------------------------
+
+document.getElementById('btnExportPng').onclick = async () => {
+  const url = await getCompositeDataUrl();
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `photoshoot_composite_${Date.now()}.png`;
+  a.click();
+};
+
+document.getElementById('btnExportJson').onclick = () => {
+  const project = {
+    version: 2, savedAt: new Date().toISOString(),
+    original: state.original, cutout: state.cutout, mask: state.mask,
+    pose: state.pose, depth: state.depth,
+    illumination: state.illumination, layers: state.layers, activeLayerId: state.activeLayerId,
+    params: {
+      prompt: state.lastPrompt,
+      controlnet_strength: state.lastControlnetStrength,
+      denoise: state.lastDenoise,
+      checkpoint: 'RealVisXL_V5.0_fp16.safetensors',
+      controlnet: 'diffusers_xl_depth_full.safetensors',
+    },
+  };
+  const blob = new Blob([JSON.stringify(project, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `photoshoot_project_${Date.now()}.json`;
+  a.click();
+};
+
+document.getElementById('btnImportJson').onclick = () => document.getElementById('importInput').click();
+document.getElementById('importInput').onchange = async () => {
+  const file = document.getElementById('importInput').files[0];
+  if (!file) return;
+  const text = await file.text();
+  const project = JSON.parse(text);
+  Object.assign(state, {
+    original: project.original, cutout: project.cutout, mask: project.mask,
+    pose: project.pose, depth: project.depth,
+    illumination: project.illumination, layers: project.layers || [],
+    activeLayerId: project.activeLayerId || null,
+    lastPrompt: project.params?.prompt || '',
+    lastControlnetStrength: project.params?.controlnet_strength ?? 0.75,
+    lastDenoise: project.params?.denoise ?? 0.85,
+  });
+  nextLayerId = state.layers.length + 1;
+  document.getElementById('scenePrompt').value = state.lastPrompt;
+  document.getElementById('cnStrength').value = state.lastControlnetStrength;
+  document.getElementById('cnVal').textContent = state.lastControlnetStrength;
+  document.getElementById('denoise').value = state.lastDenoise;
+  document.getElementById('dnVal').textContent = state.lastDenoise;
+  if (state.illumination) {
+    document.getElementById('thumbCutout').src = state.cutout;
+    document.getElementById('thumbPose').src = state.pose;
+    document.getElementById('thumbDepth').src = state.depth;
+    document.getElementById('illumText').innerHTML =
+      `<div class="illum-line"><b>${state.illumination.descriptor}</b></div>`;
+    document.getElementById('stagesPanel').style.display = 'block';
+  }
+  document.getElementById('btnExportPng').disabled = state.layers.length === 0;
+  document.getElementById('btnExportJson').disabled = false;
+  document.getElementById('footerStatus').textContent = 'project imported';
+  setBusy(false);
+  renderLayerPanel();
+  redraw();
+};
+
+connectWs();
+redraw();
+</script>
+</body>
+</html>

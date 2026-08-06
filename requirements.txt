@@ -6,6 +6,17 @@ opencv-python
 SpoutGL
 PyOpenGL
 
+# mixed-reality photo booth (web_server.py, photoshoot_pipeline.py)
+fastapi
+uvicorn[standard]
+websockets
+httpx
+python-multipart
+rembg
+onnxruntime
+controlnet_aux
+matplotlib
+
 # generation backends (backends/) — only the one(s) you use with --backend
 runwayml
 PyJWT
