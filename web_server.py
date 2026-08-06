@@ -18,6 +18,8 @@ import base64
 import io
 import json
 import struct
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -33,11 +35,67 @@ COMFY_ADDRESS = "127.0.0.1:8188"
 COMFY_CLIENT_ID = "web-photoshoot-bridge"
 BINARY_PREVIEW_EVENT = 1  # ComfyUI's BinaryEventTypes.PREVIEW_IMAGE
 
+# Virtual-production tie-in: pushes a generated composite out as its own
+# Spout source, so a real LED wall / projector on set can show it live
+# behind the model during the actual shoot — the same technique bridge.py
+# uses, kept as an independent sender here (own name, own thread) so this
+# app doesn't depend on bridge.py running at all, and never collides with
+# its "ComfyBridge" sender if both happen to be up at once.
+PHOTOBOOTH_SPOUT_NAME = "PhotoBooth"
+PHOTOBOOTH_SPOUT_WIDTH = 768
+PHOTOBOOTH_SPOUT_HEIGHT = 768
+PHOTOBOOTH_SPOUT_FPS = 15
+
+
+class SpoutFrameBuffer:
+    def __init__(self, width: int, height: int):
+        self.width = width
+        self.height = height
+        self.lock = threading.Lock()
+        self.data = bytes([20, 20, 24, 255]) * (width * height)  # placeholder: near-black
+
+    def set_image(self, image: Image.Image):
+        if image.size != (self.width, self.height):
+            image = image.resize((self.width, self.height), Image.LANCZOS)
+        with self.lock:
+            self.data = image.convert("RGBA").tobytes()
+
+    def get_bytes(self) -> bytes:
+        with self.lock:
+            return self.data
+
+
+photobooth_frame_buffer = SpoutFrameBuffer(PHOTOBOOTH_SPOUT_WIDTH, PHOTOBOOTH_SPOUT_HEIGHT)
+spout_stop_event = threading.Event()
+
+
+def photobooth_spout_loop():
+    import SpoutGL
+    from OpenGL import GL
+
+    with SpoutGL.SpoutSender() as sender:
+        sender.setSenderName(PHOTOBOOTH_SPOUT_NAME)
+        print(f"[spout] sender '{PHOTOBOOTH_SPOUT_NAME}' started at "
+              f"{PHOTOBOOTH_SPOUT_WIDTH}x{PHOTOBOOTH_SPOUT_HEIGHT}")
+        while not spout_stop_event.is_set():
+            sender.sendImage(
+                photobooth_frame_buffer.get_bytes(),
+                photobooth_frame_buffer.width,
+                photobooth_frame_buffer.height,
+                GL.GL_RGBA,
+                False,
+                0,
+            )
+            sender.setFrameSync(PHOTOBOOTH_SPOUT_NAME)
+            time.sleep(1.0 / PHOTOBOOTH_SPOUT_FPS)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(comfy_relay_loop())
+    threading.Thread(target=photobooth_spout_loop, daemon=True).start()
     yield
+    spout_stop_event.set()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -184,6 +242,8 @@ async def ws_endpoint(websocket: WebSocket):
                 asyncio.create_task(handle_generate_background(msg))
             elif action == "edit_region":
                 asyncio.create_task(handle_edit_region(msg))
+            elif action == "send_to_spout":
+                asyncio.create_task(handle_send_to_spout(msg))
 
     except WebSocketDisconnect:
         if current_ws is websocket:
@@ -262,6 +322,20 @@ async def handle_edit_region(msg: dict):
     active_prompt_id = prompt_id
     active_kind = "region"
     await send_json({"type": "queued", "prompt_id": prompt_id})
+
+
+async def handle_send_to_spout(msg: dict):
+    """Pushes the current flattened composite out over the 'PhotoBooth'
+    Spout sender, for a real LED wall / projector on set to pick up as a
+    live source — same mechanism as bridge.py's Resolume tie-in, just
+    fired manually from the browser instead of an OSC trigger."""
+    try:
+        image = b64_to_pil(msg["image"]).convert("RGBA")
+    except Exception as exc:
+        await send_json({"type": "error", "message": f"bad request: {exc}"})
+        return
+    photobooth_frame_buffer.set_image(image)
+    await send_json({"type": "spout_sent"})
 
 
 def main():

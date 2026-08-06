@@ -71,7 +71,13 @@ verified against ComfyUI's own `server.py` (`encode_bytes`/`send_image`).
 
 ```
 pip install -r requirements.txt
+pip install --force-reinstall opencv-python
 ```
+
+The second line matters: `controlnet_aux` pulls in `opencv-python-headless`,
+which silently overwrites the GUI-capable `opencv-python` build on disk
+(same `cv2` module name, one wins) — without this, `spout_viewer.py` and
+the Resolume bridge's video preview fail with a `waitKeyImpl` error.
 
 Models (ComfyUI's `models/` folder):
 - Checkpoint: [`RealVisXL_V5.0_fp16.safetensors`](https://huggingface.co/SG161222/RealVisXL_V5.0) in `models/checkpoints/`
