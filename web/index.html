@@ -427,15 +427,21 @@ async function handleFile(file) {
   state.mask = 'data:image/png;base64,' + data.mask;
   state.pose = 'data:image/png;base64,' + data.pose;
   state.depth = 'data:image/png;base64,' + data.depth;
+  state.shadow = 'data:image/png;base64,' + data.shadow;
   state.illumination = data.illumination;
 
   // parallax: how far this layer shifts during the "living photo" camera
   // sweep, relative to the others -- 0 = pinned (background), 1 = full
   // shift (subject, closest to camera). Mirrors real depth ordering.
+  // "shadow" sits between background and subject in the stack (rendered
+  // under the subject, over the environment) -- it's deterministic (from
+  // pose foot keypoints, not AI), so it's on and correctly grounded no
+  // matter how the generated background turns out.
   state.layers = [
     { id: 'background', name: 'Background', kind: 'background', src: state.original, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 0 },
     { id: 'depth', name: 'Depth (debug)', kind: 'debug', src: state.depth, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1, parallax: 0 },
     { id: 'pose', name: 'Pose (debug)', kind: 'debug', src: state.pose, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1, parallax: 0 },
+    { id: 'shadow', name: 'Contact Shadow', kind: 'shadow', src: state.shadow, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 0.1 },
     { id: 'subject', name: 'Subject', kind: 'subject', src: state.cutout, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 1 },
   ];
   state.activeLayerId = 'subject';
@@ -809,7 +815,7 @@ document.getElementById('btnExportJson').onclick = () => {
   const project = {
     version: 3, savedAt: new Date().toISOString(),
     original: state.original, cutout: state.cutout, mask: state.mask,
-    pose: state.pose, depth: state.depth,
+    pose: state.pose, depth: state.depth, shadow: state.shadow,
     illumination: state.illumination, layers: state.layers, activeLayerId: state.activeLayerId,
     provenanceLog: state.provenanceLog, // full generation audit trail, every seed/prompt/setting used this session
     params: {
@@ -835,7 +841,7 @@ document.getElementById('importInput').onchange = async () => {
   const project = JSON.parse(text);
   Object.assign(state, {
     original: project.original, cutout: project.cutout, mask: project.mask,
-    pose: project.pose, depth: project.depth,
+    pose: project.pose, depth: project.depth, shadow: project.shadow,
     illumination: project.illumination, layers: project.layers || [],
     activeLayerId: project.activeLayerId || null,
     lastPrompt: project.params?.prompt || '',

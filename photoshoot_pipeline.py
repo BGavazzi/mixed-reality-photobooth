@@ -93,6 +93,62 @@ def estimate_pose(image: Image.Image) -> Image.Image:
     return Image.fromarray(rgba, mode="RGBA")
 
 
+# --- ground-contact shadow (deterministic, no AI) ---------------------------
+
+# COCO-18/OpenPose body keypoint order used by controlnet_aux's Body model.
+_ANKLE_KEYPOINT_INDICES = (10, 13)  # RAnkle, LAnkle
+
+
+def detect_foot_points(image: Image.Image) -> list[tuple[float, float]]:
+    """Returns pixel-space (x, y) of any detected ankle keypoints. Pulled
+    from the same OpenPose model estimate_pose() uses, but read before it
+    gets rendered to a skeleton image — detect_poses() hands back the raw
+    (normalized 0-1) keypoint coordinates directly."""
+    detector = _get_pose_detector()
+    np_img = np.array(image.convert("RGB"))
+    poses = detector.detect_poses(np_img, include_hand=False, include_face=False)
+    if not poses:
+        return []
+
+    body = poses[0].body
+    w, h = image.size
+    points = []
+    for idx in _ANKLE_KEYPOINT_INDICES:
+        if idx < len(body.keypoints) and body.keypoints[idx] is not None:
+            kp = body.keypoints[idx]
+            points.append((kp.x * w, kp.y * h))
+    return points
+
+
+def generate_contact_shadow(image_size: tuple[int, int], foot_points: list[tuple[float, float]],
+                             opacity: int = 110) -> Image.Image:
+    """Classic photo-compositing trick, deliberately not AI: a soft dark
+    ellipse under each detected foot. Fast, deterministic, and always
+    correctly grounds the subject regardless of how good (or not) the
+    generated background turns out — a useful contrast to "let the model
+    figure it out." Returns an RGBA layer, transparent except the shadow(s)."""
+    from PIL import ImageDraw, ImageFilter
+
+    w, h = image_size
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    if not foot_points:
+        return layer
+
+    draw = ImageDraw.Draw(layer)
+    ellipse_w = w * 0.09
+    ellipse_h = ellipse_w * 0.30
+    foot_offset_y = h * 0.015  # ankle keypoint sits a bit above the actual sole
+
+    for x, y in foot_points:
+        gy = y + foot_offset_y
+        draw.ellipse(
+            [x - ellipse_w / 2, gy - ellipse_h / 2, x + ellipse_w / 2, gy + ellipse_h / 2],
+            fill=(0, 0, 0, opacity),
+        )
+
+    return layer.filter(ImageFilter.GaussianBlur(radius=max(2.0, ellipse_h * 0.5)))
+
+
 # --- depth ----------------------------------------------------------------
 
 def estimate_depth(image: Image.Image) -> Image.Image:
@@ -179,16 +235,19 @@ def estimate_illumination(image: Image.Image, mask: Image.Image) -> Illumination
 # --- convenience: run everything at once -----------------------------------
 
 def analyze(image: Image.Image) -> dict:
-    """Runs all four stages and returns a dict of results, for the web
-    layer to hand straight to the client as separate layers."""
+    """Runs all stages and returns a dict of results, for the web layer to
+    hand straight to the client as separate layers."""
     cutout, mask = segment_subject(image)
     pose = estimate_pose(image)
     depth = estimate_depth(image)
     illumination = estimate_illumination(image, mask)
+    foot_points = detect_foot_points(image)
+    shadow = generate_contact_shadow(image.size, foot_points)
     return {
         "cutout": cutout,
         "mask": mask,
         "pose": pose,
         "depth": depth,
         "illumination": illumination,
+        "shadow": shadow,
     }
