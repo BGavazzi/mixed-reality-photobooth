@@ -139,6 +139,7 @@
       <h2>3. Generate Background</h2>
       <label class="field">Scene prompt (respects, or overrides, the detected lighting)</label>
       <textarea id="scenePrompt" rows="3" placeholder="e.g. sunlit rooftop terrace at golden hour, city skyline"></textarea>
+      <button class="secondary small" id="btnVoicePrompt" style="width:100%;margin-top:6px">🎤 Speak Scene (hands-free direction)</button>
       <label class="field">ControlNet depth strength <span class="val" id="cnVal">0.75</span></label>
       <input type="range" id="cnStrength" min="0" max="1.5" step="0.05" value="0.75">
       <label class="field">Denoise <span class="val" id="dnVal">0.85</span></label>
@@ -148,6 +149,14 @@
       </div>
       <button class="secondary small" id="btnAddObject" style="width:100%;margin-top:8px" disabled>+ Add Object (draw region): OFF</button>
       <div class="hint">Draws a box on the canvas, asks what goes there, and inpaints just that region onto its own layer — the rest of the composite is untouched.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Time of Day</h2>
+      <div class="hint" style="margin-top:0">Drag to pick a lighting mood, then relight the environment with it -- swaps the time-of-day phrase into the scene prompt and regenerates the background (full generation still takes ~30-45s; this isn't literally real-time, just one click instead of hand-editing the prompt).</div>
+      <div style="text-align:center;font-weight:600;margin-top:10px" id="timeOfDayLabel">Golden Hour</div>
+      <input type="range" id="timeOfDaySlider" min="0" max="4" step="1" value="2">
+      <button class="secondary small" id="btnRelight" style="width:100%;margin-top:8px" disabled>Relight Environment</button>
     </div>
 
     <div class="panel">
@@ -165,6 +174,13 @@
       <div class="hint" style="margin-top:0">Turns the composite into a short looping video with subtle 3D camera motion -- each layer shifts by its parallax depth slider above (set on the layer rows), so the subject moves against a more distant background instead of everything sliding as one flat image.</div>
       <button class="secondary small" id="btnPreviewParallax" style="width:100%;margin-top:10px">Preview Parallax: OFF</button>
       <button id="btnExportLiving" style="margin-top:8px" disabled>Export Living Photo (.webm)</button>
+    </div>
+
+    <div class="panel">
+      <h2>AI Content Disclosure</h2>
+      <div class="hint" style="margin-top:0">A record of what actually generated this image -- model, seed, and settings -- not just "AI made this." Relevant for brand-safety review and disclosure requirements (FTC guidance, EU AI Act) around AI-generated ad content.</div>
+      <div id="provenanceCard" class="hint" style="margin-top:10px;font-family:'SF Mono',Consolas,monospace;font-size:11px;color:var(--text);white-space:pre-wrap">no generation yet</div>
+      <button class="secondary small" id="btnCopyDisclosure" style="width:100%;margin-top:8px" disabled>Copy Disclosure Text</button>
     </div>
 
     <div class="panel">
@@ -190,6 +206,7 @@ const state = {
   activeLayerId: null,
   lastPrompt: '', lastControlnetStrength: 0.75, lastDenoise: 0.85,
   drawingRect: null, // {x0,y0,x1,y1} in canvas space, while drawing a region
+  provenanceLog: [], // every generation's metadata this session, for the disclosure card + export audit trail
 };
 const imgCache = {};
 
@@ -342,9 +359,38 @@ async function handleGenerationDone(msg) {
   document.getElementById('btnExportJson').disabled = false;
   document.getElementById('btnExportLiving').disabled = false;
   document.getElementById('btnSendSpout').disabled = false;
+  if (msg.provenance) {
+    state.provenanceLog.push(msg.provenance);
+    renderProvenanceCard(msg.provenance);
+    document.getElementById('btnCopyDisclosure').disabled = false;
+  }
   setBusy(false);
   renderLayerPanel();
   redraw();
+}
+
+function renderProvenanceCard(p) {
+  const when = new Date(p.generated_at).toLocaleString();
+  const lines = [
+    `type: ${p.kind}`,
+    `prompt: "${p.prompt}"`,
+    `seed: ${p.seed}`,
+    `checkpoint: ${p.checkpoint}`,
+  ];
+  if (p.controlnet) lines.push(`controlnet: ${p.controlnet} (strength ${p.controlnet_strength})`);
+  if (p.denoise != null) lines.push(`denoise: ${p.denoise}`);
+  lines.push(`generated: ${when}`);
+  lines.push(`session total: ${state.provenanceLog.length} generation(s)`);
+  document.getElementById('provenanceCard').textContent = lines.join('\n');
+}
+
+function disclosureText(p) {
+  const when = new Date(p.generated_at).toLocaleString();
+  let text = `This image's ${p.kind === 'background' ? 'background environment' : p.kind === 'region' ? 'added object' : 'content'} was generated using AI ` +
+    `(Stable Diffusion XL${p.controlnet ? ' with ControlNet depth guidance' : ''}) on ${when}.\n` +
+    `Model: ${p.checkpoint}\nSeed: ${p.seed}\nPrompt: "${p.prompt}"`;
+  if (p.controlnet) text += `\nControlNet: ${p.controlnet} (strength ${p.controlnet_strength}, denoise ${p.denoise})`;
+  return text;
 }
 
 function clipToMask(imageUrl, maskUrl) {
@@ -362,6 +408,7 @@ function clipToMask(imageUrl, maskUrl) {
 function setBusy(busy) {
   document.getElementById('btnGenerate').disabled = busy || !state.cutout;
   document.getElementById('btnAddObject').disabled = busy || !state.cutout;
+  document.getElementById('btnRelight').disabled = busy || !state.cutout;
 }
 
 // --- upload + analyze --------------------------------------------------------
@@ -390,15 +437,21 @@ async function handleFile(file) {
   state.mask = 'data:image/png;base64,' + data.mask;
   state.pose = 'data:image/png;base64,' + data.pose;
   state.depth = 'data:image/png;base64,' + data.depth;
+  state.shadow = 'data:image/png;base64,' + data.shadow;
   state.illumination = data.illumination;
 
   // parallax: how far this layer shifts during the "living photo" camera
   // sweep, relative to the others -- 0 = pinned (background), 1 = full
   // shift (subject, closest to camera). Mirrors real depth ordering.
+  // "shadow" sits between background and subject in the stack (rendered
+  // under the subject, over the environment) -- it's deterministic (from
+  // pose foot keypoints, not AI), so it's on and correctly grounded no
+  // matter how the generated background turns out.
   state.layers = [
     { id: 'background', name: 'Background', kind: 'background', src: state.original, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 0 },
     { id: 'depth', name: 'Depth (debug)', kind: 'debug', src: state.depth, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1, parallax: 0 },
     { id: 'pose', name: 'Pose (debug)', kind: 'debug', src: state.pose, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1, parallax: 0 },
+    { id: 'shadow', name: 'Contact Shadow', kind: 'shadow', src: state.shadow, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 0.1 },
     { id: 'subject', name: 'Subject', kind: 'subject', src: state.cutout, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 1 },
   ];
   state.activeLayerId = 'subject';
@@ -422,14 +475,61 @@ async function handleFile(file) {
   redraw();
 }
 
-// --- generate background -----------------------------------------------------
+// --- voice-driven scene direction --------------------------------------------
+// Hands-free scene direction for a photographer actively running a shoot --
+// dictate instead of typing. Client-side only (Web Speech API), Chrome/Edge
+// only (no Firefox/Safari support as of this writing); degrades to a clear
+// message rather than a silent no-op on unsupported browsers.
+
+const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+let voiceRecognition = null;
+let voiceListening = false;
+
+function initVoiceRecognition() {
+  if (!SpeechRecognitionImpl) return null;
+  const rec = new SpeechRecognitionImpl();
+  rec.continuous = false;
+  rec.interimResults = false;
+  rec.lang = 'en-US';
+  rec.onresult = (event) => {
+    const transcript = event.results[0][0].transcript;
+    const box = document.getElementById('scenePrompt');
+    box.value = box.value.trim() ? `${box.value.trim()}, ${transcript}` : transcript;
+  };
+  rec.onerror = (event) => {
+    document.getElementById('footerStatus').textContent = `voice input error: ${event.error}`;
+  };
+  rec.onend = () => {
+    voiceListening = false;
+    const btn = document.getElementById('btnVoicePrompt');
+    btn.textContent = '🎤 Speak Scene (hands-free direction)';
+    btn.classList.remove('active-toggle');
+  };
+  return rec;
+}
+
+document.getElementById('btnVoicePrompt').onclick = () => {
+  if (!SpeechRecognitionImpl) {
+    alert('Voice input needs the Web Speech API, which this browser doesn\'t support (Chrome/Edge only). Type the scene prompt instead.');
+    return;
+  }
+  if (!voiceRecognition) voiceRecognition = initVoiceRecognition();
+  const btn = document.getElementById('btnVoicePrompt');
+  if (voiceListening) {
+    voiceRecognition.stop();
+  } else {
+    voiceListening = true;
+    btn.textContent = '🎤 Listening...';
+    btn.classList.add('active-toggle');
+    voiceRecognition.start();
+  }
+};
 
 document.getElementById('cnStrength').oninput = (e) => document.getElementById('cnVal').textContent = e.target.value;
 document.getElementById('denoise').oninput = (e) => document.getElementById('dnVal').textContent = e.target.value;
 
-document.getElementById('btnGenerate').onclick = () => {
+function queueBackgroundGeneration(prompt) {
   if (!state.cutout) return;
-  const prompt = document.getElementById('scenePrompt').value.trim();
   const controlnet_strength = parseFloat(document.getElementById('cnStrength').value);
   const denoise = parseFloat(document.getElementById('denoise').value);
   state.lastPrompt = prompt; state.lastControlnetStrength = controlnet_strength; state.lastDenoise = denoise;
@@ -441,6 +541,45 @@ document.getElementById('btnGenerate').onclick = () => {
     depth: state.depth.split(',')[1],
     prompt, controlnet_strength, denoise,
   }));
+}
+
+document.getElementById('btnGenerate').onclick = () => {
+  queueBackgroundGeneration(document.getElementById('scenePrompt').value.trim());
+};
+
+// --- time-of-day relighting ---------------------------------------------------
+// Reuses the exact same generate_background action as the button above --
+// the only thing this adds is composing a time-of-day phrase into the
+// prompt, no new backend path needed.
+
+const TIME_OF_DAY_PRESETS = [
+  { label: 'Dawn', phrase: 'soft cool blue pre-dawn light, gentle diffuse glow, quiet atmosphere' },
+  { label: 'Morning', phrase: 'bright clear morning light, crisp shadows, fresh atmosphere' },
+  { label: 'Golden Hour', phrase: 'warm golden hour sunlight, long soft shadows, glowing warm tones' },
+  { label: 'Dusk', phrase: 'deep orange and purple dusk light, dramatic sky, cooling shadows' },
+  { label: 'Night', phrase: 'cool moonlight and artificial city lights, night ambience, deep shadows' },
+];
+
+document.getElementById('timeOfDaySlider').oninput = (e) => {
+  document.getElementById('timeOfDayLabel').textContent = TIME_OF_DAY_PRESETS[parseInt(e.target.value)].label;
+};
+
+document.getElementById('btnRelight').onclick = () => {
+  if (!state.cutout) return;
+  const preset = TIME_OF_DAY_PRESETS[parseInt(document.getElementById('timeOfDaySlider').value)];
+
+  // strip any time-of-day phrase from a previous relight before adding the
+  // new one, so repeated relights don't pile up "dawn light ... dusk light
+  // ... night light" into one incoherent prompt
+  let base = document.getElementById('scenePrompt').value;
+  for (const p of TIME_OF_DAY_PRESETS) {
+    base = base.split(`, ${p.phrase}`).join('').split(p.phrase).join('');
+  }
+  base = base.replace(/,\s*,/g, ',').replace(/^\s*,|,\s*$/g, '').trim();
+
+  const prompt = base ? `${base}, ${preset.phrase}` : preset.phrase;
+  document.getElementById('scenePrompt').value = prompt;
+  queueBackgroundGeneration(prompt);
 };
 
 document.getElementById('quickPrompt').addEventListener('keydown', (e) => {
@@ -753,12 +892,28 @@ document.getElementById('btnSendSpout').onclick = async () => {
   setTimeout(() => { btn.textContent = originalText; }, 1500);
 };
 
+document.getElementById('btnCopyDisclosure').onclick = async () => {
+  const btn = document.getElementById('btnCopyDisclosure');
+  if (!state.provenanceLog.length) return;
+  const latest = state.provenanceLog[state.provenanceLog.length - 1];
+  const text = disclosureText(latest);
+  try {
+    await navigator.clipboard.writeText(text);
+    const originalText = btn.textContent;
+    btn.textContent = 'Copied ✓';
+    setTimeout(() => { btn.textContent = originalText; }, 1500);
+  } catch (e) {
+    alert(text); // clipboard API blocked (e.g. non-HTTPS context) -- show it directly instead
+  }
+};
+
 document.getElementById('btnExportJson').onclick = () => {
   const project = {
-    version: 2, savedAt: new Date().toISOString(),
+    version: 3, savedAt: new Date().toISOString(),
     original: state.original, cutout: state.cutout, mask: state.mask,
-    pose: state.pose, depth: state.depth,
+    pose: state.pose, depth: state.depth, shadow: state.shadow,
     illumination: state.illumination, layers: state.layers, activeLayerId: state.activeLayerId,
+    provenanceLog: state.provenanceLog, // full generation audit trail, every seed/prompt/setting used this session
     params: {
       prompt: state.lastPrompt,
       controlnet_strength: state.lastControlnetStrength,
@@ -782,14 +937,19 @@ document.getElementById('importInput').onchange = async () => {
   const project = JSON.parse(text);
   Object.assign(state, {
     original: project.original, cutout: project.cutout, mask: project.mask,
-    pose: project.pose, depth: project.depth,
+    pose: project.pose, depth: project.depth, shadow: project.shadow,
     illumination: project.illumination, layers: project.layers || [],
     activeLayerId: project.activeLayerId || null,
     lastPrompt: project.params?.prompt || '',
     lastControlnetStrength: project.params?.controlnet_strength ?? 0.75,
     lastDenoise: project.params?.denoise ?? 0.85,
+    provenanceLog: project.provenanceLog || [], // older (v1/v2) project files just won't have an audit trail
   });
   nextLayerId = state.layers.length + 1;
+  if (state.provenanceLog.length) {
+    renderProvenanceCard(state.provenanceLog[state.provenanceLog.length - 1]);
+    document.getElementById('btnCopyDisclosure').disabled = false;
+  }
   document.getElementById('scenePrompt').value = state.lastPrompt;
   document.getElementById('cnStrength').value = state.lastControlnetStrength;
   document.getElementById('cnVal').textContent = state.lastControlnetStrength;
