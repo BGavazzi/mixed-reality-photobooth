@@ -69,7 +69,7 @@
   .layer-row:last-child { border-bottom: none; }
   .layer-row.active { background: rgba(110,168,254,.12); }
   .layer-row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .layer-row input[type=range] { width: 54px; }
+  .layer-row input[type=range] { width: 38px; }
   .layer-row .reorder { display: flex; flex-direction: column; gap: 1px; }
   .layer-row .reorder button, .layer-row .del button {
     width: auto; padding: 0 4px; font-size: 9px; background: var(--panel2); color: var(--dim); border: 1px solid var(--border);
@@ -161,6 +161,13 @@
     </div>
 
     <div class="panel">
+      <h2>Living Photo</h2>
+      <div class="hint" style="margin-top:0">Turns the composite into a short looping video with subtle 3D camera motion -- each layer shifts by its parallax depth slider above (set on the layer rows), so the subject moves against a more distant background instead of everything sliding as one flat image.</div>
+      <button class="secondary small" id="btnPreviewParallax" style="width:100%;margin-top:10px">Preview Parallax: OFF</button>
+      <button id="btnExportLiving" style="margin-top:8px" disabled>Export Living Photo (.webm)</button>
+    </div>
+
+    <div class="panel">
       <h2>Export</h2>
       <button id="btnExportPng" disabled>Flatten &amp; Download PNG</button>
     </div>
@@ -199,14 +206,20 @@ function activeLayer() { return state.activeLayerId ? findLayer(state.activeLaye
 const canvas = document.getElementById('compositeCanvas');
 const ctx = canvas.getContext('2d');
 
-async function redraw() {
+async function redraw(cameraOffsetPx = 0) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // Overscan only kicks in during parallax motion, so a normal (offset=0)
+  // redraw -- export, layer editing, everything else -- is pixel-identical
+  // to before this feature existed. With motion, layers are drawn a bit
+  // oversized so the camera shift never reveals empty canvas at the edges.
+  const overscan = cameraOffsetPx !== 0 ? 1.08 : 1;
   for (const layer of state.layers) {
     if (!layer.visible || !layer.src) continue;
     const im = await loadImg(layer.src);
     ctx.globalAlpha = layer.opacity;
-    const w = canvas.width * layer.scale, h = canvas.height * layer.scale;
-    const x = (canvas.width - w) / 2 + layer.x, y = (canvas.height - h) / 2 + layer.y;
+    const w = canvas.width * layer.scale * overscan, h = canvas.height * layer.scale * overscan;
+    const shift = cameraOffsetPx * (layer.parallax || 0);
+    const x = (canvas.width - w) / 2 + layer.x + shift, y = (canvas.height - h) / 2 + layer.y;
     ctx.drawImage(im, x, y, w, h);
   }
   ctx.globalAlpha = 1;
@@ -313,7 +326,7 @@ async function handleGenerationDone(msg) {
     const clipped = await clipToMask(resultUrl, pendingGeneration.regionMaskUrl);
     state.layers.push({
       id: 'obj_' + (nextLayerId++), name: pendingGeneration.label, kind: 'object',
-      src: clipped, visible: true, opacity: 1, x: 0, y: 0, scale: 1,
+      src: clipped, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 0.5,
     });
     state.activeLayerId = state.layers[state.layers.length - 1].id;
   } else {
@@ -325,6 +338,7 @@ async function handleGenerationDone(msg) {
   pendingGeneration = null;
   document.getElementById('btnExportPng').disabled = false;
   document.getElementById('btnExportJson').disabled = false;
+  document.getElementById('btnExportLiving').disabled = false;
   setBusy(false);
   renderLayerPanel();
   redraw();
@@ -375,11 +389,14 @@ async function handleFile(file) {
   state.depth = 'data:image/png;base64,' + data.depth;
   state.illumination = data.illumination;
 
+  // parallax: how far this layer shifts during the "living photo" camera
+  // sweep, relative to the others -- 0 = pinned (background), 1 = full
+  // shift (subject, closest to camera). Mirrors real depth ordering.
   state.layers = [
-    { id: 'background', name: 'Background', kind: 'background', src: state.original, visible: true, opacity: 1, x: 0, y: 0, scale: 1 },
-    { id: 'depth', name: 'Depth (debug)', kind: 'debug', src: state.depth, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1 },
-    { id: 'pose', name: 'Pose (debug)', kind: 'debug', src: state.pose, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1 },
-    { id: 'subject', name: 'Subject', kind: 'subject', src: state.cutout, visible: true, opacity: 1, x: 0, y: 0, scale: 1 },
+    { id: 'background', name: 'Background', kind: 'background', src: state.original, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 0 },
+    { id: 'depth', name: 'Depth (debug)', kind: 'debug', src: state.depth, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1, parallax: 0 },
+    { id: 'pose', name: 'Pose (debug)', kind: 'debug', src: state.pose, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1, parallax: 0 },
+    { id: 'subject', name: 'Subject', kind: 'subject', src: state.cutout, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 1 },
   ];
   state.activeLayerId = 'subject';
 
@@ -451,7 +468,13 @@ function renderLayerPanel() {
 
     const op = document.createElement('input');
     op.type = 'range'; op.min = 0; op.max = 1; op.step = 0.05; op.value = layer.opacity;
+    op.title = 'opacity';
     op.oninput = (e) => { layer.opacity = parseFloat(e.target.value); redraw(); };
+
+    const pz = document.createElement('input');
+    pz.type = 'range'; pz.min = 0; pz.max = 1; pz.step = 0.05; pz.value = layer.parallax ?? 0;
+    pz.title = 'parallax depth (0 = far/pinned, 1 = near/full shift) -- see Living Photo panel';
+    pz.oninput = (e) => { layer.parallax = parseFloat(e.target.value); };
 
     const reorder = document.createElement('div');
     reorder.className = 'reorder';
@@ -461,7 +484,7 @@ function renderLayerPanel() {
     down.onclick = (e) => { e.stopPropagation(); moveLayer(layer.id, -1); };
     reorder.append(up, down);
 
-    row.append(vis, name, op, reorder);
+    row.append(vis, name, op, pz, reorder);
 
     if (layer.kind === 'object' || layer.kind === 'image') {
       const del = document.createElement('button');
@@ -512,7 +535,7 @@ document.getElementById('layerFileInput').onchange = (e) => {
   const reader = new FileReader();
   reader.onload = () => {
     const id = 'img_' + (nextLayerId++);
-    state.layers.push({ id, name: file.name, kind: 'image', src: reader.result, visible: true, opacity: 1, x: 0, y: 0, scale: 1 });
+    state.layers.push({ id, name: file.name, kind: 'image', src: reader.result, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 0.6 });
     state.activeLayerId = id;
     renderLayerPanel(); redraw();
   };
@@ -623,6 +646,91 @@ async function startRegionEdit(x, y, w, h) {
   }));
 }
 
+// --- living photo (depth-based parallax loop) -----------------------------------
+
+const PARALLAX_AMPLITUDE_PX = 18;
+const PARALLAX_PERIOD_MS = 2600;
+
+let parallaxAnimating = false;
+let parallaxAnimStart = null;
+
+function parallaxOffsetAt(ts) {
+  if (parallaxAnimStart === null) parallaxAnimStart = ts;
+  const t = (ts - parallaxAnimStart) / PARALLAX_PERIOD_MS;
+  return { offset: Math.sin(t * Math.PI * 2) * PARALLAX_AMPLITUDE_PX, t };
+}
+
+function parallaxPreviewFrame(ts) {
+  if (!parallaxAnimating) return;
+  const { offset } = parallaxOffsetAt(ts);
+  redraw(offset);
+  requestAnimationFrame(parallaxPreviewFrame);
+}
+
+document.getElementById('btnPreviewParallax').onclick = () => {
+  parallaxAnimating = !parallaxAnimating;
+  parallaxAnimStart = null;
+  document.getElementById('btnPreviewParallax').textContent = 'Preview Parallax: ' + (parallaxAnimating ? 'ON' : 'OFF');
+  document.getElementById('btnPreviewParallax').classList.toggle('active-toggle', parallaxAnimating);
+  if (parallaxAnimating) {
+    requestAnimationFrame(parallaxPreviewFrame);
+  } else {
+    redraw();
+  }
+};
+
+document.getElementById('btnExportLiving').onclick = async () => {
+  const btn = document.getElementById('btnExportLiving');
+  if (!window.MediaRecorder || !canvas.captureStream) {
+    alert('This browser doesn\'t support recording the canvas (MediaRecorder/captureStream missing). Try a recent Chrome/Edge.');
+    return;
+  }
+
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = 'Recording...';
+
+  const wasAnimating = parallaxAnimating;
+  const stream = canvas.captureStream(30);
+  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+  const recorder = new MediaRecorder(stream, { mimeType });
+  const chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+  const stopped = new Promise((resolve) => { recorder.onstop = resolve; });
+
+  parallaxAnimating = true;
+  parallaxAnimStart = null;
+  let recording = true;
+
+  function recordFrame(ts) {
+    if (!recording) return;
+    const { offset, t } = parallaxOffsetAt(ts);
+    redraw(offset);
+    if (t < 1) {
+      requestAnimationFrame(recordFrame);
+    } else {
+      recording = false;
+      recorder.stop();
+    }
+  }
+
+  recorder.start();
+  requestAnimationFrame(recordFrame);
+  await stopped;
+
+  parallaxAnimating = wasAnimating;
+  if (!wasAnimating) redraw();
+
+  const blob = new Blob(chunks, { type: 'video/webm' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `living_photo_${Date.now()}.webm`;
+  a.click();
+
+  btn.disabled = false;
+  btn.textContent = originalText;
+};
+
 // --- export / import -----------------------------------------------------------
 
 document.getElementById('btnExportPng').onclick = async () => {
@@ -685,6 +793,7 @@ document.getElementById('importInput').onchange = async () => {
   }
   document.getElementById('btnExportPng').disabled = state.layers.length === 0;
   document.getElementById('btnExportJson').disabled = false;
+  document.getElementById('btnExportLiving').disabled = state.layers.length === 0;
   document.getElementById('footerStatus').textContent = 'project imported';
   setBusy(false);
   renderLayerPanel();
