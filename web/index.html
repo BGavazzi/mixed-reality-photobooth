@@ -139,6 +139,7 @@
       <h2>3. Generate Background</h2>
       <label class="field">Scene prompt (respects, or overrides, the detected lighting)</label>
       <textarea id="scenePrompt" rows="3" placeholder="e.g. sunlit rooftop terrace at golden hour, city skyline"></textarea>
+      <button class="secondary small" id="btnVoicePrompt" style="width:100%;margin-top:6px">🎤 Speak Scene (hands-free direction)</button>
       <label class="field">ControlNet depth strength <span class="val" id="cnVal">0.75</span></label>
       <input type="range" id="cnStrength" min="0" max="1.5" step="0.05" value="0.75">
       <label class="field">Denoise <span class="val" id="dnVal">0.85</span></label>
@@ -148,6 +149,14 @@
       </div>
       <button class="secondary small" id="btnAddObject" style="width:100%;margin-top:8px" disabled>+ Add Object (draw region): OFF</button>
       <div class="hint">Draws a box on the canvas, asks what goes there, and inpaints just that region onto its own layer — the rest of the composite is untouched.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Time of Day</h2>
+      <div class="hint" style="margin-top:0">Drag to pick a lighting mood, then relight the environment with it -- swaps the time-of-day phrase into the scene prompt and regenerates the background (full generation still takes ~30-45s; this isn't literally real-time, just one click instead of hand-editing the prompt).</div>
+      <div style="text-align:center;font-weight:600;margin-top:10px" id="timeOfDayLabel">Golden Hour</div>
+      <input type="range" id="timeOfDaySlider" min="0" max="4" step="1" value="2">
+      <button class="secondary small" id="btnRelight" style="width:100%;margin-top:8px" disabled>Relight Environment</button>
     </div>
 
     <div class="panel">
@@ -399,6 +408,7 @@ function clipToMask(imageUrl, maskUrl) {
 function setBusy(busy) {
   document.getElementById('btnGenerate').disabled = busy || !state.cutout;
   document.getElementById('btnAddObject').disabled = busy || !state.cutout;
+  document.getElementById('btnRelight').disabled = busy || !state.cutout;
 }
 
 // --- upload + analyze --------------------------------------------------------
@@ -465,14 +475,61 @@ async function handleFile(file) {
   redraw();
 }
 
-// --- generate background -----------------------------------------------------
+// --- voice-driven scene direction --------------------------------------------
+// Hands-free scene direction for a photographer actively running a shoot --
+// dictate instead of typing. Client-side only (Web Speech API), Chrome/Edge
+// only (no Firefox/Safari support as of this writing); degrades to a clear
+// message rather than a silent no-op on unsupported browsers.
+
+const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+let voiceRecognition = null;
+let voiceListening = false;
+
+function initVoiceRecognition() {
+  if (!SpeechRecognitionImpl) return null;
+  const rec = new SpeechRecognitionImpl();
+  rec.continuous = false;
+  rec.interimResults = false;
+  rec.lang = 'en-US';
+  rec.onresult = (event) => {
+    const transcript = event.results[0][0].transcript;
+    const box = document.getElementById('scenePrompt');
+    box.value = box.value.trim() ? `${box.value.trim()}, ${transcript}` : transcript;
+  };
+  rec.onerror = (event) => {
+    document.getElementById('footerStatus').textContent = `voice input error: ${event.error}`;
+  };
+  rec.onend = () => {
+    voiceListening = false;
+    const btn = document.getElementById('btnVoicePrompt');
+    btn.textContent = '🎤 Speak Scene (hands-free direction)';
+    btn.classList.remove('active-toggle');
+  };
+  return rec;
+}
+
+document.getElementById('btnVoicePrompt').onclick = () => {
+  if (!SpeechRecognitionImpl) {
+    alert('Voice input needs the Web Speech API, which this browser doesn\'t support (Chrome/Edge only). Type the scene prompt instead.');
+    return;
+  }
+  if (!voiceRecognition) voiceRecognition = initVoiceRecognition();
+  const btn = document.getElementById('btnVoicePrompt');
+  if (voiceListening) {
+    voiceRecognition.stop();
+  } else {
+    voiceListening = true;
+    btn.textContent = '🎤 Listening...';
+    btn.classList.add('active-toggle');
+    voiceRecognition.start();
+  }
+};
 
 document.getElementById('cnStrength').oninput = (e) => document.getElementById('cnVal').textContent = e.target.value;
 document.getElementById('denoise').oninput = (e) => document.getElementById('dnVal').textContent = e.target.value;
 
-document.getElementById('btnGenerate').onclick = () => {
+function queueBackgroundGeneration(prompt) {
   if (!state.cutout) return;
-  const prompt = document.getElementById('scenePrompt').value.trim();
   const controlnet_strength = parseFloat(document.getElementById('cnStrength').value);
   const denoise = parseFloat(document.getElementById('denoise').value);
   state.lastPrompt = prompt; state.lastControlnetStrength = controlnet_strength; state.lastDenoise = denoise;
@@ -484,6 +541,45 @@ document.getElementById('btnGenerate').onclick = () => {
     depth: state.depth.split(',')[1],
     prompt, controlnet_strength, denoise,
   }));
+}
+
+document.getElementById('btnGenerate').onclick = () => {
+  queueBackgroundGeneration(document.getElementById('scenePrompt').value.trim());
+};
+
+// --- time-of-day relighting ---------------------------------------------------
+// Reuses the exact same generate_background action as the button above --
+// the only thing this adds is composing a time-of-day phrase into the
+// prompt, no new backend path needed.
+
+const TIME_OF_DAY_PRESETS = [
+  { label: 'Dawn', phrase: 'soft cool blue pre-dawn light, gentle diffuse glow, quiet atmosphere' },
+  { label: 'Morning', phrase: 'bright clear morning light, crisp shadows, fresh atmosphere' },
+  { label: 'Golden Hour', phrase: 'warm golden hour sunlight, long soft shadows, glowing warm tones' },
+  { label: 'Dusk', phrase: 'deep orange and purple dusk light, dramatic sky, cooling shadows' },
+  { label: 'Night', phrase: 'cool moonlight and artificial city lights, night ambience, deep shadows' },
+];
+
+document.getElementById('timeOfDaySlider').oninput = (e) => {
+  document.getElementById('timeOfDayLabel').textContent = TIME_OF_DAY_PRESETS[parseInt(e.target.value)].label;
+};
+
+document.getElementById('btnRelight').onclick = () => {
+  if (!state.cutout) return;
+  const preset = TIME_OF_DAY_PRESETS[parseInt(document.getElementById('timeOfDaySlider').value)];
+
+  // strip any time-of-day phrase from a previous relight before adding the
+  // new one, so repeated relights don't pile up "dawn light ... dusk light
+  // ... night light" into one incoherent prompt
+  let base = document.getElementById('scenePrompt').value;
+  for (const p of TIME_OF_DAY_PRESETS) {
+    base = base.split(`, ${p.phrase}`).join('').split(p.phrase).join('');
+  }
+  base = base.replace(/,\s*,/g, ',').replace(/^\s*,|,\s*$/g, '').trim();
+
+  const prompt = base ? `${base}, ${preset.phrase}` : preset.phrase;
+  document.getElementById('scenePrompt').value = prompt;
+  queueBackgroundGeneration(prompt);
 };
 
 document.getElementById('quickPrompt').addEventListener('keydown', (e) => {
