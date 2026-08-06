@@ -236,6 +236,7 @@ async def analyze(file: UploadFile = File(...)):
         "mask": pil_to_b64(result["mask"]),
         "pose": pil_to_b64(result["pose"]),
         "depth": pil_to_b64(result["depth"]),
+        "shadow": pil_to_b64(result["shadow"]),
         "illumination": result["illumination"].to_dict(),
     })
 
