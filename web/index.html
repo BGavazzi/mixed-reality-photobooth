@@ -168,6 +168,13 @@
     </div>
 
     <div class="panel">
+      <h2>AI Content Disclosure</h2>
+      <div class="hint" style="margin-top:0">A record of what actually generated this image -- model, seed, and settings -- not just "AI made this." Relevant for brand-safety review and disclosure requirements (FTC guidance, EU AI Act) around AI-generated ad content.</div>
+      <div id="provenanceCard" class="hint" style="margin-top:10px;font-family:'SF Mono',Consolas,monospace;font-size:11px;color:var(--text);white-space:pre-wrap">no generation yet</div>
+      <button class="secondary small" id="btnCopyDisclosure" style="width:100%;margin-top:8px" disabled>Copy Disclosure Text</button>
+    </div>
+
+    <div class="panel">
       <h2>Export</h2>
       <button id="btnExportPng" disabled>Flatten &amp; Download PNG</button>
       <button class="secondary small" id="btnSendSpout" style="width:100%;margin-top:8px" disabled>Send to Spout (live projection)</button>
@@ -190,6 +197,7 @@ const state = {
   activeLayerId: null,
   lastPrompt: '', lastControlnetStrength: 0.75, lastDenoise: 0.85,
   drawingRect: null, // {x0,y0,x1,y1} in canvas space, while drawing a region
+  provenanceLog: [], // every generation's metadata this session, for the disclosure card + export audit trail
 };
 const imgCache = {};
 
@@ -342,9 +350,38 @@ async function handleGenerationDone(msg) {
   document.getElementById('btnExportJson').disabled = false;
   document.getElementById('btnExportLiving').disabled = false;
   document.getElementById('btnSendSpout').disabled = false;
+  if (msg.provenance) {
+    state.provenanceLog.push(msg.provenance);
+    renderProvenanceCard(msg.provenance);
+    document.getElementById('btnCopyDisclosure').disabled = false;
+  }
   setBusy(false);
   renderLayerPanel();
   redraw();
+}
+
+function renderProvenanceCard(p) {
+  const when = new Date(p.generated_at).toLocaleString();
+  const lines = [
+    `type: ${p.kind}`,
+    `prompt: "${p.prompt}"`,
+    `seed: ${p.seed}`,
+    `checkpoint: ${p.checkpoint}`,
+  ];
+  if (p.controlnet) lines.push(`controlnet: ${p.controlnet} (strength ${p.controlnet_strength})`);
+  if (p.denoise != null) lines.push(`denoise: ${p.denoise}`);
+  lines.push(`generated: ${when}`);
+  lines.push(`session total: ${state.provenanceLog.length} generation(s)`);
+  document.getElementById('provenanceCard').textContent = lines.join('\n');
+}
+
+function disclosureText(p) {
+  const when = new Date(p.generated_at).toLocaleString();
+  let text = `This image's ${p.kind === 'background' ? 'background environment' : p.kind === 'region' ? 'added object' : 'content'} was generated using AI ` +
+    `(Stable Diffusion XL${p.controlnet ? ' with ControlNet depth guidance' : ''}) on ${when}.\n` +
+    `Model: ${p.checkpoint}\nSeed: ${p.seed}\nPrompt: "${p.prompt}"`;
+  if (p.controlnet) text += `\nControlNet: ${p.controlnet} (strength ${p.controlnet_strength}, denoise ${p.denoise})`;
+  return text;
 }
 
 function clipToMask(imageUrl, maskUrl) {
@@ -753,12 +790,28 @@ document.getElementById('btnSendSpout').onclick = async () => {
   setTimeout(() => { btn.textContent = originalText; }, 1500);
 };
 
+document.getElementById('btnCopyDisclosure').onclick = async () => {
+  const btn = document.getElementById('btnCopyDisclosure');
+  if (!state.provenanceLog.length) return;
+  const latest = state.provenanceLog[state.provenanceLog.length - 1];
+  const text = disclosureText(latest);
+  try {
+    await navigator.clipboard.writeText(text);
+    const originalText = btn.textContent;
+    btn.textContent = 'Copied ✓';
+    setTimeout(() => { btn.textContent = originalText; }, 1500);
+  } catch (e) {
+    alert(text); // clipboard API blocked (e.g. non-HTTPS context) -- show it directly instead
+  }
+};
+
 document.getElementById('btnExportJson').onclick = () => {
   const project = {
-    version: 2, savedAt: new Date().toISOString(),
+    version: 3, savedAt: new Date().toISOString(),
     original: state.original, cutout: state.cutout, mask: state.mask,
     pose: state.pose, depth: state.depth,
     illumination: state.illumination, layers: state.layers, activeLayerId: state.activeLayerId,
+    provenanceLog: state.provenanceLog, // full generation audit trail, every seed/prompt/setting used this session
     params: {
       prompt: state.lastPrompt,
       controlnet_strength: state.lastControlnetStrength,
@@ -788,8 +841,13 @@ document.getElementById('importInput').onchange = async () => {
     lastPrompt: project.params?.prompt || '',
     lastControlnetStrength: project.params?.controlnet_strength ?? 0.75,
     lastDenoise: project.params?.denoise ?? 0.85,
+    provenanceLog: project.provenanceLog || [], // older (v1/v2) project files just won't have an audit trail
   });
   nextLayerId = state.layers.length + 1;
+  if (state.provenanceLog.length) {
+    renderProvenanceCard(state.provenanceLog[state.provenanceLog.length - 1]);
+    document.getElementById('btnCopyDisclosure').disabled = false;
+  }
   document.getElementById('scenePrompt').value = state.lastPrompt;
   document.getElementById('cnStrength').value = state.lastControlnetStrength;
   document.getElementById('cnVal').textContent = state.lastControlnetStrength;

@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import websockets
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
@@ -34,6 +35,13 @@ import photoshoot_pipeline
 COMFY_ADDRESS = "127.0.0.1:8188"
 COMFY_CLIENT_ID = "web-photoshoot-bridge"
 BINARY_PREVIEW_EVENT = 1  # ComfyUI's BinaryEventTypes.PREVIEW_IMAGE
+
+# Matches workflows/txt2img_api.json and workflows/photoshoot_bg_api.json's
+# hardcoded ckpt_name/control_net_name — surfaced here too so the
+# provenance record doesn't have to re-parse the workflow JSON to know
+# what model actually produced a given image.
+CHECKPOINT_NAME = "RealVisXL_V5.0_fp16.safetensors"
+CONTROLNET_NAME = "diffusers_xl_depth_full.safetensors"
 
 # Virtual-production tie-in: pushes a generated composite out as its own
 # Spout source, so a real LED wall / projector on set can show it live
@@ -106,6 +114,7 @@ backend = ComfyBackend(COMFY_ADDRESS)
 current_ws: WebSocket | None = None
 active_prompt_id: str | None = None
 active_kind: str | None = None  # "image" | "background" | "region" — tells the client how to apply the result
+active_provenance: dict | None = None  # generation metadata for the "done" event's AI-content receipt
 
 
 # --- helpers ----------------------------------------------------------------
@@ -152,7 +161,7 @@ async def comfy_relay_loop():
 
 
 async def handle_comfy_message(message):
-    global active_prompt_id, active_kind
+    global active_prompt_id, active_kind, active_provenance
 
     if isinstance(message, (bytes, bytearray)):
         if len(message) < 8:
@@ -188,9 +197,15 @@ async def handle_comfy_message(message):
             # None node with our active prompt_id means this run just finished.
             image = await asyncio.to_thread(backend.get_result_image, prompt_id)
             if image is not None:
-                await send_json({"type": "done", "image_base64": pil_to_b64(image), "kind": active_kind})
+                await send_json({
+                    "type": "done",
+                    "image_base64": pil_to_b64(image),
+                    "kind": active_kind,
+                    "provenance": active_provenance,
+                })
             active_prompt_id = None
             active_kind = None
+            active_provenance = None
         else:
             await send_json({"type": "executing", "node": node})
 
@@ -198,6 +213,7 @@ async def handle_comfy_message(message):
         await send_json({"type": "error", "message": str(data.get("exception_message", "generation failed"))})
         active_prompt_id = None
         active_kind = None
+        active_provenance = None
 
 
 # --- HTTP routes --------------------------------------------------------------
@@ -251,18 +267,24 @@ async def ws_endpoint(websocket: WebSocket):
 
 
 async def handle_generate_image(msg: dict):
-    global active_prompt_id, active_kind
+    global active_prompt_id, active_kind, active_provenance
     prompt = (msg.get("prompt") or "").strip()
     if not prompt:
         return
-    prompt_id = await asyncio.to_thread(backend.queue_image_generation, prompt, COMFY_CLIENT_ID)
+    prompt_id, seed = await asyncio.to_thread(backend.queue_image_generation, prompt, COMFY_CLIENT_ID)
     active_prompt_id = prompt_id
     active_kind = "image"
+    active_provenance = {
+        "kind": "image", "prompt": prompt, "seed": seed,
+        "checkpoint": CHECKPOINT_NAME, "controlnet": None,
+        "controlnet_strength": None, "denoise": None,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
     await send_json({"type": "queued", "prompt_id": prompt_id})
 
 
 async def handle_generate_background(msg: dict):
-    global active_prompt_id, active_kind
+    global active_prompt_id, active_kind, active_provenance
     try:
         subject = b64_to_pil(msg["subject"]).convert("RGB")
         mask = b64_to_pil(msg["mask"]).convert("L")
@@ -277,7 +299,7 @@ async def handle_generate_background(msg: dict):
         await send_json({"type": "error", "message": f"bad request: {exc}"})
         return
 
-    prompt_id = await asyncio.to_thread(
+    prompt_id, seed = await asyncio.to_thread(
         backend.queue_background_generation,
         subject, background_mask, depth, prompt,
         controlnet_strength, denoise,
@@ -285,6 +307,12 @@ async def handle_generate_background(msg: dict):
     )
     active_prompt_id = prompt_id
     active_kind = "background"
+    active_provenance = {
+        "kind": "background", "prompt": prompt, "seed": seed,
+        "checkpoint": CHECKPOINT_NAME, "controlnet": CONTROLNET_NAME,
+        "controlnet_strength": controlnet_strength, "denoise": denoise,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
     await send_json({"type": "queued", "prompt_id": prompt_id})
 
 
@@ -300,7 +328,7 @@ async def handle_edit_region(msg: dict):
     so conditioning on it fights the model trying to introduce new geometry
     that wasn't there — empirically this suppressed the object entirely at
     background-regen strength."""
-    global active_prompt_id, active_kind
+    global active_prompt_id, active_kind, active_provenance
     try:
         composite = b64_to_pil(msg["subject"]).convert("RGB")
         region_mask = b64_to_pil(msg["mask"]).convert("L")
@@ -313,7 +341,7 @@ async def handle_edit_region(msg: dict):
         await send_json({"type": "error", "message": f"bad request: {exc}"})
         return
 
-    prompt_id = await asyncio.to_thread(
+    prompt_id, seed = await asyncio.to_thread(
         backend.queue_background_generation,
         composite, region_mask, depth, prompt,
         controlnet_strength, denoise,
@@ -321,6 +349,12 @@ async def handle_edit_region(msg: dict):
     )
     active_prompt_id = prompt_id
     active_kind = "region"
+    active_provenance = {
+        "kind": "region", "prompt": prompt, "seed": seed,
+        "checkpoint": CHECKPOINT_NAME, "controlnet": CONTROLNET_NAME,
+        "controlnet_strength": controlnet_strength, "denoise": denoise,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
     await send_json({"type": "queued", "prompt_id": prompt_id})
 
 
