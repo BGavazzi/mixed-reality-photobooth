@@ -170,6 +170,8 @@
     <div class="panel">
       <h2>Export</h2>
       <button id="btnExportPng" disabled>Flatten &amp; Download PNG</button>
+      <button class="secondary small" id="btnSendSpout" style="width:100%;margin-top:8px" disabled>Send to Spout (live projection)</button>
+      <div class="hint">Pushes the composite to a "PhotoBooth" Spout source -- pick it up in Resolume (Sources &gt; Spout &gt; PhotoBooth) or any Spout receiver to project it live on an LED wall/backdrop behind the model during the actual shoot.</div>
     </div>
   </div>
 </main>
@@ -339,6 +341,7 @@ async function handleGenerationDone(msg) {
   document.getElementById('btnExportPng').disabled = false;
   document.getElementById('btnExportJson').disabled = false;
   document.getElementById('btnExportLiving').disabled = false;
+  document.getElementById('btnSendSpout').disabled = false;
   setBusy(false);
   renderLayerPanel();
   redraw();
@@ -741,6 +744,15 @@ document.getElementById('btnExportPng').onclick = async () => {
   a.click();
 };
 
+document.getElementById('btnSendSpout').onclick = async () => {
+  const btn = document.getElementById('btnSendSpout');
+  const originalText = btn.textContent;
+  const url = await getCompositeDataUrl();
+  ws.send(JSON.stringify({ action: 'send_to_spout', image: url.split(',')[1] }));
+  btn.textContent = 'Sent to Spout ✓';
+  setTimeout(() => { btn.textContent = originalText; }, 1500);
+};
+
 document.getElementById('btnExportJson').onclick = () => {
   const project = {
     version: 2, savedAt: new Date().toISOString(),
@@ -794,6 +806,7 @@ document.getElementById('importInput').onchange = async () => {
   document.getElementById('btnExportPng').disabled = state.layers.length === 0;
   document.getElementById('btnExportJson').disabled = false;
   document.getElementById('btnExportLiving').disabled = state.layers.length === 0;
+  document.getElementById('btnSendSpout').disabled = state.layers.length === 0;
   document.getElementById('footerStatus').textContent = 'project imported';
   setBusy(false);
   renderLayerPanel();

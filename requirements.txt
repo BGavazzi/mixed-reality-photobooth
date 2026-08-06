@@ -17,6 +17,14 @@ onnxruntime
 controlnet_aux
 matplotlib
 
+# controlnet_aux hard-depends on opencv-python-headless, which silently
+# overwrites opencv-python's GUI build (same importable "cv2" module, one
+# wins on disk) -- breaks spout_viewer.py / bridge.py's video preview with
+# "waitKeyImpl ... Rebuild the library with Windows, GTK+ ... support".
+# After `pip install -r requirements.txt`, always run:
+#     pip install --force-reinstall opencv-python
+# to make sure the GUI build ends up the one actually on disk.
+
 # generation backends (backends/) — only the one(s) you use with --backend
 runwayml
 PyJWT
