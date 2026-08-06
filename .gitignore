@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .env
+fallback_examples/
+*_stdout.log
+*_stderr.log

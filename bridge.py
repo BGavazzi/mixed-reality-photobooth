@@ -142,16 +142,28 @@ class VideoPlaybackManager:
 
     def play(self, path: str, delete_on_replace: bool = True):
         with self.lock:
-            if self.current is not None:
-                self.current.stop()
-                if self.current_owned:
-                    try:
-                        os.remove(self.current.path)
-                    except OSError:
-                        pass
+            self._stop_current_locked()
             self.current = VideoLoopPlayer(self.frame_buffer, path)
             self.current_owned = delete_on_replace
             self.current.start()
+
+    def stop_current(self):
+        """Stop whatever video is looping, if any, so a plain image can be
+        published without the video thread immediately clobbering it on its
+        next tick."""
+        with self.lock:
+            self._stop_current_locked()
+
+    def _stop_current_locked(self):
+        if self.current is not None:
+            self.current.stop()  # joins the thread, so it can't set_image() after this returns
+            if self.current_owned:
+                try:
+                    os.remove(self.current.path)
+                except OSError:
+                    pass
+            self.current = None
+            self.current_owned = False
 
 
 # --- trigger -> generation plumbing -----------------------------------------
@@ -165,7 +177,7 @@ def load_prompts(prompts_path) -> dict:
         return json.load(f)
 
 
-def run_generation(backend, frame_buffer: FrameBuffer, prompt_text: str):
+def run_generation(backend, frame_buffer: FrameBuffer, prompt_text: str, video_manager: "VideoPlaybackManager" = None):
     if not frame_buffer.busy.acquire(blocking=False):
         print("[bridge] busy generating, ignoring trigger")
         return
@@ -173,6 +185,8 @@ def run_generation(backend, frame_buffer: FrameBuffer, prompt_text: str):
     def worker():
         try:
             image = backend.generate_image(prompt_text)
+            if video_manager is not None:
+                video_manager.stop_current()  # stop any looping video before publishing the new still
             frame_buffer.set_image(image)
             print("[bridge] frame updated")
         except Exception as exc:
@@ -183,7 +197,7 @@ def run_generation(backend, frame_buffer: FrameBuffer, prompt_text: str):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def make_clip_trigger_handler(backend, frame_buffer, prompts_path):
+def make_clip_trigger_handler(backend, frame_buffer, prompts_path, video_manager):
     prompts = load_prompts(prompts_path)
 
     def handler(address: str, *args):
@@ -198,7 +212,7 @@ def make_clip_trigger_handler(backend, frame_buffer, prompts_path):
         key = f"L{layer}C{clip}"
         prompt_text = prompts.get(key, prompts.get("_default", "abstract generative art"))
         print(f"[osc] clip trigger {key} -> {prompt_text!r}")
-        run_generation(backend, frame_buffer, prompt_text)
+        run_generation(backend, frame_buffer, prompt_text, video_manager)
 
     return handler
 
@@ -227,14 +241,14 @@ def run_video_generation(backend, frame_buffer: FrameBuffer, video_manager: Vide
     threading.Thread(target=worker, daemon=True).start()
 
 
-def make_manual_trigger_handler(backend, frame_buffer):
+def make_manual_trigger_handler(backend, frame_buffer, video_manager):
     def handler(address: str, *args):
         if not args:
             print("[osc] manual trigger with no prompt text, ignoring")
             return
         prompt_text = str(args[0])
         print(f"[osc] manual trigger -> {prompt_text!r}")
-        run_generation(backend, frame_buffer, prompt_text)
+        run_generation(backend, frame_buffer, prompt_text, video_manager)
 
     return handler
 
@@ -266,7 +280,7 @@ def make_play_file_handler(video_manager):
     return handler
 
 
-def make_resync_handler(backend, frame_buffer, resolume_url: str):
+def make_resync_handler(backend, frame_buffer, resolume_url: str, video_manager):
     def handler(address: str, *args):
         try:
             prompt_text = resolume_state.compose_prompt(resolume_url, RESYNC_STYLE_SUFFIX)
@@ -274,7 +288,7 @@ def make_resync_handler(backend, frame_buffer, resolume_url: str):
             print(f"[resolume] failed to read composition from {resolume_url}: {exc}")
             return
         print(f"[resolume] composed prompt -> {prompt_text!r}")
-        run_generation(backend, frame_buffer, prompt_text)
+        run_generation(backend, frame_buffer, prompt_text, video_manager)
 
     return handler
 
@@ -306,11 +320,11 @@ def main():
     spout_thread.start()
 
     disp = dispatcher.Dispatcher()
-    disp.map("/composition/layers/*/clips/*/connect", make_clip_trigger_handler(backend, frame_buffer, args.prompts))
-    disp.map(MANUAL_TRIGGER_ADDRESS, make_manual_trigger_handler(backend, frame_buffer))
+    disp.map("/composition/layers/*/clips/*/connect", make_clip_trigger_handler(backend, frame_buffer, args.prompts, video_manager))
+    disp.map(MANUAL_TRIGGER_ADDRESS, make_manual_trigger_handler(backend, frame_buffer, video_manager))
     disp.map(VIDEO_TRIGGER_ADDRESS, make_video_trigger_handler(backend, frame_buffer, video_manager))
     disp.map(PLAY_FILE_ADDRESS, make_play_file_handler(video_manager))
-    disp.map(RESYNC_TRIGGER_ADDRESS, make_resync_handler(backend, frame_buffer, args.resolume_url))
+    disp.map(RESYNC_TRIGGER_ADDRESS, make_resync_handler(backend, frame_buffer, args.resolume_url, video_manager))
 
     server = osc_server.ThreadingOSCUDPServer((OSC_LISTEN_IP, args.osc_port), disp)
     print(f"[osc] listening on {OSC_LISTEN_IP}:{args.osc_port}")

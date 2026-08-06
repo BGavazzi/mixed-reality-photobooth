@@ -1,12 +1,141 @@
 # resolume-genai-bridge
 
-Quick-and-dirty local demo connecting Resolume to generative AI, in both
-directions:
+Two demos in one repo, both built around orchestrating ComfyUI's real APIs
+(REST + its own progress/preview websocket) rather than just calling a
+`/generate` endpoint and waiting:
 
-- **Trigger → generate**: a Resolume clip trigger (or a manual/test call)
-  fires a still-image or video generation and streams the result back in
-  live as a Spout source.
-- **Resolume → prompt**: pull whatever's currently live in Resolume
+1. **Mixed-Reality Photo Booth** (primary) — a browser app that takes a
+   real photo of a person, extracts everything needed to regenerate the
+   environment around them (rotoscope, pose, depth, lighting), generates a
+   new depth-conditioned background or adds objects into it, and
+   composites the untouched original subject back on top. Live denoising
+   preview streams into the browser as it generates.
+2. **Resolume live VJ bridge** (original build, still included) — a
+   Resolume-to-generative-AI bridge that turns clip triggers or Resolume's
+   own live composition state into image/video generations, streamed back
+   as a Spout source.
+
+---
+
+## 1. Mixed-Reality Photo Booth
+
+```
+Browser (web/index.html)
+  |  upload photo
+  v
+POST /api/analyze  -----------------------------------------------+
+  |                                                                |
+  |  photoshoot_pipeline.py:                                      |
+  |    segment_subject()  -> rembg/birefnet-portrait -> cutout+mask
+  |    estimate_pose()    -> OpenPose/DWPose (controlnet_aux)     |
+  |    estimate_depth()   -> MiDaS (controlnet_aux)               |
+  |    estimate_illumination() -> plain CV on the subject pixels  |
+  |         (light direction / warmth / softness -> text descriptor)
+  v                                                                |
+Browser: layer stack (background / subject / pose / depth, <------+
+          each independently visible/opaque/movable/scalable)
+  |
+  |  scene prompt + "Generate Background"
+  v
+WS /ws  ==(relays ComfyUI's own websocket)==>  ComfyUI
+  |         - progress (step N/M)                  |
+  |         - executing (which node)                RealVisXL V5.0 (SDXL)
+  |         - binary preview frames (live denoise)   + ControlNet depth
+  |         - done -> final image                    inpaint, masked to
+  v                                                   background-only
+Browser: new background layer, or (region-draw tool)
+          a masked object inserted as its own layer
+  |
+  v
+Flatten & export PNG, or export a project .json (all layers +
+generation params) to resume/tweak later
+```
+
+The core idea: the subject's actual pixels are never re-generated. Only
+the region *around* them is, conditioned on their real pose/depth so the
+new environment stays geometrically consistent, then composited back
+with the original cutout on top.
+
+### Why a websocket relay instead of just polling
+
+ComfyUI already exposes a websocket with real-time `progress`,
+`executing`, and (with `--preview-method auto`) binary JPEG preview
+frames of the image mid-denoise. `web_server.py` keeps one persistent
+websocket connection to ComfyUI and relays those events straight to
+whichever browser tab is active — the browser shows the image actually
+forming, not a spinner. The binary preview frame format is
+undocumented-but-stable: `struct.pack(">I", event_type) + struct.pack(">I", image_type) + image_bytes`;
+verified against ComfyUI's own `server.py` (`encode_bytes`/`send_image`).
+
+### Setup
+
+```
+pip install -r requirements.txt
+```
+
+Models (ComfyUI's `models/` folder):
+- Checkpoint: [`RealVisXL_V5.0_fp16.safetensors`](https://huggingface.co/SG161222/RealVisXL_V5.0) in `models/checkpoints/`
+- ControlNet: [`diffusers_xl_depth_full.safetensors`](https://huggingface.co/lllyasviel/sd_control_collection) in `models/controlnet/`
+- Rotoscope/pose/depth models (`birefnet-portrait`, OpenPose, MiDaS) download automatically on first use via `rembg`/`controlnet_aux`.
+
+### Run
+
+```
+powershell -ExecutionPolicy Bypass -File start_demo.ps1
+```
+
+Starts ComfyUI (with `--preview-method auto`), waits for it to be ready,
+starts `web_server.py`, waits for that, opens the browser. Run
+`stop_demo.ps1` to shut both down. (If you double-click the script rather
+than running it from an already-open PowerShell window and the services
+don't seem to stay up, open PowerShell yourself and run it directly —
+that path is the one that's fully verified end-to-end.)
+
+Or manually:
+```
+python web_server.py     # http://127.0.0.1:8000, needs ComfyUI already running
+```
+
+### The region-draw "add object" tool
+
+Draws a box on the canvas, asks what belongs there, and inpaints just
+that masked region — added as its own layer, everything else untouched.
+Two things that matter for this to actually work, found empirically:
+
+- **ControlNet depth strength defaults near-zero for object insertion**
+  (vs. 0.75 for background regen). The depth map reflects the scene
+  *before* the new object exists, so conditioning on it fights the model
+  trying to introduce geometry that isn't there — at background-regen
+  strength the object just didn't appear at all.
+- **Minimum region size matters.** SDXL can't render a recognizable
+  object into a small masked patch — a tiny corner box just blends into
+  the surrounding background. ~30% of the canvas per side is the point
+  where this reliably stopped failing in testing; the UI enforces that
+  as a minimum.
+
+### Known limitations
+
+- Rotoscope (`birefnet-portrait`) runs CPU-only, ~20s/photo — this
+  machine's `onnxruntime-gpu` wants CUDA 13 libraries that aren't
+  published as pip wheels yet (checked: `nvidia-cublas-cu13` on PyPI is
+  a version-`0.0.1` placeholder).
+- Single generation in flight at a time, single browser session assumed
+  (matches the Resolume bridge's own busy-lock philosophy below).
+- The illumination estimate is classic CV (per-quadrant luminance,
+  highlight color, contrast), not a learned model — a useful heuristic
+  for prompt-grounding, not a physically accurate light probe.
+
+---
+
+## 2. Resolume live VJ bridge
+
+The original build this repo started as: a Resolume-to-generative-AI
+bridge in both directions.
+
+- **Trigger -> generate**: a Resolume clip trigger (or a manual/test
+  call) fires a still-image or video generation and streams the result
+  back live as a Spout source.
+- **Resolume -> prompt**: pull whatever's currently live in Resolume
   (active clip names, active effects, and the clip's actual thumbnail
   image) and turn it into a text prompt, so you can regenerate/reinterpret
   what the VJ actually built instead of typing a prompt by hand.
@@ -33,7 +162,7 @@ Resolume state <---- |     REST API -> name+effects   |         or
                        or  python spout_viewer.py  (no Resolume needed)
 ```
 
-## Prerequisites
+### Prerequisites
 
 - Windows (Spout is Windows-only)
 - A generation backend, at least one of:
@@ -46,11 +175,7 @@ Resolume state <---- |     REST API -> name+effects   |         or
   `test_trigger.py` and `spout_viewer.py` without it)
 - Python 3.10+ (SpoutGL ships prebuilt wheels for common CPython versions)
 
-## Setup
-
-```
-pip install -r requirements.txt
-```
+### Setup
 
 If you're using the ComfyUI backend:
 - Stills: edit `workflows/txt2img_api.json`, set `"ckpt_name"` (node `4`)
@@ -68,7 +193,7 @@ prompts for the clip-trigger path. `_default` covers any untracked clip.
 The resync path doesn't need this file — it builds its prompt from
 Resolume's live state instead.
 
-## Run
+### Run
 
 ```
 python bridge.py --backend comfy              # local Stable Diffusion / LTXV via ComfyUI
@@ -85,7 +210,12 @@ This starts an OSC listener (`:9000` by default) and a Spout sender named
 python spout_viewer.py
 ```
 
-opens a window showing whatever the bridge is currently sending.
+opens a window showing whatever the bridge is currently sending. Or use
+the typing-box GUI instead of raw OSC calls:
+
+```
+python gui.py
+```
 
 **In Resolume** (once you're ready):
 1. **Preferences > OSC** — enable OSC output, host `127.0.0.1`, port
@@ -96,7 +226,7 @@ opens a window showing whatever the bridge is currently sending.
 3. Add a layer, **Sources > Spout > ComfyBridge**.
 4. Trigger any clip to fire a generation from `prompts.json`.
 
-## Testing without Resolume open
+### Testing without Resolume open
 
 ```
 python test_trigger.py --clip 1 1        # simulate a clip trigger
@@ -109,7 +239,7 @@ python test_trigger.py --resync           # pull live state from Resolume's REST
 since it reads real composition state; the other three work with just
 `bridge.py` and a backend running.
 
-## How resync builds a prompt
+### How resync builds a prompt
 
 `resolume_state.py` calls Resolume's REST API (`GET /api/v1/composition`),
 walks the visible layers, and for each one's active (connected) clip pulls
@@ -130,7 +260,7 @@ from two sources:
 Fragments are joined, de-duplicated, and a fixed style suffix is
 appended.
 
-## How video generation works
+### How video generation works
 
 `--backend comfy` gets a `generate_video()` in addition to
 `generate_image()`. It queues `workflows/text_to_video_api.json` (LTXV
@@ -144,10 +274,11 @@ frames with OpenCV and feeds them into the same `FrameBuffer` the Spout
 sender reads from, looping until the next generation replaces it.
 Triggered via OSC `/comfybridge/generate_video` (arg0: prompt text).
 
-## Known limitations (this is a demo, not production)
+### Known limitations (this is a demo, not production)
 
 - Polls REST endpoints on a timer instead of using websocket/streaming
-  APIs — simpler, slightly higher latency.
+  APIs — simpler, slightly higher latency. (The photo booth app above
+  does use ComfyUI's websocket — see part 1.)
 - One generation in flight at a time; triggers that arrive while busy are
   dropped rather than queued.
 - Fixed output canvas (`SPOUT_WIDTH`/`SPOUT_HEIGHT` in `bridge.py`,
@@ -164,10 +295,10 @@ Triggered via OSC `/comfybridge/generate_video` (arg0: prompt text).
 
 ## Where this goes next
 
-- Websocket/streaming completion detection instead of polling, for lower
-  latency.
-- Queue triggers instead of dropping them while busy.
 - Runway/Kling `generate_video()` implementations (their APIs already
   support image-to-video/text-to-video).
 - Feed effect *parameter values* (not just names) into the resync prompt
   — e.g. a Colorize hue value as an actual color descriptor.
+- Photo booth: multi-region batch edits in one generation pass instead of
+  one masked region at a time; GPU-accelerated rotoscope once CUDA 13
+  onnxruntime wheels are published.
