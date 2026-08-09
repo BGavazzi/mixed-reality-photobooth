@@ -1,5 +1,7 @@
 # resolume-genai-bridge
 
+[![tests](https://github.com/BGavazzi/resolume-genai-bridge/actions/workflows/tests.yml/badge.svg)](https://github.com/BGavazzi/resolume-genai-bridge/actions/workflows/tests.yml)
+
 Two demos in one repo, both built around orchestrating ComfyUI's real APIs
 (REST + its own progress/preview websocket) rather than just calling a
 `/generate` endpoint and waiting:
@@ -169,8 +171,16 @@ photo:
   machine's `onnxruntime-gpu` wants CUDA 13 libraries that aren't
   published as pip wheels yet (checked: `nvidia-cublas-cu13` on PyPI is
   a version-`0.0.1` placeholder).
-- Single generation in flight at a time, single browser session assumed
-  (matches the Resolume bridge's own busy-lock philosophy below).
+- Multiple browser sessions can connect and queue concurrently — each `/ws`
+  connection gets its own session id, and ComfyUI's events route back by
+  `prompt_id → session` rather than to a single global "whoever connected
+  last." ComfyUI itself still renders one graph at a time (a real GPU
+  constraint), so concurrent sessions queue through its own `/prompt` queue;
+  what the routing guarantees is that each session gets *its own* result.
+  The CPU analysis stages serialize behind a lock for the same reason —
+  the cached PyTorch model instances aren't safe for concurrent forward
+  passes (reproduced: two simultaneous `/api/analyze` calls crashed inside
+  MiDaS).
 - The illumination estimate is classic CV (per-quadrant luminance,
   highlight color, contrast), not a learned model — a useful heuristic
   for prompt-grounding, not a physically accurate light probe.
@@ -186,9 +196,31 @@ photo:
   template (e.g. `PHOTOSHOOT_POSITIVE_PROMPT_NODE = "7"`) — a workflow
   re-exported from the ComfyUI UI could silently shift those IDs and
   break the app. A production version would want a small schema mapping
-  semantic node roles to IDs per workflow version.
+  semantic node roles to IDs per workflow version. Partially mitigated:
+  `tests/test_provenance.py` asserts every hardcoded ID still resolves to a
+  node with the expected input, so a renumbered workflow fails in CI rather
+  than at generation time — and the two model *names* in the provenance
+  record are already read by `class_type` instead of by ID.
 
 ### Testing
+
+Two complementary layers.
+
+**1. Offline unit tests** — no ComfyUI, no GPU, no photos, ~1 second:
+
+```
+pip install -r requirements-test.txt
+pytest
+```
+
+Covers the pure-logic parts of the pipeline (mask blob cleanup, illumination
+estimation, resolution capping, the ControlNet-strength heuristic, contact
+shadow geometry, cover-fit), the provenance extraction, and the multi-session
+job routing in `web_server.py` — the last driven against a fake backend, so
+the cross-session-leak cases can be checked without a GPU in the loop. Runs
+in CI on Python 3.10 and 3.12 (`.github/workflows/tests.yml`).
+
+**2. End-to-end verification** — needs the real stack running.
 
 `verify_web_ui.py` drives a real Chromium via Playwright through the full
 click-through path (upload → analyze → generate background → region-draw
@@ -204,6 +236,13 @@ python verify_web_ui.py --image path\to\any\subject\photo.jpg
 
 Needs ComfyUI and `web_server.py` already running. Screenshots and any
 exported downloads land in `verify_out/<timestamp>/` (gitignored).
+
+Three narrower scripts sit alongside it, same requirements:
+`verify_multi_session.py` (two concurrent tabs, real overlapping generations,
+asserts neither receives the other's result), `verify_canvas_fit.py`, and
+`verify_project_roundtrip.py`. They're named `verify_*` rather than `test_*`
+precisely because they *aren't* collectable tests — they parse argv, drive
+live servers, and depend on gitignored photos. `pytest` means `tests/` only.
 
 ---
 
@@ -252,7 +291,7 @@ Resolume state <---- |     REST API -> name+effects   |         or
   - Runway API access (`RUNWAYML_API_SECRET` env var) — https://docs.dev.runwayml.com
   - Kling AI API access (`KLING_ACCESS_KEY` / `KLING_SECRET_KEY` env vars) — https://kling.ai/document-api
 - Resolume Arena or Avenue (optional — everything works against
-  `test_trigger.py` and `spout_viewer.py` without it)
+  `send_trigger.py` and `spout_viewer.py` without it)
 - Python 3.10+ (SpoutGL ships prebuilt wheels for common CPython versions)
 
 ### Setup
@@ -309,10 +348,10 @@ python gui.py
 ### Testing without Resolume open
 
 ```
-python test_trigger.py --clip 1 1        # simulate a clip trigger
-python test_trigger.py --prompt "a cat made of stained glass"
-python test_trigger.py --video "a cat made of stained glass, slow pan"  # ComfyUI backend only
-python test_trigger.py --resync           # pull live state from Resolume's REST API
+python send_trigger.py --clip 1 1        # simulate a clip trigger
+python send_trigger.py --prompt "a cat made of stained glass"
+python send_trigger.py --video "a cat made of stained glass, slow pan"  # ComfyUI backend only
+python send_trigger.py --resync           # pull live state from Resolume's REST API
 ```
 
 `--resync` needs Resolume actually running (with the webserver enabled),

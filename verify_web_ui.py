@@ -11,7 +11,7 @@ expected DOM state, with a screenshot and any JS console errors, so a broken
 UI is caught before a live demo instead of during one.
 
 Requires ComfyUI and web_server.py already running -- this only drives the
-browser, the same assumption test_trigger.py makes about bridge.py.
+browser, the same assumption send_trigger.py makes about bridge.py.
 
     pip install playwright
     playwright install chromium

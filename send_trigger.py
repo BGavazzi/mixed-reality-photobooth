@@ -2,11 +2,11 @@
 Simulate OSC triggers so you can exercise the bridge without Resolume open.
 
 Examples:
-    python test_trigger.py --clip 1 1        # simulate Resolume layer 1 / clip 1 connect
-    python test_trigger.py --prompt "a cat made of stained glass"
-    python test_trigger.py --video "a cat made of stained glass, slow pan"  # ComfyUI backend only
-    python test_trigger.py --play-file "D:\\path\\to\\clip.mp4"            # play a pre-rendered file as-is
-    python test_trigger.py --resync           # pull live state from Resolume's REST API
+    python send_trigger.py --clip 1 1        # simulate Resolume layer 1 / clip 1 connect
+    python send_trigger.py --prompt "a cat made of stained glass"
+    python send_trigger.py --video "a cat made of stained glass, slow pan"  # ComfyUI backend only
+    python send_trigger.py --play-file "D:\\path\\to\\clip.mp4"            # play a pre-rendered file as-is
+    python send_trigger.py --resync           # pull live state from Resolume's REST API
 """
 
 import argparse

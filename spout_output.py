@@ -59,24 +59,52 @@ class SpoutFrameBuffer:
             return self.data
 
 
-def spout_sender_loop(frame_buffer: SpoutFrameBuffer, sender_name: str, fps: float, stop_event: threading.Event):
+def spout_sender_loop(frame_buffer: SpoutFrameBuffer, sender_name: str, fps: float,
+                       stop_event: threading.Event, live_event: threading.Event = None):
     """Blocking loop, intended to run in its own daemon thread: republishes
     frame_buffer's current frame over Spout as sender_name at fps until
-    stop_event is set."""
-    import SpoutGL
-    from OpenGL import GL
+    stop_event is set.
 
-    with SpoutGL.SpoutSender() as sender:
-        sender.setSenderName(sender_name)
-        print(f"[spout] sender '{sender_name}' started at {frame_buffer.width}x{frame_buffer.height}")
-        while not stop_event.is_set():
-            sender.sendImage(
-                frame_buffer.get_bytes(),
-                frame_buffer.width,
-                frame_buffer.height,
-                GL.GL_RGBA,
-                False,
-                0,
-            )
-            sender.setFrameSync(sender_name)
-            time.sleep(1.0 / fps)
+    live_event, if given, is set once the sender is actually publishing and
+    cleared when it stops, so a caller can tell the difference between "sent
+    to Spout" and "wrote a frame into a buffer nothing is reading."
+
+    Every failure here is reported rather than allowed to kill the thread
+    quietly. This runs as a daemon thread nobody joins, so an unhandled
+    exception -- most likely `import SpoutGL` on a machine without it, since
+    Spout is Windows-only -- printed a traceback into the startup noise and
+    then left the app looking completely healthy while "Send to Spout"
+    reported success and no Spout source ever appeared. Silence is the worst
+    possible outcome for an output whose whole job is to be picked up by
+    another application.
+    """
+    try:
+        import SpoutGL
+        from OpenGL import GL
+    except ImportError as exc:
+        print(f"[spout] DISABLED: {exc}. Spout is Windows-only (pip install SpoutGL PyOpenGL); "
+              f"everything else works, but no '{sender_name}' source will be published.")
+        return
+
+    try:
+        with SpoutGL.SpoutSender() as sender:
+            sender.setSenderName(sender_name)
+            print(f"[spout] sender '{sender_name}' started at {frame_buffer.width}x{frame_buffer.height}")
+            if live_event is not None:
+                live_event.set()
+            while not stop_event.is_set():
+                sender.sendImage(
+                    frame_buffer.get_bytes(),
+                    frame_buffer.width,
+                    frame_buffer.height,
+                    GL.GL_RGBA,
+                    False,
+                    0,
+                )
+                sender.setFrameSync(sender_name)
+                time.sleep(1.0 / fps)
+    except Exception as exc:
+        print(f"[spout] sender '{sender_name}' stopped with an error: {exc!r}")
+    finally:
+        if live_event is not None:
+            live_event.clear()

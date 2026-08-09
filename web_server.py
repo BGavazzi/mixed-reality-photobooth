@@ -25,24 +25,42 @@ import asyncio
 import base64
 import io
 import json
+import os
 import struct
 import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import websockets
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from backends.comfy import ComfyBackend, DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH
+from console_encoding import use_utf8_console
 from spout_output import SpoutFrameBuffer, spout_sender_loop
 import photoshoot_pipeline
 
-COMFY_ADDRESS = "127.0.0.1:8188"
+# Env-configurable so ComfyUI can live on another box (a GPU workstation on
+# the same LAN) without editing source. The relay URL, the REST backend, and
+# the /prompt submissions all derive from this one value.
+COMFY_ADDRESS = os.environ.get("COMFY_ADDRESS", "127.0.0.1:8188")
 COMFY_CLIENT_ID = "web-photoshoot-bridge"
 BINARY_PREVIEW_EVENT = 1  # ComfyUI's BinaryEventTypes.PREVIEW_IMAGE
+
+# Resolved against this file, not the process's working directory -- the
+# route used to serve the literal relative path "web/index.html", so
+# starting the server from anywhere but the repo root returned a 404 for
+# the entire app with no hint as to why.
+INDEX_HTML_PATH = Path(__file__).parent / "web" / "index.html"
+
+# Rejected before decoding rather than after. Pillow will happily start
+# allocating for a huge upload, and a decompression-bomb PNG can exhaust
+# memory during Image.open() itself -- this is a local demo, but "one bad
+# upload takes the server down mid-shoot" is a bad failure mode regardless.
+MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
 
 def _read_model_names_from_workflow(workflow_path) -> tuple[str, str]:
@@ -63,6 +81,14 @@ def _read_model_names_from_workflow(workflow_path) -> tuple[str, str]:
             checkpoint_name = node["inputs"]["ckpt_name"]
         elif class_type == "ControlNetLoader":
             controlnet_name = node["inputs"]["control_net_name"]
+    # Warn rather than raise: a missing name only degrades the provenance
+    # record, and refusing to import the module over it would take the whole
+    # app down for a cosmetic field. Silence, though, would let every
+    # disclosure card quietly read "checkpoint: null".
+    if checkpoint_name is None or controlnet_name is None:
+        print(f"[provenance] warning: {workflow_path} has no "
+              f"{'CheckpointLoaderSimple' if checkpoint_name is None else 'ControlNetLoader'} node; "
+              f"generated images will have an incomplete provenance record")
     return checkpoint_name, controlnet_name
 
 
@@ -82,6 +108,11 @@ PHOTOBOOTH_SPOUT_FPS = 15
 
 photobooth_frame_buffer = SpoutFrameBuffer(PHOTOBOOTH_SPOUT_WIDTH, PHOTOBOOTH_SPOUT_HEIGHT)
 spout_stop_event = threading.Event()
+# Set by the sender thread once it's genuinely publishing. Without this the
+# "Send to Spout" button reported success even on a machine where SpoutGL
+# isn't installed at all, which is the one situation where the user most
+# needs to be told why no source shows up in Resolume.
+spout_live_event = threading.Event()
 
 
 def _warm_up_pipeline_models():
@@ -121,7 +152,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(comfy_relay_loop())
     threading.Thread(
         target=spout_sender_loop,
-        args=(photobooth_frame_buffer, PHOTOBOOTH_SPOUT_NAME, PHOTOBOOTH_SPOUT_FPS, spout_stop_event),
+        args=(photobooth_frame_buffer, PHOTOBOOTH_SPOUT_NAME, PHOTOBOOTH_SPOUT_FPS,
+              spout_stop_event, spout_live_event),
         daemon=True,
     ).start()
     yield
@@ -202,7 +234,27 @@ async def comfy_relay_loop():
                     await handle_comfy_message(message)
         except Exception as exc:
             print(f"[relay] comfy ws error: {exc!r}, reconnecting in 2s")
-            await asyncio.sleep(2)
+        await _fail_orphaned_jobs("lost the connection to ComfyUI mid-generation")
+        await asyncio.sleep(2)
+
+
+async def _fail_orphaned_jobs(reason: str):
+    """Anything still in JOBS when the ComfyUI websocket drops can never
+    reach a terminal event: ComfyUI doesn't replay events on reconnect, so
+    those prompt_ids are unobservable from here even if the GPU goes on to
+    finish them. Left alone they were a double failure -- the JOBS entries
+    accumulated for the life of the process, and every affected browser sat
+    on a disabled Generate button forever waiting for a `done` that had
+    already been missed."""
+    global executing_prompt_id
+    if not JOBS:
+        return
+    orphaned = list(JOBS.items())
+    JOBS.clear()
+    executing_prompt_id = None
+    for prompt_id, job in orphaned:
+        print(f"[relay] orphaning job {prompt_id} ({reason})")
+        await send_json_to(job["session_id"], {"type": "error", "message": reason})
 
 
 async def handle_comfy_message(message):
@@ -246,14 +298,29 @@ async def handle_comfy_message(message):
     elif etype == "executing":
         node = data.get("node")
         if node is None:
-            # None node for a job we're tracking means this run just finished.
-            image = await asyncio.to_thread(backend.get_result_image, prompt_id)
+            # None node for a job we're tracking means this run just
+            # finished. Every exit from here must tell the client something:
+            # an unhandled exception used to propagate out of this coroutine
+            # into comfy_relay_loop's `async for`, tearing down and
+            # reconnecting the ComfyUI websocket while the browser sat on a
+            # disabled Generate button waiting for a "done" that could never
+            # arrive. A silent `image is None` had the same effect.
+            try:
+                image = await asyncio.to_thread(backend.get_result_image, prompt_id)
+            except Exception as exc:
+                print(f"[relay] fetching result for {prompt_id} failed: {exc!r}")
+                image = None
             if image is not None:
                 await send_json_to(session_id, {
                     "type": "done",
                     "image_base64": pil_to_b64(image),
                     "kind": job["kind"],
                     "provenance": job["provenance"],
+                })
+            else:
+                await send_json_to(session_id, {
+                    "type": "error",
+                    "message": "generation finished but its output image could not be retrieved from ComfyUI",
                 })
             JOBS.pop(prompt_id, None)
             if executing_prompt_id == prompt_id:
@@ -285,13 +352,31 @@ async def handle_comfy_message(message):
 
 @app.get("/")
 def index():
-    return FileResponse("web/index.html")
+    return FileResponse(INDEX_HTML_PATH)
 
 
 @app.post("/api/analyze")
 async def analyze(file: UploadFile = File(...)):
     raw = await file.read()
-    image = Image.open(io.BytesIO(raw)).convert("RGB")
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty upload")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"photo is {len(raw) // (1024 * 1024)}MB; the limit is {MAX_UPLOAD_BYTES // (1024 * 1024)}MB",
+        )
+    try:
+        # EXIF orientation matters here specifically: phone cameras store
+        # portrait shots as landscape pixels plus a rotation flag, so
+        # without exif_transpose the pose/depth/rotoscope stages all run on
+        # a sideways subject -- and the browser, which honours the flag when
+        # displaying the same file, would show an upright photo whose
+        # extracted layers are inexplicably rotated 90 degrees.
+        image = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    except (UnidentifiedImageError, OSError) as exc:
+        # Previously an unhandled exception here returned a 500 with a
+        # traceback; the browser's only clue was "analysis failed".
+        raise HTTPException(status_code=400, detail=f"could not read that file as an image: {exc}") from exc
 
     result = await asyncio.to_thread(photoshoot_pipeline.analyze, image)
 
@@ -343,36 +428,54 @@ async def ws_endpoint(websocket: WebSocket):
         # can't crash the relay loop or leak into another session's results.
 
 
-async def handle_generate_image(session_id: str, msg: dict):
-    prompt = (msg.get("prompt") or "").strip()
-    if not prompt:
-        return
-    # Registered *before* the queue call, with our own pre-generated
-    # prompt_id, not after -- ComfyUI's relay is a concurrent task and can
+async def _queue_job(session_id: str, kind: str, submit, provenance: dict):
+    """Shared submit-and-track path for every generation action.
+
+    The three handlers below were the same eleven lines of bookkeeping three
+    times over -- pre-register, submit, roll back on failure, attach
+    provenance, notify -- differing only in what they submit. Keeping the
+    ordering correct in one place matters more than usual here, because two
+    separate bugs already lived in it (see the comments below); triplicating
+    it meant triplicating both.
+
+    `submit` is a zero-arg callable returning (prompt_id, seed); it runs in a
+    worker thread because the backend's HTTP calls are blocking.
+    """
+    # Registered *before* the submit call, with our own pre-generated
+    # prompt_id, not after -- the ComfyUI relay is a concurrent task and can
     # start delivering events for a same-instant-queued job before this
     # coroutine's own await returns; without pre-registering, that first
-    # event would look up a JOBS entry that doesn't exist yet and get
-    # silently dropped. Confirmed ComfyUI's /prompt honors a client-supplied
-    # prompt_id and echoes it back unchanged.
+    # event would look up a JOBS entry that doesn't exist yet and be
+    # silently dropped. ComfyUI's /prompt honors a client-supplied prompt_id
+    # and echoes it back unchanged (confirmed empirically).
     prompt_id = str(uuid.uuid4())
-    JOBS[prompt_id] = {"session_id": session_id, "kind": "image", "provenance": None}
+    JOBS[prompt_id] = {"session_id": session_id, "kind": kind, "provenance": None}
     try:
-        _, seed = await asyncio.to_thread(backend.queue_image_generation, prompt, COMFY_CLIENT_ID, prompt_id)
+        _, seed = await asyncio.to_thread(submit, prompt_id)
     except Exception as exc:
-        # Pre-registering before the call means a failed submission (e.g.
-        # ComfyUI unreachable) would otherwise leave this JOBS entry
-        # orphaned forever -- clean it up and tell the client, same as any
-        # other request-time failure.
+        # Pre-registering means a failed submission (ComfyUI unreachable,
+        # bad workflow) would otherwise leave this JOBS entry orphaned for
+        # the life of the process -- roll it back and tell the client.
         JOBS.pop(prompt_id, None)
         await send_json_to(session_id, {"type": "error", "message": f"failed to queue generation: {exc}"})
         return
     JOBS[prompt_id]["provenance"] = {
-        "kind": "image", "prompt": prompt, "seed": seed,
-        "checkpoint": CHECKPOINT_NAME, "controlnet": None,
-        "controlnet_strength": None, "denoise": None,
+        "kind": kind, "seed": seed, "checkpoint": CHECKPOINT_NAME,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        **provenance,
     }
     await send_json_to(session_id, {"type": "queued", "prompt_id": prompt_id})
+
+
+async def handle_generate_image(session_id: str, msg: dict):
+    prompt = (msg.get("prompt") or "").strip()
+    if not prompt:
+        return
+    await _queue_job(
+        session_id, "image",
+        lambda prompt_id: backend.queue_image_generation(prompt, COMFY_CLIENT_ID, prompt_id),
+        {"prompt": prompt, "controlnet": None, "controlnet_strength": None, "denoise": None},
+    )
 
 
 async def handle_generate_background(session_id: str, msg: dict):
@@ -390,27 +493,15 @@ async def handle_generate_background(session_id: str, msg: dict):
         await send_json_to(session_id, {"type": "error", "message": f"bad request: {exc}"})
         return
 
-    prompt_id = str(uuid.uuid4())  # see handle_generate_image()'s comment on why this is pre-registered
-    JOBS[prompt_id] = {"session_id": session_id, "kind": "background", "provenance": None}
-    try:
-        _, seed = await asyncio.to_thread(
-            backend.queue_background_generation,
-            subject, background_mask, depth, prompt,
-            controlnet_strength, denoise,
-            client_id=COMFY_CLIENT_ID,
-            prompt_id=prompt_id,
-        )
-    except Exception as exc:
-        JOBS.pop(prompt_id, None)  # see handle_generate_image()'s comment -- avoids orphaning this entry
-        await send_json_to(session_id, {"type": "error", "message": f"failed to queue generation: {exc}"})
-        return
-    JOBS[prompt_id]["provenance"] = {
-        "kind": "background", "prompt": prompt, "seed": seed,
-        "checkpoint": CHECKPOINT_NAME, "controlnet": CONTROLNET_NAME,
-        "controlnet_strength": controlnet_strength, "denoise": denoise,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await send_json_to(session_id, {"type": "queued", "prompt_id": prompt_id})
+    await _queue_job(
+        session_id, "background",
+        lambda prompt_id: backend.queue_background_generation(
+            subject, background_mask, depth, prompt, controlnet_strength, denoise,
+            client_id=COMFY_CLIENT_ID, prompt_id=prompt_id,
+        ),
+        {"prompt": prompt, "controlnet": CONTROLNET_NAME,
+         "controlnet_strength": controlnet_strength, "denoise": denoise},
+    )
 
 
 async def handle_edit_region(session_id: str, msg: dict):
@@ -437,27 +528,15 @@ async def handle_edit_region(session_id: str, msg: dict):
         await send_json_to(session_id, {"type": "error", "message": f"bad request: {exc}"})
         return
 
-    prompt_id = str(uuid.uuid4())  # see handle_generate_image()'s comment on why this is pre-registered
-    JOBS[prompt_id] = {"session_id": session_id, "kind": "region", "provenance": None}
-    try:
-        _, seed = await asyncio.to_thread(
-            backend.queue_background_generation,
-            composite, region_mask, depth, prompt,
-            controlnet_strength, denoise,
-            client_id=COMFY_CLIENT_ID,
-            prompt_id=prompt_id,
-        )
-    except Exception as exc:
-        JOBS.pop(prompt_id, None)  # see handle_generate_image()'s comment -- avoids orphaning this entry
-        await send_json_to(session_id, {"type": "error", "message": f"failed to queue generation: {exc}"})
-        return
-    JOBS[prompt_id]["provenance"] = {
-        "kind": "region", "prompt": prompt, "seed": seed,
-        "checkpoint": CHECKPOINT_NAME, "controlnet": CONTROLNET_NAME,
-        "controlnet_strength": controlnet_strength, "denoise": denoise,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await send_json_to(session_id, {"type": "queued", "prompt_id": prompt_id})
+    await _queue_job(
+        session_id, "region",
+        lambda prompt_id: backend.queue_background_generation(
+            composite, region_mask, depth, prompt, controlnet_strength, denoise,
+            client_id=COMFY_CLIENT_ID, prompt_id=prompt_id,
+        ),
+        {"prompt": prompt, "controlnet": CONTROLNET_NAME,
+         "controlnet_strength": controlnet_strength, "denoise": denoise},
+    )
 
 
 async def handle_send_to_spout(session_id: str, msg: dict):
@@ -480,11 +559,19 @@ async def handle_send_to_spout(session_id: str, msg: dict):
     # other connected session's progress/preview delivery) right when
     # multi-session routing is supposed to keep sessions independent.
     await asyncio.to_thread(photobooth_frame_buffer.set_image, image)
+    if not spout_live_event.is_set():
+        await send_json_to(session_id, {
+            "type": "error",
+            "message": (f"the composite was staged, but the '{PHOTOBOOTH_SPOUT_NAME}' Spout sender "
+                        f"is not running (see the server log) — no receiver will see it"),
+        })
+        return
     await send_json_to(session_id, {"type": "spout_sent"})
 
 
 def main():
     import uvicorn
+    use_utf8_console()  # prompts are logged verbatim and can contain non-ASCII
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)

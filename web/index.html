@@ -220,13 +220,34 @@ const state = {
   provenanceLog: [], // every generation's metadata this session, for the disclosure card + export audit trail
   photoWidth: null, photoHeight: null, // the analyzed photo's real pixel size, for the canvas-fit offer
 };
-const imgCache = {};
+// Decoded-image cache keyed by source URL. Layer sources are stable data
+// URLs, so caching them is what keeps redraw() from re-decoding several
+// megabytes of PNG on every pointermove during a layer drag.
+const imgCache = new Map();
+const MAX_CACHED_IMAGES = 64;
 
-function loadImg(src) {
+function loadImg(src, { cache = true } = {}) {
+  const hit = imgCache.get(src);
+  if (hit) return Promise.resolve(hit);
   return new Promise((resolve) => {
-    if (imgCache[src]) return resolve(imgCache[src]);
     const im = new Image();
-    im.onload = () => { imgCache[src] = im; resolve(im); };
+    // Both handlers must settle this promise. With only onload, a src that
+    // failed to decode (truncated data URL, revoked blob URL) left the
+    // promise pending forever -- and since redraw() awaits it per layer,
+    // one bad layer silently froze all rendering for the rest of the
+    // session with no error surfaced anywhere.
+    im.onload = () => {
+      if (cache) {
+        // Bounded on purpose: entries are multi-megabyte data URLs, and an
+        // unbounded map of them is a steady leak across a long editing
+        // session. Map preserves insertion order, so the first key is the
+        // oldest.
+        if (imgCache.size >= MAX_CACHED_IMAGES) imgCache.delete(imgCache.keys().next().value);
+        imgCache.set(src, im);
+      }
+      resolve(im);
+    };
+    im.onerror = () => resolve(null);
     im.src = src;
   });
 }
@@ -238,15 +259,31 @@ const canvas = document.getElementById('compositeCanvas');
 const ctx = canvas.getContext('2d');
 
 async function redraw(cameraOffsetPx = 0) {
+  // Resolve every layer image BEFORE touching the canvas. redraw() is
+  // called from pointermove, requestAnimationFrame, and websocket
+  // callbacks, so several are routinely in flight at once; when the drawing
+  // loop itself awaited mid-paint, those interleaved -- one redraw's
+  // clearRect landing between another's layer draws. That showed up as
+  // flicker while dragging, and as half-composited output from
+  // getCompositeDataUrl() (PNG export, Spout send, region-edit source).
+  // Awaiting first and painting synchronously makes each redraw atomic:
+  // concurrent redraws can now only overwrite each other wholesale.
+  const drawable = state.layers.filter(l => l.visible && l.src);
+  const images = await Promise.all(drawable.map(l => loadImg(l.src)));
+  paintLayers(drawable, images, cameraOffsetPx);
+}
+
+function paintLayers(layers, images, cameraOffsetPx) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   // Overscan only kicks in during parallax motion, so a normal (offset=0)
   // redraw -- export, layer editing, everything else -- is pixel-identical
   // to before this feature existed. With motion, layers are drawn a bit
   // oversized so the camera shift never reveals empty canvas at the edges.
   const overscan = cameraOffsetPx !== 0 ? 1.08 : 1;
-  for (const layer of state.layers) {
-    if (!layer.visible || !layer.src) continue;
-    const im = await loadImg(layer.src);
+  for (let i = 0; i < layers.length; i++) {
+    const layer = layers[i];
+    const im = images[i];
+    if (!im) continue;  // failed to decode; skip it rather than abort the whole paint
     ctx.globalAlpha = layer.opacity;
     // Cover-fit to the image's own aspect ratio instead of stretching it to
     // the canvas's fixed square shape -- naive canvas.width x canvas.height
@@ -301,14 +338,24 @@ function connectWs() {
   ws = new WebSocket(`ws://${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => setConn(true);
-  ws.onclose = () => { setConn(false); setTimeout(connectWs, 1500); };
+  ws.onclose = () => {
+    setConn(false);
+    // The server routes results by session_id, and a reconnect gets a brand
+    // new one -- so any job queued on the old connection can never report
+    // back here. Clearing the busy state stops the UI stranding every
+    // generate button disabled forever after a single dropped socket.
+    if (isBusy) logEvent('connection lost — the in-flight generation can no longer report back', 'ev-error');
+    pendingGeneration = null;
+    setBusy(false);
+    setTimeout(connectWs, 1500);
+  };
   ws.onerror = () => setConn(false);
   ws.onmessage = (ev) => {
     if (ev.data instanceof ArrayBuffer) {
       const blob = new Blob([ev.data], { type: 'image/jpeg' });
-      previewUrl = URL.createObjectURL(blob);
+      setPreviewUrl(URL.createObjectURL(blob));
       document.getElementById('progressPanel').style.display = 'block';
-      drawLivePreview();
+      drawLivePreview(previewUrl);
       return;
     }
     handleServerEvent(JSON.parse(ev.data));
@@ -321,9 +368,22 @@ function setConn(ok) {
 }
 
 let previewUrl = null;
-async function drawLivePreview() {
-  if (!previewUrl) return;
-  const im = await loadImg(previewUrl);
+
+function setPreviewUrl(url) {
+  // Every mid-denoise preview frame arrives as its own Blob. Without
+  // revoking the previous object URL the browser pins each one for the life
+  // of the tab -- a 30-step generation streams dozens of frames, and they
+  // were also being written into imgCache under a key that could never be
+  // hit again, so nothing ever released them.
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  previewUrl = url;
+}
+
+async function drawLivePreview(url) {
+  // cache:false -- a blob URL is single-use and about to be revoked;
+  // caching it would pin the Blob and never produce a cache hit anyway.
+  const im = await loadImg(url, { cache: false });
+  if (!im || url !== previewUrl) return;  // decode failed, or a newer frame already landed
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(im, 0, 0, canvas.width, canvas.height);
 }
@@ -347,7 +407,7 @@ function handleServerEvent(msg) {
     panel.style.display = 'block';
     document.getElementById('progressText').textContent = 'queued…';
     document.getElementById('eventLog').innerHTML = '';
-    previewUrl = null;
+    setPreviewUrl(null);
     logEvent(`queued prompt_id=${msg.prompt_id}`);
   } else if (msg.type === 'executing') {
     document.getElementById('progressText').textContent = `executing node ${msg.node}`;
@@ -361,9 +421,13 @@ function handleServerEvent(msg) {
     document.getElementById('progressText').textContent = 'done';
     logEvent('generation complete', 'ev-done');
     handleGenerationDone(msg);
+  } else if (msg.type === 'spout_sent') {
+    logEvent('composite published to the PhotoBooth Spout source', 'ev-done');
+    resolveSpoutSend(true);
   } else if (msg.type === 'error') {
     logEvent('error: ' + msg.message, 'ev-error');
     document.getElementById('progressText').textContent = 'error — see log';
+    resolveSpoutSend(false);
     setBusy(false);
     redraw();
   }
@@ -372,14 +436,24 @@ function handleServerEvent(msg) {
 async function handleGenerationDone(msg) {
   const resultUrl = 'data:image/png;base64,' + msg.image_base64;
 
-  if (msg.kind === 'region' && pendingGeneration) {
+  if (msg.kind === 'region' && !pendingGeneration) {
+    // The mask that defines the region lives only in pendingGeneration, so
+    // without it the result can't be clipped into an object layer. This
+    // used to fall through to the final `else`, which pops the *sandbox*
+    // preview overlay -- a confusing way to surface a lost region edit.
+    logEvent('region result arrived without its mask (page reloaded mid-generation?) — discarded', 'ev-error');
+  } else if (msg.kind === 'region') {
     const clipped = await clipToMask(resultUrl, pendingGeneration.regionMaskUrl);
-    state.layers.push({
-      id: 'obj_' + (nextLayerId++), name: pendingGeneration.label, kind: 'object',
-      src: clipped, visible: true, opacity: 1, x: 0, y: 0, scale: 1, rotation: 0, parallax: 0.5,
-    });
-    state.activeLayerId = state.layers[state.layers.length - 1].id;
-    syncScaleSlider();
+    if (clipped) {
+      state.layers.push({
+        id: 'obj_' + (nextLayerId++), name: pendingGeneration.label, kind: 'object',
+        src: clipped, visible: true, opacity: 1, x: 0, y: 0, scale: 1, rotation: 0, parallax: 0.5,
+      });
+      state.activeLayerId = state.layers[state.layers.length - 1].id;
+      syncScaleSlider();
+    } else {
+      logEvent('region result could not be clipped to its mask — discarded', 'ev-error');
+    }
   } else if (msg.kind === 'background') {
     const bg = findLayer('background');
     if (bg) bg.src = resultUrl;
@@ -442,6 +516,7 @@ function disclosureText(p) {
 
 function clipToMask(imageUrl, maskUrl) {
   return Promise.all([loadImg(imageUrl), loadImg(maskUrl)]).then(([im, maskIm]) => {
+    if (!im || !maskIm) return null;  // loadImg resolves null on decode failure
     const c = document.createElement('canvas');
     c.width = canvas.width; c.height = canvas.height;
     const cctx = c.getContext('2d');
@@ -452,7 +527,9 @@ function clipToMask(imageUrl, maskUrl) {
   });
 }
 
+let isBusy = false;
 function setBusy(busy) {
+  isBusy = busy;
   document.getElementById('btnGenerate').disabled = busy || !state.cutout;
   document.getElementById('btnAddObject').disabled = busy || !state.cutout;
   document.getElementById('btnRelight').disabled = busy || !state.cutout;
@@ -1026,14 +1103,27 @@ document.getElementById('btnExportPng').onclick = async () => {
   a.click();
 };
 
+// Confirmation is driven by the server's reply, not by the click. The
+// button used to flip straight to "Sent to Spout ✓" the instant the
+// message left the browser -- which it did just as cheerfully on a machine
+// where the Spout sender never started, claiming success for an output no
+// receiver could possibly see.
+const SPOUT_BTN_LABEL = 'Send to Spout (live projection)';
 document.getElementById('btnSendSpout').onclick = async () => {
   const btn = document.getElementById('btnSendSpout');
-  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
   const url = await getCompositeDataUrl();
   ws.send(JSON.stringify({ action: 'send_to_spout', image: url.split(',')[1] }));
-  btn.textContent = 'Sent to Spout ✓';
-  setTimeout(() => { btn.textContent = originalText; }, 1500);
 };
+
+function resolveSpoutSend(ok) {
+  const btn = document.getElementById('btnSendSpout');
+  if (btn.textContent !== 'Sending…') return;  // not waiting on a send
+  btn.disabled = false;
+  btn.textContent = ok ? 'Sent to Spout ✓' : 'Spout send failed — see log';
+  setTimeout(() => { btn.textContent = SPOUT_BTN_LABEL; }, 2500);
+}
 
 document.getElementById('btnCopyDisclosure').onclick = async () => {
   const btn = document.getElementById('btnCopyDisclosure');
@@ -1050,6 +1140,21 @@ document.getElementById('btnCopyDisclosure').onclick = async () => {
   }
 };
 
+function modelNamesFromProvenance() {
+  // Walk backwards for the most recent entry that actually names a
+  // checkpoint. The quick-sandbox ('image') path has controlnet: null, so a
+  // plain `last entry` read would drop the ControlNet name from a project
+  // whose background genuinely used one.
+  const params = {};
+  for (let i = state.provenanceLog.length - 1; i >= 0; i--) {
+    const p = state.provenanceLog[i];
+    if (params.checkpoint == null && p.checkpoint) params.checkpoint = p.checkpoint;
+    if (params.controlnet == null && p.controlnet) params.controlnet = p.controlnet;
+    if (params.checkpoint && params.controlnet) break;
+  }
+  return params;
+}
+
 document.getElementById('btnExportJson').onclick = () => {
   const project = {
     version: 3, savedAt: new Date().toISOString(),
@@ -1059,12 +1164,18 @@ document.getElementById('btnExportJson').onclick = () => {
     provenanceLog: state.provenanceLog, // full generation audit trail, every seed/prompt/setting used this session
     canvasWidth: canvas.width, canvasHeight: canvas.height,
     photoWidth: state.photoWidth, photoHeight: state.photoHeight,
+    // Model names come from the provenance record the server attached to
+    // the last real generation -- which the server in turn reads out of the
+    // workflow JSON that actually ran (see _read_model_names_from_workflow
+    // in web_server.py). They used to be hardcoded string literals here,
+    // which silently made every exported project claim RealVisXL/depth_full
+    // no matter what the workflow was actually configured with. Same class
+    // of bug the server side already fixed; this was the other half of it.
     params: {
       prompt: state.lastPrompt,
       controlnet_strength: state.lastControlnetStrength,
       denoise: state.lastDenoise,
-      checkpoint: 'RealVisXL_V5.0_fp16.safetensors',
-      controlnet: 'diffusers_xl_depth_full.safetensors',
+      ...modelNamesFromProvenance(),
     },
   };
   const blob = new Blob([JSON.stringify(project, null, 2)], { type: 'application/json' });
