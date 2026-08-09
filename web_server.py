@@ -36,7 +36,7 @@ from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps
 
-from backends.comfy import ComfyBackend
+from backends.comfy import ComfyBackend, DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH
 from spout_output import SpoutFrameBuffer, spout_sender_loop
 import photoshoot_pipeline
 
@@ -44,12 +44,29 @@ COMFY_ADDRESS = "127.0.0.1:8188"
 COMFY_CLIENT_ID = "web-photoshoot-bridge"
 BINARY_PREVIEW_EVENT = 1  # ComfyUI's BinaryEventTypes.PREVIEW_IMAGE
 
-# Matches workflows/txt2img_api.json and workflows/photoshoot_bg_api.json's
-# hardcoded ckpt_name/control_net_name — surfaced here too so the
-# provenance record doesn't have to re-parse the workflow JSON to know
-# what model actually produced a given image.
-CHECKPOINT_NAME = "RealVisXL_V5.0_fp16.safetensors"
-CONTROLNET_NAME = "diffusers_xl_depth_full.safetensors"
+
+def _read_model_names_from_workflow(workflow_path) -> tuple[str, str]:
+    """Reads the checkpoint/ControlNet names straight out of the workflow
+    JSON that's actually used at generation time, by node class_type rather
+    than a hardcoded node ID (more robust to the workflow being re-exported
+    with different node numbering). Previously these were separate
+    hardcoded constants that duplicated the workflow file — if someone
+    swapped the model inside the workflow JSON without also updating the
+    constants here, every provenance record would silently keep reporting
+    the old model name even though a different one produced the image."""
+    with open(workflow_path) as f:
+        workflow = json.load(f)
+    checkpoint_name = controlnet_name = None
+    for node in workflow.values():
+        class_type = node.get("class_type")
+        if class_type == "CheckpointLoaderSimple":
+            checkpoint_name = node["inputs"]["ckpt_name"]
+        elif class_type == "ControlNetLoader":
+            controlnet_name = node["inputs"]["control_net_name"]
+    return checkpoint_name, controlnet_name
+
+
+CHECKPOINT_NAME, CONTROLNET_NAME = _read_model_names_from_workflow(DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH)
 
 # Virtual-production tie-in: pushes a generated composite out as its own
 # Spout source, so a real LED wall / projector on set can show it live
@@ -330,16 +347,30 @@ async def handle_generate_image(session_id: str, msg: dict):
     prompt = (msg.get("prompt") or "").strip()
     if not prompt:
         return
-    prompt_id, seed = await asyncio.to_thread(backend.queue_image_generation, prompt, COMFY_CLIENT_ID)
-    JOBS[prompt_id] = {
-        "session_id": session_id,
-        "kind": "image",
-        "provenance": {
-            "kind": "image", "prompt": prompt, "seed": seed,
-            "checkpoint": CHECKPOINT_NAME, "controlnet": None,
-            "controlnet_strength": None, "denoise": None,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        },
+    # Registered *before* the queue call, with our own pre-generated
+    # prompt_id, not after -- ComfyUI's relay is a concurrent task and can
+    # start delivering events for a same-instant-queued job before this
+    # coroutine's own await returns; without pre-registering, that first
+    # event would look up a JOBS entry that doesn't exist yet and get
+    # silently dropped. Confirmed ComfyUI's /prompt honors a client-supplied
+    # prompt_id and echoes it back unchanged.
+    prompt_id = str(uuid.uuid4())
+    JOBS[prompt_id] = {"session_id": session_id, "kind": "image", "provenance": None}
+    try:
+        _, seed = await asyncio.to_thread(backend.queue_image_generation, prompt, COMFY_CLIENT_ID, prompt_id)
+    except Exception as exc:
+        # Pre-registering before the call means a failed submission (e.g.
+        # ComfyUI unreachable) would otherwise leave this JOBS entry
+        # orphaned forever -- clean it up and tell the client, same as any
+        # other request-time failure.
+        JOBS.pop(prompt_id, None)
+        await send_json_to(session_id, {"type": "error", "message": f"failed to queue generation: {exc}"})
+        return
+    JOBS[prompt_id]["provenance"] = {
+        "kind": "image", "prompt": prompt, "seed": seed,
+        "checkpoint": CHECKPOINT_NAME, "controlnet": None,
+        "controlnet_strength": None, "denoise": None,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     await send_json_to(session_id, {"type": "queued", "prompt_id": prompt_id})
 
@@ -359,21 +390,25 @@ async def handle_generate_background(session_id: str, msg: dict):
         await send_json_to(session_id, {"type": "error", "message": f"bad request: {exc}"})
         return
 
-    prompt_id, seed = await asyncio.to_thread(
-        backend.queue_background_generation,
-        subject, background_mask, depth, prompt,
-        controlnet_strength, denoise,
-        client_id=COMFY_CLIENT_ID,
-    )
-    JOBS[prompt_id] = {
-        "session_id": session_id,
-        "kind": "background",
-        "provenance": {
-            "kind": "background", "prompt": prompt, "seed": seed,
-            "checkpoint": CHECKPOINT_NAME, "controlnet": CONTROLNET_NAME,
-            "controlnet_strength": controlnet_strength, "denoise": denoise,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        },
+    prompt_id = str(uuid.uuid4())  # see handle_generate_image()'s comment on why this is pre-registered
+    JOBS[prompt_id] = {"session_id": session_id, "kind": "background", "provenance": None}
+    try:
+        _, seed = await asyncio.to_thread(
+            backend.queue_background_generation,
+            subject, background_mask, depth, prompt,
+            controlnet_strength, denoise,
+            client_id=COMFY_CLIENT_ID,
+            prompt_id=prompt_id,
+        )
+    except Exception as exc:
+        JOBS.pop(prompt_id, None)  # see handle_generate_image()'s comment -- avoids orphaning this entry
+        await send_json_to(session_id, {"type": "error", "message": f"failed to queue generation: {exc}"})
+        return
+    JOBS[prompt_id]["provenance"] = {
+        "kind": "background", "prompt": prompt, "seed": seed,
+        "checkpoint": CHECKPOINT_NAME, "controlnet": CONTROLNET_NAME,
+        "controlnet_strength": controlnet_strength, "denoise": denoise,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     await send_json_to(session_id, {"type": "queued", "prompt_id": prompt_id})
 
@@ -402,21 +437,25 @@ async def handle_edit_region(session_id: str, msg: dict):
         await send_json_to(session_id, {"type": "error", "message": f"bad request: {exc}"})
         return
 
-    prompt_id, seed = await asyncio.to_thread(
-        backend.queue_background_generation,
-        composite, region_mask, depth, prompt,
-        controlnet_strength, denoise,
-        client_id=COMFY_CLIENT_ID,
-    )
-    JOBS[prompt_id] = {
-        "session_id": session_id,
-        "kind": "region",
-        "provenance": {
-            "kind": "region", "prompt": prompt, "seed": seed,
-            "checkpoint": CHECKPOINT_NAME, "controlnet": CONTROLNET_NAME,
-            "controlnet_strength": controlnet_strength, "denoise": denoise,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        },
+    prompt_id = str(uuid.uuid4())  # see handle_generate_image()'s comment on why this is pre-registered
+    JOBS[prompt_id] = {"session_id": session_id, "kind": "region", "provenance": None}
+    try:
+        _, seed = await asyncio.to_thread(
+            backend.queue_background_generation,
+            composite, region_mask, depth, prompt,
+            controlnet_strength, denoise,
+            client_id=COMFY_CLIENT_ID,
+            prompt_id=prompt_id,
+        )
+    except Exception as exc:
+        JOBS.pop(prompt_id, None)  # see handle_generate_image()'s comment -- avoids orphaning this entry
+        await send_json_to(session_id, {"type": "error", "message": f"failed to queue generation: {exc}"})
+        return
+    JOBS[prompt_id]["provenance"] = {
+        "kind": "region", "prompt": prompt, "seed": seed,
+        "checkpoint": CHECKPOINT_NAME, "controlnet": CONTROLNET_NAME,
+        "controlnet_strength": controlnet_strength, "denoise": denoise,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     await send_json_to(session_id, {"type": "queued", "prompt_id": prompt_id})
 
