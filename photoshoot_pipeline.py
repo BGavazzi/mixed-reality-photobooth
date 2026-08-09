@@ -16,17 +16,32 @@ layerable results rather than one opaque black-box call.
 Models are lazy-loaded and cached at module scope — the CV stages run on
 CPU (a few seconds each) so they don't fight the GPU with ComfyUI's SDXL
 generation, which runs concurrently.
+
+Concurrency note: the cached model instances above are shared across every
+call to analyze(), including genuinely concurrent ones from different
+web_server.py sessions (see its multi-session job routing). PyTorch
+`nn.Module` instances aren't guaranteed safe for concurrent forward passes
+from multiple threads without external synchronization -- confirmed
+directly: two real concurrent /api/analyze calls reproduced the exact same
+tensor-size-mismatch crash inside MiDaS that a *cold-start* single call had
+hit earlier (see web_server.py's warmup comment), except this one wasn't a
+cold-load race, it was two threads calling the same MidasDetector instance
+at once. _pipeline_lock serializes the model-touching stages so concurrent
+sessions queue safely instead of corrupting each other's inference.
 """
 
 import colorsys
+import threading
 from dataclasses import dataclass, asdict
 
+import cv2
 import numpy as np
 from PIL import Image
 
 _rembg_session = None
 _pose_detector = None
 _depth_detector = None
+_pipeline_lock = threading.Lock()
 
 
 def _get_rembg_session():
@@ -60,12 +75,42 @@ def _get_depth_detector():
 
 # --- rotoscope ---------------------------------------------------------
 
+_MIN_COMPONENT_AREA_RATIO = 0.03  # relative to the largest blob's area
+
+
+def _drop_tiny_disconnected_blobs(mask: Image.Image) -> Image.Image:
+    """Zeroes out alpha blobs that are disconnected from the main subject
+    AND tiny relative to it. rembg occasionally misclassifies a small
+    disconnected patch of a busy background (e.g. a sliver of a chair leg)
+    as subject — a real floating artifact, not a body part — since
+    alpha-channel thresholding has no notion of connectivity.
+
+    Deliberately NOT "keep only the largest blob": a subject can
+    legitimately have smaller disconnected regions that are still part of
+    them — a dangling earring, a held bag/phone, a strand of hair separated
+    by anti-aliasing — and discarding those would silently cut off a real
+    part of the subject. The area-ratio threshold is a heuristic, not a
+    guarantee: it trades "might keep a very small real artifact" against
+    "won't ever amputate a normal-sized accessory," which is the safer
+    failure mode for a photoshoot tool."""
+    binary = (np.asarray(mask) > 127).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if num_labels <= 2:  # just background (0) + the one subject blob
+        return mask
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest_area = areas.max()
+    keep_labels = {1 + i for i, area in enumerate(areas) if area >= largest_area * _MIN_COMPONENT_AREA_RATIO}
+    keep = np.isin(labels, list(keep_labels))
+    cleaned = np.where(keep, np.asarray(mask), 0).astype(np.uint8)
+    return Image.fromarray(cleaned, mode="L")
+
+
 def segment_subject(image: Image.Image) -> tuple[Image.Image, Image.Image]:
     """Returns (cutout_rgba, mask_l). mask is 255=subject, 0=background."""
     from rembg import remove
 
     cutout = remove(image.convert("RGB"), session=_get_rembg_session())
-    mask = cutout.split()[-1]  # alpha channel is already the subject mask, hard-edged
+    mask = _drop_tiny_disconnected_blobs(cutout.split()[-1])  # alpha channel is the subject mask, hard-edged
 
     # rembg's raw alpha edge is a hard cutoff, which shows as a visible seam
     # once composited over a different background. Soften just the cutout's
@@ -91,6 +136,62 @@ def estimate_pose(image: Image.Image) -> Image.Image:
     alpha = (arr.max(axis=-1) > 10).astype(np.uint8) * 255
     rgba = np.dstack([arr, alpha])
     return Image.fromarray(rgba, mode="RGBA")
+
+
+# --- ground-contact shadow (deterministic, no AI) ---------------------------
+
+# COCO-18/OpenPose body keypoint order used by controlnet_aux's Body model.
+_ANKLE_KEYPOINT_INDICES = (10, 13)  # RAnkle, LAnkle
+
+
+def detect_foot_points(image: Image.Image) -> list[tuple[float, float]]:
+    """Returns pixel-space (x, y) of any detected ankle keypoints. Pulled
+    from the same OpenPose model estimate_pose() uses, but read before it
+    gets rendered to a skeleton image — detect_poses() hands back the raw
+    (normalized 0-1) keypoint coordinates directly."""
+    detector = _get_pose_detector()
+    np_img = np.array(image.convert("RGB"))
+    poses = detector.detect_poses(np_img, include_hand=False, include_face=False)
+    if not poses:
+        return []
+
+    body = poses[0].body
+    w, h = image.size
+    points = []
+    for idx in _ANKLE_KEYPOINT_INDICES:
+        if idx < len(body.keypoints) and body.keypoints[idx] is not None:
+            kp = body.keypoints[idx]
+            points.append((kp.x * w, kp.y * h))
+    return points
+
+
+def generate_contact_shadow(image_size: tuple[int, int], foot_points: list[tuple[float, float]],
+                             opacity: int = 110) -> Image.Image:
+    """Classic photo-compositing trick, deliberately not AI: a soft dark
+    ellipse under each detected foot. Fast, deterministic, and always
+    correctly grounds the subject regardless of how good (or not) the
+    generated background turns out — a useful contrast to "let the model
+    figure it out." Returns an RGBA layer, transparent except the shadow(s)."""
+    from PIL import ImageDraw, ImageFilter
+
+    w, h = image_size
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    if not foot_points:
+        return layer
+
+    draw = ImageDraw.Draw(layer)
+    ellipse_w = w * 0.09
+    ellipse_h = ellipse_w * 0.30
+    foot_offset_y = h * 0.015  # ankle keypoint sits a bit above the actual sole
+
+    for x, y in foot_points:
+        gy = y + foot_offset_y
+        draw.ellipse(
+            [x - ellipse_w / 2, gy - ellipse_h / 2, x + ellipse_w / 2, gy + ellipse_h / 2],
+            fill=(0, 0, 0, opacity),
+        )
+
+    return layer.filter(ImageFilter.GaussianBlur(radius=max(2.0, ellipse_h * 0.5)))
 
 
 # --- depth ----------------------------------------------------------------
@@ -176,19 +277,87 @@ def estimate_illumination(image: Image.Image, mask: Image.Image) -> Illumination
     )
 
 
+# --- background complexity -> suggested ControlNet strength (plain CV) -----
+
+# Depth ControlNet conditions the new background on the *original* scene's
+# geometry. A plain backdrop has near-flat depth, so a high strength barely
+# constrains the model and the prompt is free to invent a whole new
+# environment. A background with real structure (furniture, a doorway, a
+# wall at an angle) has real depth variance -- at the same high strength,
+# the model ends up re-texturing that existing geometry instead of
+# replacing it, so a "reading nook" prompt over a room with a chair in it
+# comes back looking like the same room with a chair in it. Observed
+# directly: a photo with a leather armchair in frame barely changed under a
+# "cozy reading nook, bookshelves" prompt at strength 0.75.
+BUSY_BACKGROUND_DEPTH_STD = 25.0
+PLAIN_BACKGROUND_STRENGTH = 0.75
+BUSY_BACKGROUND_STRENGTH = 0.45
+
+
+def suggest_controlnet_strength(depth: Image.Image, mask: Image.Image) -> float:
+    """Heuristic, not a guarantee: measures depth variance in the
+    background region (inverse of the subject mask) and suggests a lower
+    ControlNet strength when that background has real 3D structure to
+    fight against, rather than always defaulting to the same value
+    regardless of what's actually behind the subject."""
+    depth_arr = np.asarray(depth.convert("L").resize((128, 128))).astype(np.float32)
+    mask_arr = np.asarray(mask.resize((128, 128))).astype(np.float32) / 255.0
+    background_px = depth_arr[mask_arr < 0.5]
+    if background_px.size == 0:
+        return PLAIN_BACKGROUND_STRENGTH
+    variance = float(background_px.std())
+    return BUSY_BACKGROUND_STRENGTH if variance > BUSY_BACKGROUND_DEPTH_STD else PLAIN_BACKGROUND_STRENGTH
+
+
 # --- convenience: run everything at once -----------------------------------
 
+# workflows/photoshoot_bg_api.json has no resize node -- VAEEncode runs at
+# the subject photo's *native* resolution. A realistic camera/phone photo
+# (e.g. 3875x5812, 22MP) pushed straight into that drove ComfyUI into a VAE
+# out-of-memory fallback ("retrying with tiled VAE encoding") and dropped
+# sampling from ~1.2s/step to ~41s/step -- observed directly: interrupted
+# after 374s at step 7/30, on track for ~20 minutes with zero error surfaced
+# to the user. 1536px keeps CPU stages fast and generation in the normal
+# 30-45s range while still being well above SDXL's native working resolution.
+MAX_INPUT_DIMENSION = 1536
+
+
+def cap_resolution(image: Image.Image) -> Image.Image:
+    if max(image.size) <= MAX_INPUT_DIMENSION:
+        return image
+    resized = image.copy()
+    resized.thumbnail((MAX_INPUT_DIMENSION, MAX_INPUT_DIMENSION), Image.LANCZOS)
+    return resized
+
+
 def analyze(image: Image.Image) -> dict:
-    """Runs all four stages and returns a dict of results, for the web
-    layer to hand straight to the client as separate layers."""
-    cutout, mask = segment_subject(image)
-    pose = estimate_pose(image)
-    depth = estimate_depth(image)
+    """Runs all stages and returns a dict of results, for the web layer to
+    hand straight to the client as separate layers. `image` is downscaled
+    first if oversized -- callers should treat the returned `image` as the
+    new canonical original (e.g. what gets sent back to the browser and
+    reused for later generation calls), not the caller's original object.
+
+    Holds _pipeline_lock for the model-touching stages: with web_server.py's
+    multi-session support, two sessions can call this concurrently from
+    different threads, and the cached model instances above aren't safe for
+    that without serializing (see module docstring). Concurrent callers
+    queue here rather than racing each other's inference."""
+    image = cap_resolution(image)
+    with _pipeline_lock:
+        cutout, mask = segment_subject(image)
+        pose = estimate_pose(image)
+        depth = estimate_depth(image)
+        foot_points = detect_foot_points(image)
     illumination = estimate_illumination(image, mask)
+    shadow = generate_contact_shadow(image.size, foot_points)
+    suggested_controlnet_strength = suggest_controlnet_strength(depth, mask)
     return {
+        "image": image,
         "cutout": cutout,
         "mask": mask,
+        "suggested_controlnet_strength": suggested_controlnet_strength,
         "pose": pose,
         "depth": depth,
         "illumination": illumination,
+        "shadow": shadow,
     }

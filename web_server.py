@@ -8,6 +8,14 @@ The whole generation step streams live over a websocket relay of ComfyUI's
 own progress + denoising-preview events, so the browser shows the image
 actually forming instead of a spinner.
 
+Multiple browser tabs/sessions can be connected and have jobs in flight at
+once -- each /ws connection gets its own session_id, and ComfyUI's events
+route back by prompt_id -> session rather than to a single global "whoever
+connected last." ComfyUI itself still renders one graph at a time (a real
+GPU constraint), so concurrent sessions queue naturally through its own
+/prompt queue; what multi-session routing fixes is that each session
+correctly gets *its own* results instead of racing a shared global.
+
     python web_server.py
     -> http://127.0.0.1:8000
 """
@@ -19,21 +27,46 @@ import io
 import json
 import struct
 import threading
-import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import websockets
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps
 
-from backends.comfy import ComfyBackend
+from backends.comfy import ComfyBackend, DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH
+from spout_output import SpoutFrameBuffer, spout_sender_loop
 import photoshoot_pipeline
 
 COMFY_ADDRESS = "127.0.0.1:8188"
 COMFY_CLIENT_ID = "web-photoshoot-bridge"
 BINARY_PREVIEW_EVENT = 1  # ComfyUI's BinaryEventTypes.PREVIEW_IMAGE
+
+
+def _read_model_names_from_workflow(workflow_path) -> tuple[str, str]:
+    """Reads the checkpoint/ControlNet names straight out of the workflow
+    JSON that's actually used at generation time, by node class_type rather
+    than a hardcoded node ID (more robust to the workflow being re-exported
+    with different node numbering). Previously these were separate
+    hardcoded constants that duplicated the workflow file — if someone
+    swapped the model inside the workflow JSON without also updating the
+    constants here, every provenance record would silently keep reporting
+    the old model name even though a different one produced the image."""
+    with open(workflow_path) as f:
+        workflow = json.load(f)
+    checkpoint_name = controlnet_name = None
+    for node in workflow.values():
+        class_type = node.get("class_type")
+        if class_type == "CheckpointLoaderSimple":
+            checkpoint_name = node["inputs"]["ckpt_name"]
+        elif class_type == "ControlNetLoader":
+            controlnet_name = node["inputs"]["control_net_name"]
+    return checkpoint_name, controlnet_name
+
+
+CHECKPOINT_NAME, CONTROLNET_NAME = _read_model_names_from_workflow(DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH)
 
 # Virtual-production tie-in: pushes a generated composite out as its own
 # Spout source, so a real LED wall / projector on set can show it live
@@ -47,53 +80,50 @@ PHOTOBOOTH_SPOUT_HEIGHT = 768
 PHOTOBOOTH_SPOUT_FPS = 15
 
 
-class SpoutFrameBuffer:
-    def __init__(self, width: int, height: int):
-        self.width = width
-        self.height = height
-        self.lock = threading.Lock()
-        self.data = bytes([20, 20, 24, 255]) * (width * height)  # placeholder: near-black
-
-    def set_image(self, image: Image.Image):
-        if image.size != (self.width, self.height):
-            image = image.resize((self.width, self.height), Image.LANCZOS)
-        with self.lock:
-            self.data = image.convert("RGBA").tobytes()
-
-    def get_bytes(self) -> bytes:
-        with self.lock:
-            return self.data
-
-
 photobooth_frame_buffer = SpoutFrameBuffer(PHOTOBOOTH_SPOUT_WIDTH, PHOTOBOOTH_SPOUT_HEIGHT)
 spout_stop_event = threading.Event()
 
 
-def photobooth_spout_loop():
-    import SpoutGL
-    from OpenGL import GL
+def _warm_up_pipeline_models():
+    """Runs each CV stage once on a throwaway image before the server takes
+    real traffic. Without this, the *first* real upload pays for lazy model
+    construction (rembg session, OpenposeDetector, MidasDetector) inline —
+    and MiDaS's first-ever forward pass in a freshly loaded process has been
+    observed to fail outright with a tensor-size mismatch inside its DPT
+    skip connections (a cold-load race, not an input-size problem: a second
+    call in the same process succeeds every time). Warming up here moves
+    that cost and that failure mode out of the user-facing request path.
 
-    with SpoutGL.SpoutSender() as sender:
-        sender.setSenderName(PHOTOBOOTH_SPOUT_NAME)
-        print(f"[spout] sender '{PHOTOBOOTH_SPOUT_NAME}' started at "
-              f"{PHOTOBOOTH_SPOUT_WIDTH}x{PHOTOBOOTH_SPOUT_HEIGHT}")
-        while not spout_stop_event.is_set():
-            sender.sendImage(
-                photobooth_frame_buffer.get_bytes(),
-                photobooth_frame_buffer.width,
-                photobooth_frame_buffer.height,
-                GL.GL_RGBA,
-                False,
-                0,
-            )
-            sender.setFrameSync(PHOTOBOOTH_SPOUT_NAME)
-            time.sleep(1.0 / PHOTOBOOTH_SPOUT_FPS)
+    Retries once on failure precisely because it's the *first* call that's
+    been observed to trip the race — if warmup itself hits it, a second
+    attempt in the same now-partially-loaded process is the empirically
+    reliable recovery. If both attempts fail, log and let the server start
+    anyway: failing startup entirely over a cold-load race would be a worse
+    outcome than the pre-warmup behavior of only the first real request
+    failing."""
+    dummy = Image.new("RGB", (512, 512), (128, 128, 128))
+    try:
+        photoshoot_pipeline.analyze(dummy)
+    except Exception as exc:
+        print(f"[warmup] first attempt failed ({exc!r}), retrying once...")
+        try:
+            photoshoot_pipeline.analyze(dummy)
+        except Exception as exc2:
+            print(f"[warmup] retry also failed ({exc2!r}) — starting anyway, "
+                  f"first real upload may hit this instead")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print("[warmup] loading rotoscope/pose/depth models...")
+    await asyncio.to_thread(_warm_up_pipeline_models)
+    print("[warmup] done")
     asyncio.create_task(comfy_relay_loop())
-    threading.Thread(target=photobooth_spout_loop, daemon=True).start()
+    threading.Thread(
+        target=spout_sender_loop,
+        args=(photobooth_frame_buffer, PHOTOBOOTH_SPOUT_NAME, PHOTOBOOTH_SPOUT_FPS, spout_stop_event),
+        daemon=True,
+    ).start()
     yield
     spout_stop_event.set()
 
@@ -101,11 +131,25 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 backend = ComfyBackend(COMFY_ADDRESS)
 
-# Single-generation-at-a-time, single-demo-user design (matches bridge.py's
-# own busy-lock philosophy) — one active browser socket, one active job.
-current_ws: WebSocket | None = None
-active_prompt_id: str | None = None
-active_kind: str | None = None  # "image" | "background" | "region" — tells the client how to apply the result
+# Multi-session job routing. Each browser tab that opens /ws gets its own
+# session_id; ComfyUI's own websocket events carry a prompt_id, and JOBS
+# maps that back to the session that queued it, so results route to the
+# *right* client instead of a single global "whoever's currently active" --
+# the earlier design meant a second concurrent tab would silently steal or
+# corrupt the first tab's in-flight generation. ComfyUI itself still only
+# executes one graph at a time (a real GPU constraint, not a shortcut taken
+# here) — multiple sessions queueing concurrently now queue correctly
+# through ComfyUI's own /prompt queue instead of racing a shared global.
+SESSIONS: dict[str, WebSocket] = {}  # session_id -> websocket
+JOBS: dict[str, dict] = {}  # prompt_id -> {"session_id", "kind", "provenance"}
+
+# Binary preview frames carry no prompt_id in ComfyUI's wire protocol (see
+# "Why a websocket relay instead of just polling" in README.md) -- this is
+# the one place a single "currently active" value is actually correct
+# rather than a limitation, since it mirrors ComfyUI's real one-graph-at-
+# a-time execution: whichever prompt_id we last saw in a JSON event is
+# unambiguously the one whose binary frames are arriving right now.
+executing_prompt_id: str | None = None
 
 
 # --- helpers ----------------------------------------------------------------
@@ -120,20 +164,30 @@ def b64_to_pil(data: str) -> Image.Image:
     return Image.open(io.BytesIO(base64.b64decode(data)))
 
 
-async def send_json(payload: dict):
-    if current_ws is not None:
+async def send_json_to(session_id: str, payload: dict):
+    ws = SESSIONS.get(session_id)
+    if ws is not None:
         try:
-            await current_ws.send_json(payload)
+            await ws.send_json(payload)
         except Exception as exc:
-            print(f"[ws] send failed: {exc}")
+            print(f"[ws] send to session {session_id} failed: {exc}")
 
 
-async def send_bytes(data: bytes):
-    if current_ws is not None:
+async def send_bytes_to(session_id: str, data: bytes):
+    ws = SESSIONS.get(session_id)
+    if ws is not None:
         try:
-            await current_ws.send_bytes(data)
+            await ws.send_bytes(data)
         except Exception as exc:
-            print(f"[ws] send failed: {exc}")
+            print(f"[ws] send to session {session_id} failed: {exc}")
+
+
+async def broadcast_json(payload: dict):
+    for ws in list(SESSIONS.values()):
+        try:
+            await ws.send_json(payload)
+        except Exception as exc:
+            print(f"[ws] broadcast failed: {exc}")
 
 
 # --- ComfyUI websocket relay -------------------------------------------------
@@ -152,14 +206,16 @@ async def comfy_relay_loop():
 
 
 async def handle_comfy_message(message):
-    global active_prompt_id, active_kind
+    global executing_prompt_id
 
     if isinstance(message, (bytes, bytearray)):
         if len(message) < 8:
             return
         event_type = struct.unpack(">I", message[:4])[0]
-        if event_type == BINARY_PREVIEW_EVENT:
-            await send_bytes(message[8:])  # strip 4-byte event + 4-byte format header
+        if event_type == BINARY_PREVIEW_EVENT and executing_prompt_id is not None:
+            job = JOBS.get(executing_prompt_id)
+            if job is not None:
+                await send_bytes_to(job["session_id"], message[8:])  # strip 4-byte event + 4-byte format header
         return
 
     try:
@@ -172,32 +228,57 @@ async def handle_comfy_message(message):
     prompt_id = data.get("prompt_id")
 
     if etype == "status":
+        # Not job-specific -- every connected session sees overall queue
+        # depth, not just whichever session happens to have a job in flight.
         queue_remaining = data.get("status", {}).get("exec_info", {}).get("queue_remaining")
-        await send_json({"type": "status", "queue_remaining": queue_remaining})
+        await broadcast_json({"type": "status", "queue_remaining": queue_remaining})
         return
 
-    if active_prompt_id is None or prompt_id != active_prompt_id:
-        return
+    job = JOBS.get(prompt_id)
+    if job is None:
+        return  # not a job we queued (or already finished/errored and cleaned up)
+    session_id = job["session_id"]
 
     if etype == "progress":
-        await send_json({"type": "progress", "value": data.get("value"), "max": data.get("max")})
+        executing_prompt_id = prompt_id
+        await send_json_to(session_id, {"type": "progress", "value": data.get("value"), "max": data.get("max")})
 
     elif etype == "executing":
         node = data.get("node")
         if node is None:
-            # None node with our active prompt_id means this run just finished.
+            # None node for a job we're tracking means this run just finished.
             image = await asyncio.to_thread(backend.get_result_image, prompt_id)
             if image is not None:
-                await send_json({"type": "done", "image_base64": pil_to_b64(image), "kind": active_kind})
-            active_prompt_id = None
-            active_kind = None
+                await send_json_to(session_id, {
+                    "type": "done",
+                    "image_base64": pil_to_b64(image),
+                    "kind": job["kind"],
+                    "provenance": job["provenance"],
+                })
+            JOBS.pop(prompt_id, None)
+            if executing_prompt_id == prompt_id:
+                executing_prompt_id = None
         else:
-            await send_json({"type": "executing", "node": node})
+            executing_prompt_id = prompt_id
+            await send_json_to(session_id, {"type": "executing", "node": node})
 
     elif etype == "execution_error":
-        await send_json({"type": "error", "message": str(data.get("exception_message", "generation failed"))})
-        active_prompt_id = None
-        active_kind = None
+        await send_json_to(session_id, {"type": "error", "message": str(data.get("exception_message", "generation failed"))})
+        JOBS.pop(prompt_id, None)
+        if executing_prompt_id == prompt_id:
+            executing_prompt_id = None
+
+    elif etype == "execution_interrupted":
+        # Fires if a job is cancelled from ComfyUI's own UI/API (queue
+        # cleared, manually interrupted) rather than through this app --
+        # without handling it, JOBS would never get cleaned up for that
+        # prompt_id and would sit there for the life of the process, a slow
+        # per-cancelled-job memory leak on what's meant to be a long-running
+        # server.
+        await send_json_to(session_id, {"type": "error", "message": "generation was interrupted"})
+        JOBS.pop(prompt_id, None)
+        if executing_prompt_id == prompt_id:
+            executing_prompt_id = None
 
 
 # --- HTTP routes --------------------------------------------------------------
@@ -215,12 +296,19 @@ async def analyze(file: UploadFile = File(...)):
     result = await asyncio.to_thread(photoshoot_pipeline.analyze, image)
 
     return JSONResponse({
-        "original": pil_to_b64(image),
+        # result["image"] is `image` downscaled if it was oversized -- this,
+        # not the raw upload, becomes the browser's canonical "original" and
+        # is what later generation calls send back as the subject photo.
+        "original": pil_to_b64(result["image"]),
         "cutout": pil_to_b64(result["cutout"]),
         "mask": pil_to_b64(result["mask"]),
         "pose": pil_to_b64(result["pose"]),
         "depth": pil_to_b64(result["depth"]),
+        "shadow": pil_to_b64(result["shadow"]),
         "illumination": result["illumination"].to_dict(),
+        "suggested_controlnet_strength": result["suggested_controlnet_strength"],
+        "width": result["image"].width,
+        "height": result["image"].height,
     })
 
 
@@ -228,41 +316,66 @@ async def analyze(file: UploadFile = File(...)):
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
-    global current_ws
+    session_id = str(uuid.uuid4())
     await websocket.accept()
-    current_ws = websocket
+    SESSIONS[session_id] = websocket
     try:
         while True:
             msg = await websocket.receive_json()
             action = msg.get("action")
 
             if action == "generate_image":
-                asyncio.create_task(handle_generate_image(msg))
+                asyncio.create_task(handle_generate_image(session_id, msg))
             elif action == "generate_background":
-                asyncio.create_task(handle_generate_background(msg))
+                asyncio.create_task(handle_generate_background(session_id, msg))
             elif action == "edit_region":
-                asyncio.create_task(handle_edit_region(msg))
+                asyncio.create_task(handle_edit_region(session_id, msg))
             elif action == "send_to_spout":
-                asyncio.create_task(handle_send_to_spout(msg))
+                asyncio.create_task(handle_send_to_spout(session_id, msg))
 
     except WebSocketDisconnect:
-        if current_ws is websocket:
-            current_ws = None
+        pass
+    finally:
+        SESSIONS.pop(session_id, None)
+        # Jobs this session queued are left in JOBS -- ComfyUI still renders
+        # them, and send_json_to()/send_bytes_to() just no-op once the
+        # session is gone rather than erroring, so a disconnect mid-generation
+        # can't crash the relay loop or leak into another session's results.
 
 
-async def handle_generate_image(msg: dict):
-    global active_prompt_id, active_kind
+async def handle_generate_image(session_id: str, msg: dict):
     prompt = (msg.get("prompt") or "").strip()
     if not prompt:
         return
-    prompt_id = await asyncio.to_thread(backend.queue_image_generation, prompt, COMFY_CLIENT_ID)
-    active_prompt_id = prompt_id
-    active_kind = "image"
-    await send_json({"type": "queued", "prompt_id": prompt_id})
+    # Registered *before* the queue call, with our own pre-generated
+    # prompt_id, not after -- ComfyUI's relay is a concurrent task and can
+    # start delivering events for a same-instant-queued job before this
+    # coroutine's own await returns; without pre-registering, that first
+    # event would look up a JOBS entry that doesn't exist yet and get
+    # silently dropped. Confirmed ComfyUI's /prompt honors a client-supplied
+    # prompt_id and echoes it back unchanged.
+    prompt_id = str(uuid.uuid4())
+    JOBS[prompt_id] = {"session_id": session_id, "kind": "image", "provenance": None}
+    try:
+        _, seed = await asyncio.to_thread(backend.queue_image_generation, prompt, COMFY_CLIENT_ID, prompt_id)
+    except Exception as exc:
+        # Pre-registering before the call means a failed submission (e.g.
+        # ComfyUI unreachable) would otherwise leave this JOBS entry
+        # orphaned forever -- clean it up and tell the client, same as any
+        # other request-time failure.
+        JOBS.pop(prompt_id, None)
+        await send_json_to(session_id, {"type": "error", "message": f"failed to queue generation: {exc}"})
+        return
+    JOBS[prompt_id]["provenance"] = {
+        "kind": "image", "prompt": prompt, "seed": seed,
+        "checkpoint": CHECKPOINT_NAME, "controlnet": None,
+        "controlnet_strength": None, "denoise": None,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await send_json_to(session_id, {"type": "queued", "prompt_id": prompt_id})
 
 
-async def handle_generate_background(msg: dict):
-    global active_prompt_id, active_kind
+async def handle_generate_background(session_id: str, msg: dict):
     try:
         subject = b64_to_pil(msg["subject"]).convert("RGB")
         mask = b64_to_pil(msg["mask"]).convert("L")
@@ -274,21 +387,33 @@ async def handle_generate_background(msg: dict):
         controlnet_strength = float(msg.get("controlnet_strength", 0.75))
         denoise = float(msg.get("denoise", 0.85))
     except Exception as exc:
-        await send_json({"type": "error", "message": f"bad request: {exc}"})
+        await send_json_to(session_id, {"type": "error", "message": f"bad request: {exc}"})
         return
 
-    prompt_id = await asyncio.to_thread(
-        backend.queue_background_generation,
-        subject, background_mask, depth, prompt,
-        controlnet_strength, denoise,
-        client_id=COMFY_CLIENT_ID,
-    )
-    active_prompt_id = prompt_id
-    active_kind = "background"
-    await send_json({"type": "queued", "prompt_id": prompt_id})
+    prompt_id = str(uuid.uuid4())  # see handle_generate_image()'s comment on why this is pre-registered
+    JOBS[prompt_id] = {"session_id": session_id, "kind": "background", "provenance": None}
+    try:
+        _, seed = await asyncio.to_thread(
+            backend.queue_background_generation,
+            subject, background_mask, depth, prompt,
+            controlnet_strength, denoise,
+            client_id=COMFY_CLIENT_ID,
+            prompt_id=prompt_id,
+        )
+    except Exception as exc:
+        JOBS.pop(prompt_id, None)  # see handle_generate_image()'s comment -- avoids orphaning this entry
+        await send_json_to(session_id, {"type": "error", "message": f"failed to queue generation: {exc}"})
+        return
+    JOBS[prompt_id]["provenance"] = {
+        "kind": "background", "prompt": prompt, "seed": seed,
+        "checkpoint": CHECKPOINT_NAME, "controlnet": CONTROLNET_NAME,
+        "controlnet_strength": controlnet_strength, "denoise": denoise,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await send_json_to(session_id, {"type": "queued", "prompt_id": prompt_id})
 
 
-async def handle_edit_region(msg: dict):
+async def handle_edit_region(session_id: str, msg: dict):
     """Regenerates only a user-drawn region of the CURRENT composite (not
     the original photo) — used by the "place an object" draw tool. Unlike
     generate_background, the mask here already means "regenerate this"
@@ -300,7 +425,6 @@ async def handle_edit_region(msg: dict):
     so conditioning on it fights the model trying to introduce new geometry
     that wasn't there — empirically this suppressed the object entirely at
     background-regen strength."""
-    global active_prompt_id, active_kind
     try:
         composite = b64_to_pil(msg["subject"]).convert("RGB")
         region_mask = b64_to_pil(msg["mask"]).convert("L")
@@ -310,32 +434,53 @@ async def handle_edit_region(msg: dict):
         controlnet_strength = float(msg.get("controlnet_strength", 0.1))
         denoise = float(msg.get("denoise", 1.0))
     except Exception as exc:
-        await send_json({"type": "error", "message": f"bad request: {exc}"})
+        await send_json_to(session_id, {"type": "error", "message": f"bad request: {exc}"})
         return
 
-    prompt_id = await asyncio.to_thread(
-        backend.queue_background_generation,
-        composite, region_mask, depth, prompt,
-        controlnet_strength, denoise,
-        client_id=COMFY_CLIENT_ID,
-    )
-    active_prompt_id = prompt_id
-    active_kind = "region"
-    await send_json({"type": "queued", "prompt_id": prompt_id})
+    prompt_id = str(uuid.uuid4())  # see handle_generate_image()'s comment on why this is pre-registered
+    JOBS[prompt_id] = {"session_id": session_id, "kind": "region", "provenance": None}
+    try:
+        _, seed = await asyncio.to_thread(
+            backend.queue_background_generation,
+            composite, region_mask, depth, prompt,
+            controlnet_strength, denoise,
+            client_id=COMFY_CLIENT_ID,
+            prompt_id=prompt_id,
+        )
+    except Exception as exc:
+        JOBS.pop(prompt_id, None)  # see handle_generate_image()'s comment -- avoids orphaning this entry
+        await send_json_to(session_id, {"type": "error", "message": f"failed to queue generation: {exc}"})
+        return
+    JOBS[prompt_id]["provenance"] = {
+        "kind": "region", "prompt": prompt, "seed": seed,
+        "checkpoint": CHECKPOINT_NAME, "controlnet": CONTROLNET_NAME,
+        "controlnet_strength": controlnet_strength, "denoise": denoise,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await send_json_to(session_id, {"type": "queued", "prompt_id": prompt_id})
 
 
-async def handle_send_to_spout(msg: dict):
+async def handle_send_to_spout(session_id: str, msg: dict):
     """Pushes the current flattened composite out over the 'PhotoBooth'
     Spout sender, for a real LED wall / projector on set to pick up as a
     live source — same mechanism as bridge.py's Resolume tie-in, just
-    fired manually from the browser instead of an OSC trigger."""
+    fired manually from the browser instead of an OSC trigger. Still one
+    shared Spout output regardless of how many sessions are connected --
+    whichever session sends last wins the physical output, same as a real
+    LED wall can only show one thing at a time.
+    """
     try:
         image = b64_to_pil(msg["image"]).convert("RGBA")
     except Exception as exc:
-        await send_json({"type": "error", "message": f"bad request: {exc}"})
+        await send_json_to(session_id, {"type": "error", "message": f"bad request: {exc}"})
         return
-    photobooth_frame_buffer.set_image(image)
-    await send_json({"type": "spout_sent"})
+    # set_image() does a PIL cover-fit resize/crop -- CPU-bound, and calling
+    # it directly here would block the single event loop thread for its
+    # duration, stalling comfy_relay_loop's message processing (and every
+    # other connected session's progress/preview delivery) right when
+    # multi-session routing is supposed to keep sessions independent.
+    await asyncio.to_thread(photobooth_frame_buffer.set_image, image)
+    await send_json_to(session_id, {"type": "spout_sent"})
 
 
 def main():

@@ -26,14 +26,20 @@ Browser (web/index.html)
 POST /api/analyze  -----------------------------------------------+
   |                                                                |
   |  photoshoot_pipeline.py:                                      |
+  |    cap_resolution()   -> downscale if oversized (see below)   |
   |    segment_subject()  -> rembg/birefnet-portrait -> cutout+mask
+  |                          (+ drop tiny disconnected mask blobs)|
   |    estimate_pose()    -> OpenPose/DWPose (controlnet_aux)     |
   |    estimate_depth()   -> MiDaS (controlnet_aux)               |
   |    estimate_illumination() -> plain CV on the subject pixels  |
   |         (light direction / warmth / softness -> text descriptor)
+  |    suggest_controlnet_strength() -> lower default if the      |
+  |         background has real depth structure to fight against |
   v                                                                |
 Browser: layer stack (background / subject / pose / depth, <------+
-          each independently visible/opaque/movable/scalable)
+          each independently visible/opaque/movable/scalable/
+          rotatable; canvas can fit the photo's own aspect ratio
+          instead of always cropping to a fixed square)
   |
   |  scene prompt + "Generate Background"
   v
@@ -119,6 +125,44 @@ Two things that matter for this to actually work, found empirically:
   where this reliably stopped failing in testing; the UI enforces that
   as a minimum.
 
+### Real-photo hardening
+
+Everything above was originally validated against one curated 1024x1024
+test image. Running real (non-square, full-resolution) photos through it
+with a specific target shot in mind — not just checking that requests
+succeed — surfaced four issues that don't show up on a clean square test
+photo:
+
+- **No resize node in `photoshoot_bg_api.json`** means SDXL's `VAEEncode`
+  runs at the uploaded photo's *native* resolution. A realistic 22MP
+  camera photo drove ComfyUI into a VAE out-of-memory fallback
+  (`retrying with tiled VAE encoding`) and dropped sampling from
+  ~1.2s/step to ~41s/step — on track for ~20 minutes with zero error
+  shown to the user. `cap_resolution()` downscales to 1536px max before
+  any model sees the image; generation resolution otherwise still tracks
+  the photo's own aspect ratio, just capped.
+- **The canvas was a fixed 768x768 square**, so any non-square photo got
+  stretched (not cropped — `drawImage` with an explicit target size
+  distorts) to fill it, visibly warping body proportions. The canvas now
+  cover-fits each layer to its real aspect ratio, and the UI offers to
+  resize the canvas itself to the photo's own proportions so nothing gets
+  cropped at all (opt-in — square stays the default).
+- **rembg occasionally classifies a small disconnected patch of a busy
+  background as subject** — a real floating artifact (e.g. a chair-leg
+  sliver), not a body part, since alpha thresholding has no notion of
+  connectivity. Fixed with a connected-component pass that drops blobs
+  below an area-ratio threshold relative to the main subject blob, rather
+  than naively keeping only the single largest one (which would also
+  discard legitimately-disconnected parts like a held object or jewelry).
+- **ControlNet depth strength (0.75 default) can over-anchor to the
+  original scene's geometry** when the background already has real
+  structure — a "cozy reading nook" prompt over a room with a chair in it
+  barely changed the room, because the depth map still encoded that
+  chair's exact geometry. `suggest_controlnet_strength()` measures depth
+  variance in the background region and suggests a lower value (0.45)
+  only when there's real structure to fight against; a plain backdrop
+  still defaults to 0.75, where the higher strength actually helps.
+
 ### Known limitations
 
 - Rotoscope (`birefnet-portrait`) runs CPU-only, ~20s/photo — this
@@ -130,6 +174,36 @@ Two things that matter for this to actually work, found empirically:
 - The illumination estimate is classic CV (per-quadrant luminance,
   highlight color, contrast), not a learned model — a useful heuristic
   for prompt-grounding, not a physically accurate light probe.
+- Generate Background / Relight always condition on the *original*
+  uploaded photo's mask/depth, not the current live composite — so an
+  object added via the region-draw tool stays in place (drawn on top)
+  but isn't re-conditioned if you regenerate the background afterward,
+  and can end up visually mismatched with the new scene. The UI surfaces
+  an explicit warning when this would happen rather than silently
+  producing a mismatched result; region-edit itself doesn't have this
+  problem, since it conditions on the current composite directly.
+- Node IDs in the ComfyUI workflow JSON files are hardcoded per exported
+  template (e.g. `PHOTOSHOOT_POSITIVE_PROMPT_NODE = "7"`) — a workflow
+  re-exported from the ComfyUI UI could silently shift those IDs and
+  break the app. A production version would want a small schema mapping
+  semantic node roles to IDs per workflow version.
+
+### Testing
+
+`verify_web_ui.py` drives a real Chromium via Playwright through the full
+click-through path (upload → analyze → generate background → region-draw
+object → relight → voice button → living-photo export → disclosure copy
+→ PNG/JSON export → Spout send), since the canvas/layer JS in
+`web/index.html` previously had no coverage beyond a Python websocket
+test client:
+
+```
+pip install playwright && playwright install chromium
+python verify_web_ui.py --image path\to\any\subject\photo.jpg
+```
+
+Needs ComfyUI and `web_server.py` already running. Screenshots and any
+exported downloads land in `verify_out/<timestamp>/` (gitignored).
 
 ---
 
@@ -289,7 +363,10 @@ Triggered via OSC `/comfybridge/generate_video` (arg0: prompt text).
   dropped rather than queued.
 - Fixed output canvas (`SPOUT_WIDTH`/`SPOUT_HEIGHT` in `bridge.py`,
   default 512x512) — anything a backend returns (image or video frame)
-  gets resized to fit, so non-square sources get squashed.
+  gets fit to it. `SpoutFrameBuffer.set_image()` (shared by both apps via
+  `spout_output.py`) cover-fits and crops to the sender's aspect ratio
+  rather than stretching, so non-square sources no longer get squashed —
+  they get cropped to fill instead, same as any normal video source.
 - `EFFECT_DESCRIPTORS` in `resolume_state.py` is a small hand-picked
   table, not a mapping of Resolume's full effect library. The thumbnail
   descriptors are deterministic pixel stats, not learned image
@@ -307,4 +384,14 @@ Triggered via OSC `/comfybridge/generate_video` (arg0: prompt text).
   — e.g. a Colorize hue value as an actual color descriptor.
 - Photo booth: multi-region batch edits in one generation pass instead of
   one masked region at a time; GPU-accelerated rotoscope once CUDA 13
-  onnxruntime wheels are published.
+  onnxruntime wheels are published; re-conditioning Generate
+  Background/Relight on the *current* composite instead of always the
+  original upload (see Known limitations above).
+- Per-layer Spout output — right now the photo booth sends one flattened
+  composite; for an actual on-set mixed-reality setup, each layer group
+  (background, subject, added objects) as its own named Spout source
+  would let a projection-mapping tool place them independently on real
+  projectors/LED panels instead of one flattened, already-composited
+  frame.
+- RAW format support / direct camera tethering (gPhoto2/PTP) for the
+  photo booth's input side, instead of `<input type=file>` only.

@@ -79,22 +79,35 @@ class ComfyBackend(GenerationBackend):
         resp.raise_for_status()
         return resp.json()["name"]
 
-    def queue_image_generation(self, prompt: str, client_id: str = None) -> str:
+    def queue_image_generation(self, prompt: str, client_id: str = None, prompt_id: str = None) -> tuple[str, int]:
         """Non-blocking counterpart to generate_image(), for callers (e.g.
         the web server) that want to relay ComfyUI's own progress/preview
-        websocket events instead of polling to a final result."""
+        websocket events instead of polling to a final result. Returns
+        (prompt_id, seed) -- the seed is handed back so callers can show a
+        real generation provenance record, not just "the model made this".
+
+        prompt_id: pass your own to know it *before* ComfyUI would ever
+        emit an event for it (confirmed empirically: ComfyUI's /prompt
+        honors a client-supplied prompt_id and echoes it back exactly) --
+        lets a caller register bookkeeping (e.g. web_server.py's JOBS dict)
+        before submitting, closing the race where an "executing" event for
+        a same-instant-queued job could otherwise arrive before the
+        caller's own tracking is set up."""
         with open(self.workflow_path) as f:
             workflow = json.load(f)
 
+        seed = int.from_bytes(uuid.uuid4().bytes[:4], "big")
         workflow[POSITIVE_PROMPT_NODE]["inputs"]["text"] = prompt
-        workflow[SEED_NODE]["inputs"]["seed"] = int.from_bytes(uuid.uuid4().bytes[:4], "big")
+        workflow[SEED_NODE]["inputs"]["seed"] = seed
 
         payload = {"prompt": workflow, "client_id": client_id or self.client_id}
+        if prompt_id:
+            payload["prompt_id"] = prompt_id
         resp = requests.post(f"http://{self.server_address}/prompt", json=payload, timeout=10)
         resp.raise_for_status()
         prompt_id = resp.json()["prompt_id"]
         print(f"[comfy] queued prompt_id={prompt_id} text={prompt!r}")
-        return prompt_id
+        return prompt_id, seed
 
     def generate_image(self, prompt: str, timeout: float = 120.0) -> Image.Image:
         with open(self.workflow_path) as f:
@@ -177,14 +190,18 @@ class ComfyBackend(GenerationBackend):
         denoise: float = 0.85,
         workflow_path: Path = DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH,
         client_id: str = None,
-    ) -> str:
+        prompt_id: str = None,
+    ) -> tuple[str, int]:
         """Queues a background-only regeneration: subject_photo is used as
         the init image, background_mask (255=regenerate, 0=keep original)
         is the inpaint mask, depth_map conditions the ControlNet so the new
         environment respects the subject's actual pose/perspective. Returns
-        the prompt_id — this is async by design so a caller (e.g. the web
+        (prompt_id, seed) — async by design so a caller (e.g. the web
         server) can relay ComfyUI's own websocket progress/preview events
-        while it runs, instead of blocking like generate_image()."""
+        while it runs, instead of blocking like generate_image().
+
+        prompt_id: see queue_image_generation()'s docstring -- same
+        race-closing purpose."""
         with open(workflow_path) as f:
             workflow = json.load(f)
 
@@ -192,29 +209,29 @@ class ComfyBackend(GenerationBackend):
         mask_name = self._upload_image(background_mask.convert("L"), "bgmask")
         depth_name = self._upload_image(depth_map.convert("RGB"), "depth")
 
+        seed = int.from_bytes(uuid.uuid4().bytes[:4], "big")
         workflow[PHOTOSHOOT_SUBJECT_NODE]["inputs"]["image"] = subject_name
         workflow[PHOTOSHOOT_MASK_NODE]["inputs"]["image"] = mask_name
         workflow[PHOTOSHOOT_DEPTH_NODE]["inputs"]["image"] = depth_name
         workflow[PHOTOSHOOT_POSITIVE_PROMPT_NODE]["inputs"]["text"] = prompt
         workflow[PHOTOSHOOT_CONTROLNET_NODE]["inputs"]["strength"] = controlnet_strength
-        workflow[PHOTOSHOOT_SEED_NODE]["inputs"]["seed"] = int.from_bytes(uuid.uuid4().bytes[:4], "big")
+        workflow[PHOTOSHOOT_SEED_NODE]["inputs"]["seed"] = seed
         workflow[PHOTOSHOOT_SEED_NODE]["inputs"]["denoise"] = denoise
 
-        if client_id:
-            payload = {"prompt": workflow, "client_id": client_id}
-            resp = requests.post(f"http://{self.server_address}/prompt", json=payload, timeout=10)
-            resp.raise_for_status()
-            prompt_id = resp.json()["prompt_id"]
-        else:
-            prompt_id = self._queue_prompt(workflow)
+        payload = {"prompt": workflow, "client_id": client_id or self.client_id}
+        if prompt_id:
+            payload["prompt_id"] = prompt_id
+        resp = requests.post(f"http://{self.server_address}/prompt", json=payload, timeout=10)
+        resp.raise_for_status()
+        prompt_id = resp.json()["prompt_id"]
 
         print(f"[comfy] queued background prompt_id={prompt_id} text={prompt!r}")
-        return prompt_id
+        return prompt_id, seed
 
     def generate_background(self, *args, timeout: float = 180.0, **kwargs) -> Image.Image:
         """Synchronous convenience wrapper around queue_background_generation
         for scripts/tests that don't need live progress."""
-        prompt_id = self.queue_background_generation(*args, **kwargs)
+        prompt_id, _seed = self.queue_background_generation(*args, **kwargs)
         deadline = time.time() + timeout
         while time.time() < deadline:
             history = self._get_history(prompt_id)

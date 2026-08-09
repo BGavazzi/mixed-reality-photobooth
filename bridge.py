@@ -35,6 +35,7 @@ from pythonosc import dispatcher, osc_server
 
 import resolume_state
 from backends import BACKENDS
+from spout_output import SpoutFrameBuffer as FrameBuffer, spout_sender_loop
 
 # --- config ---------------------------------------------------------------
 
@@ -51,50 +52,6 @@ SPOUT_SENDER_NAME = "ComfyBridge"
 SPOUT_WIDTH = 512
 SPOUT_HEIGHT = 512
 SPOUT_FPS = 15
-
-
-# --- shared frame state -----------------------------------------------------
-
-class FrameBuffer:
-    def __init__(self, width: int, height: int):
-        self.width = width
-        self.height = height
-        self.lock = threading.Lock()
-        self.data = bytes([40, 40, 48, 255]) * (width * height)  # placeholder: dark grey
-        self.busy = threading.Lock()
-
-    def set_image(self, image: Image.Image):
-        if image.size != (self.width, self.height):
-            image = image.resize((self.width, self.height), Image.LANCZOS)
-        with self.lock:
-            self.data = image.tobytes()
-
-    def get_bytes(self) -> bytes:
-        with self.lock:
-            return self.data
-
-
-# --- Spout sender thread -----------------------------------------------------
-
-def spout_sender_loop(frame_buffer: FrameBuffer, stop_event: threading.Event):
-    import SpoutGL
-    from OpenGL import GL
-
-    with SpoutGL.SpoutSender() as sender:
-        sender.setSenderName(SPOUT_SENDER_NAME)
-        print(f"[spout] sender '{SPOUT_SENDER_NAME}' started at {frame_buffer.width}x{frame_buffer.height}")
-
-        while not stop_event.is_set():
-            sender.sendImage(
-                frame_buffer.get_bytes(),
-                frame_buffer.width,
-                frame_buffer.height,
-                GL.GL_RGBA,
-                False,
-                0,
-            )
-            sender.setFrameSync(SPOUT_SENDER_NAME)
-            time.sleep(1.0 / SPOUT_FPS)
 
 
 # --- video playback (loops a generated clip's frames into the FrameBuffer) --
@@ -315,7 +272,7 @@ def main():
     stop_event = threading.Event()
 
     spout_thread = threading.Thread(
-        target=spout_sender_loop, args=(frame_buffer, stop_event), daemon=True
+        target=spout_sender_loop, args=(frame_buffer, SPOUT_SENDER_NAME, SPOUT_FPS, stop_event), daemon=True
     )
     spout_thread.start()
 
