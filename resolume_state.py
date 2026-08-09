@@ -17,7 +17,6 @@ Requires Preferences > Webserver enabled in Resolume (default port 8080).
 Reference: https://resolume.com/support/en/restapi
 """
 
-import colorsys
 import io
 
 import numpy as np
@@ -88,22 +87,62 @@ def fetch_clip_thumbnail(resolume_url: str, layer_index: int, clip_index: int, r
     return Image.open(io.BytesIO(resp.content)).convert("RGB")
 
 
+def _dominant_hue_name(hue_deg: np.ndarray, weights: np.ndarray) -> str:
+    """Most *prevalent* hue band, not the hue of the average colour.
+
+    Averaging RGB first and reading the hue off that mean is what this used
+    to do, and it gives an actively wrong answer on exactly the content this
+    is pointed at. A VJ visual that is half vivid red and half vivid cyan
+    averages to a desaturated grey-magenta: the old code reported
+    "magenta-dominant, muted, desaturated colors" for an image containing no
+    magenta and nothing desaturated.
+
+    Votes are weighted by saturation x value so that grey and near-black
+    pixels -- whose hue is numerically meaningless -- don't drag the result
+    around. Tallying by band *name* also folds red's two bands (0-15 and
+    330-360) back together, which a uniform histogram would split across
+    opposite ends of the range.
+    """
+    thresholds = [threshold for threshold, _ in HUE_NAMES]
+    names = [name for _, name in HUE_NAMES]
+    band_index = np.digitize(hue_deg.ravel(), thresholds)
+    band_index = np.clip(band_index, 0, len(names) - 1)
+    totals = np.bincount(band_index, weights=weights.ravel(), minlength=len(names))
+
+    per_name: dict[str, float] = {}
+    for name, total in zip(names, totals):
+        per_name[name] = per_name.get(name, 0.0) + float(total)
+    return max(per_name, key=per_name.get)
+
+
 def describe_image(image: Image.Image) -> str:
     """Deterministic low-level visual read of an image: dominant hue,
     saturation, brightness, contrast, and edge density, turned into
     prompt-friendly adjectives. No ML, just pixel stats — same input
     image always produces the same descriptors."""
-    small = image.resize((48, 48))
+    small = image.convert("RGB").resize((48, 48))
     arr = np.asarray(small, dtype=np.float32) / 255.0
 
-    mean_r, mean_g, mean_b = arr[..., 0].mean(), arr[..., 1].mean(), arr[..., 2].mean()
-    hue, sat, val = colorsys.rgb_to_hsv(float(mean_r), float(mean_g), float(mean_b))
+    # Per-pixel HSV rather than the HSV of the mean colour -- see
+    # _dominant_hue_name(). PIL's HSV mode packs each channel into 0-255.
+    hsv = np.asarray(small.convert("HSV"), dtype=np.float32) / 255.0
+    hue_deg, saturation, value = hsv[..., 0] * 360.0, hsv[..., 1], hsv[..., 2]
+
+    # Saturation is brightness-weighted: a black pixel's saturation is
+    # numerically zero but semantically undefined, and VJ content is
+    # routinely a dark frame with vivid accents. A flat mean let that
+    # blackness outvote the actual colour and report "muted, desaturated"
+    # for a neon element on black. Brightness is a plain mean -- there,
+    # "most of the frame is dark" is exactly the thing being described.
+    value_total = float(value.sum())
+    sat = float((saturation * value).sum() / value_total) if value_total > 0 else 0.0
+    val = float(value.mean())
 
     fragments = []
     if sat < 0.12:
         fragments.append("near-monochrome")
     else:
-        fragments.append(f"{_hue_name(hue * 360)}-dominant")
+        fragments.append(f"{_dominant_hue_name(hue_deg, saturation * value)}-dominant")
 
     if sat >= 0.55:
         fragments.append("vivid, saturated colors")

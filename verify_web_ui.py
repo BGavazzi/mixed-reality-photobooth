@@ -31,11 +31,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import verify_common
+from console_encoding import use_utf8_console
+
 # Windows consoles default to cp1252, which raises on emoji in button text
-# (e.g. the voice-input button's mic icon) -- same fix as backends/comfy.py.
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        _stream.reconfigure(encoding="utf-8", errors="replace")
+# (e.g. the voice-input button's mic icon).
+use_utf8_console()
 
 try:
     from playwright.sync_api import sync_playwright
@@ -125,19 +126,14 @@ def wait_generation_done(page, timeout=GEN_TIMEOUT_MS):
     )
 
 
-def preflight(base_url: str):
-    import requests
-    try:
-        requests.get(base_url, timeout=5).raise_for_status()
-    except Exception as exc:
-        print(f"Can't reach {base_url} ({exc}). Start ComfyUI + web_server.py first "
-              f"(e.g. start_demo.ps1), then re-run this script.")
-        sys.exit(1)
-
-
 def run(base_url: str, image_path: Path, headed: bool, slow_mo: int, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
     ok_overall = True
+    # Bound before the browser exists: the summary block at the bottom reads
+    # v.results unconditionally, so a failure between launching Chromium and
+    # constructing the Verifier used to surface as a confusing NameError
+    # instead of the real error.
+    v = None
 
     with sync_playwright() as pw:
         try:
@@ -283,9 +279,24 @@ def run(base_url: str, image_path: Path, headed: bool, slow_mo: int, out_dir: Pa
             with v.stage("Send to Spout") as p:
                 errors_before = len(v.console_errors)
                 p.click("#btnSendSpout")
-                p.wait_for_timeout(1000)
+                # The button no longer flips to a success label on click; it
+                # waits for the server to confirm the frame reached a live
+                # Spout sender. Assert only that it *resolved* one way or the
+                # other -- staying on "Sending…" means the round trip broke,
+                # which is a real failure. Whether Spout itself is running is
+                # a property of the machine, not of the app, so an honest
+                # failure label is reported rather than asserted on.
+                p.wait_for_function(
+                    "() => document.getElementById('btnSendSpout').textContent !== 'Sending…'",
+                    timeout=10_000,
+                )
+                label = p.text_content("#btnSendSpout").strip()
                 assert len(v.console_errors) == errors_before, "console error fired after Send to Spout"
-                print("    clicked, no client-side error (visual confirmation needs a Spout receiver)")
+                if "✓" in label:
+                    print(f"    server confirmed the frame reached the PhotoBooth Spout sender ({label!r})")
+                else:
+                    print(f"    server reported the send did not reach a live Spout sender ({label!r}) — "
+                          f"expected on a machine without SpoutGL; check the web_server log")
 
         except Exception as exc:
             print(f"\nStopped early: {exc}")
@@ -293,6 +304,10 @@ def run(base_url: str, image_path: Path, headed: bool, slow_mo: int, out_dir: Pa
         finally:
             context.close()
             browser.close()
+
+    if v is None:
+        print("\nThe browser session never started — nothing to summarise.")
+        return False
 
     print("\n" + "=" * 60)
     print("SUMMARY")
@@ -334,8 +349,8 @@ def main():
             print(f"Image not found: {image_path}")
         sys.exit(1)
 
-    out_dir = Path(args.out) if args.out else Path(__file__).parent / "verify_out" / datetime.now().strftime("%Y%m%d_%H%M%S")
-    preflight(args.base_url)
+    out_dir = Path(args.out) if args.out else verify_common.OUT_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
+    verify_common.preflight(args.base_url)
     ok = run(args.base_url, image_path, args.headed, args.slow_mo, out_dir)
     sys.exit(0 if ok else 1)
 

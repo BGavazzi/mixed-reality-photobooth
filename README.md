@@ -99,8 +99,17 @@ powershell -ExecutionPolicy Bypass -File start_demo.ps1
 ```
 
 Starts ComfyUI (with `--preview-method auto`), waits for it to be ready,
-starts `web_server.py`, waits for that, opens the browser. Run
-`stop_demo.ps1` to shut both down. (If you double-click the script rather
+checks that the checkpoint and ControlNet the workflow names are actually
+installed (via ComfyUI's `/object_info`, so a missing model is reported at
+startup instead of ~40s into the first generation), starts `web_server.py`,
+waits for that, opens the browser. Run `stop_demo.ps1` to shut both down.
+
+Paths are derived from the script's own location; ComfyUI is assumed to be a
+sibling directory of this repo, overridable with `COMFYUI_DIR`:
+
+```
+$env:COMFYUI_DIR = "C:\path\to\ComfyUI"; .\start_demo.ps1
+``` (If you double-click the script rather
 than running it from an already-open PowerShell window and the services
 don't seem to stay up, open PowerShell yourself and run it directly —
 that path is the one that's fully verified end-to-end.)
@@ -237,12 +246,21 @@ python verify_web_ui.py --image path\to\any\subject\photo.jpg
 Needs ComfyUI and `web_server.py` already running. Screenshots and any
 exported downloads land in `verify_out/<timestamp>/` (gitignored).
 
-Three narrower scripts sit alongside it, same requirements:
-`verify_multi_session.py` (two concurrent tabs, real overlapping generations,
-asserts neither receives the other's result), `verify_canvas_fit.py`, and
-`verify_project_roundtrip.py`. They're named `verify_*` rather than `test_*`
-precisely because they *aren't* collectable tests — they parse argv, drive
-live servers, and depend on gitignored photos. `pytest` means `tests/` only.
+Three narrower scripts sit alongside it, same requirements, each taking its
+own photos on the command line:
+
+```
+python verify_multi_session.py    --image-a one.jpg --image-b two.jpg
+python verify_canvas_fit.py       --image portrait.jpg --square-image square.png
+python verify_project_roundtrip.py --image portrait.jpg
+```
+
+`verify_multi_session.py` is the interesting one: two concurrent tabs firing
+real overlapping generations, asserting neither receives the other's result.
+
+They're named `verify_*` rather than `test_*` precisely because they *aren't*
+collectable tests — they parse argv, drive live servers, and need photos the
+repo doesn't ship. `pytest` means `tests/` only.
 
 ---
 

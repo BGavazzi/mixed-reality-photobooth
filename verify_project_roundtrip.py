@@ -3,12 +3,28 @@ Proves the project .json export/import round-trip preserves the canvas-fit
 feature's state (canvas dimensions, fit-offer UI) instead of silently
 resetting to the square default on reload.
 
-Needs ComfyUI + web_server.py already running, and test_images/pexels_6668809.jpg
-(gitignored, not tracked -- swap in any portrait-orientation subject photo
-on a fresh clone).
+Needs ComfyUI + web_server.py already running, plus a NON-square subject
+photo (the point is that a fitted canvas survives the round trip). The
+default is gitignored, so pass your own on a fresh clone:
+
+    python verify_project_roundtrip.py --image portrait.jpg
 """
 
+import argparse
+
 from playwright.sync_api import sync_playwright
+
+import verify_common
+
+parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("--base-url", default=verify_common.DEFAULT_BASE_URL)
+parser.add_argument("--image", default=verify_common.DEFAULT_PORTRAIT_PHOTO,
+                     help="a non-square subject photo")
+args = parser.parse_args()
+
+PORTRAIT = verify_common.resolve_image(args.image, "--image", "a non-square subject photo")
+OUT = verify_common.out_dir()
+verify_common.preflight(args.base_url)
 
 with sync_playwright() as pw:
     browser = pw.chromium.launch(headless=True)
@@ -17,10 +33,10 @@ with sync_playwright() as pw:
     page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
     page.on("pageerror", lambda e: errors.append(str(e)))
 
-    page.goto("http://127.0.0.1:8000")
+    page.goto(args.base_url)
     page.wait_for_function("() => document.getElementById('connStatus').textContent === 'connected'")
 
-    page.set_input_files("#fileInput", "test_images/pexels_6668809.jpg")
+    page.set_input_files("#fileInput", PORTRAIT)
     page.wait_for_function(
         "() => document.getElementById('footerStatus').textContent.includes('ready to generate')",
         timeout=90_000,
@@ -40,7 +56,7 @@ with sync_playwright() as pw:
     with page.expect_download(timeout=10_000) as dl_info:
         page.click("#btnExportJson")
     download = dl_info.value
-    project_path = "verify_out/roundtrip_project.json"
+    project_path = str(OUT / "roundtrip_project.json")
     download.save_as(project_path)
     print(f"exported to {project_path}")
 
@@ -49,7 +65,7 @@ with sync_playwright() as pw:
     errors2 = []
     page2.on("console", lambda m: errors2.append(m.text) if m.type == "error" else None)
     page2.on("pageerror", lambda e: errors2.append(str(e)))
-    page2.goto("http://127.0.0.1:8000")
+    page2.goto(args.base_url)
     page2.wait_for_function("() => document.getElementById('connStatus').textContent === 'connected'")
 
     page2.set_input_files("#importInput", project_path)
