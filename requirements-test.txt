@@ -16,6 +16,7 @@ numpy
 opencv-python-headless   # cv2, for photoshoot_pipeline's connected-components pass
 
 fastapi                  # web_server imports these at module scope
+python-multipart         # FastAPI needs it to even *declare* the /api/analyze upload route
 websockets
 requests
 python-osc               # bridge.py's OSC listener, for the import check in CI
