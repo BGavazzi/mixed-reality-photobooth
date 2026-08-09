@@ -16,9 +16,22 @@ layerable results rather than one opaque black-box call.
 Models are lazy-loaded and cached at module scope — the CV stages run on
 CPU (a few seconds each) so they don't fight the GPU with ComfyUI's SDXL
 generation, which runs concurrently.
+
+Concurrency note: the cached model instances above are shared across every
+call to analyze(), including genuinely concurrent ones from different
+web_server.py sessions (see its multi-session job routing). PyTorch
+`nn.Module` instances aren't guaranteed safe for concurrent forward passes
+from multiple threads without external synchronization -- confirmed
+directly: two real concurrent /api/analyze calls reproduced the exact same
+tensor-size-mismatch crash inside MiDaS that a *cold-start* single call had
+hit earlier (see web_server.py's warmup comment), except this one wasn't a
+cold-load race, it was two threads calling the same MidasDetector instance
+at once. _pipeline_lock serializes the model-touching stages so concurrent
+sessions queue safely instead of corrupting each other's inference.
 """
 
 import colorsys
+import threading
 from dataclasses import dataclass, asdict
 
 import cv2
@@ -28,6 +41,7 @@ from PIL import Image
 _rembg_session = None
 _pose_detector = None
 _depth_detector = None
+_pipeline_lock = threading.Lock()
 
 
 def _get_rembg_session():
@@ -321,13 +335,20 @@ def analyze(image: Image.Image) -> dict:
     hand straight to the client as separate layers. `image` is downscaled
     first if oversized -- callers should treat the returned `image` as the
     new canonical original (e.g. what gets sent back to the browser and
-    reused for later generation calls), not the caller's original object."""
+    reused for later generation calls), not the caller's original object.
+
+    Holds _pipeline_lock for the model-touching stages: with web_server.py's
+    multi-session support, two sessions can call this concurrently from
+    different threads, and the cached model instances above aren't safe for
+    that without serializing (see module docstring). Concurrent callers
+    queue here rather than racing each other's inference."""
     image = cap_resolution(image)
-    cutout, mask = segment_subject(image)
-    pose = estimate_pose(image)
-    depth = estimate_depth(image)
+    with _pipeline_lock:
+        cutout, mask = segment_subject(image)
+        pose = estimate_pose(image)
+        depth = estimate_depth(image)
+        foot_points = detect_foot_points(image)
     illumination = estimate_illumination(image, mask)
-    foot_points = detect_foot_points(image)
     shadow = generate_contact_shadow(image.size, foot_points)
     suggested_controlnet_strength = suggest_controlnet_strength(depth, mask)
     return {
