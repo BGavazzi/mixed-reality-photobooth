@@ -251,6 +251,18 @@ async def handle_comfy_message(message):
         if executing_prompt_id == prompt_id:
             executing_prompt_id = None
 
+    elif etype == "execution_interrupted":
+        # Fires if a job is cancelled from ComfyUI's own UI/API (queue
+        # cleared, manually interrupted) rather than through this app --
+        # without handling it, JOBS would never get cleaned up for that
+        # prompt_id and would sit there for the life of the process, a slow
+        # per-cancelled-job memory leak on what's meant to be a long-running
+        # server.
+        await send_json_to(session_id, {"type": "error", "message": "generation was interrupted"})
+        JOBS.pop(prompt_id, None)
+        if executing_prompt_id == prompt_id:
+            executing_prompt_id = None
+
 
 # --- HTTP routes --------------------------------------------------------------
 
@@ -423,7 +435,12 @@ async def handle_send_to_spout(session_id: str, msg: dict):
     except Exception as exc:
         await send_json_to(session_id, {"type": "error", "message": f"bad request: {exc}"})
         return
-    photobooth_frame_buffer.set_image(image)
+    # set_image() does a PIL cover-fit resize/crop -- CPU-bound, and calling
+    # it directly here would block the single event loop thread for its
+    # duration, stalling comfy_relay_loop's message processing (and every
+    # other connected session's progress/preview delivery) right when
+    # multi-session routing is supposed to keep sessions independent.
+    await asyncio.to_thread(photobooth_frame_buffer.set_image, image)
     await send_json_to(session_id, {"type": "spout_sent"})
 
 
