@@ -5,3 +5,5 @@ __pycache__/
 fallback_examples/
 *_stdout.log
 *_stderr.log
+test_images/
+verify_out/

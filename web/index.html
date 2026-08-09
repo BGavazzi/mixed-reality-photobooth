@@ -110,6 +110,10 @@
         <div class="thumb" id="thumbIllumBox"><label>Illumination</label></div>
       </div>
       <div id="illumText" style="margin-top:10px"></div>
+      <div id="canvasFitBox" style="display:none;margin-top:10px">
+        <div class="hint" style="margin-top:0" id="canvasFitHint"></div>
+        <button class="secondary small" id="btnFitCanvas" style="width:100%;margin-top:6px"></button>
+      </div>
     </div>
 
     <div class="panel">
@@ -166,6 +170,8 @@
       <input type="file" id="layerFileInput" accept="image/*">
       <label class="field">Selected layer scale <span class="val" id="scaleVal">1.00</span></label>
       <input type="range" id="layerScale" min="0.3" max="2" step="0.01" value="1">
+      <label class="field">Selected layer rotation <span class="val" id="rotVal">0°</span></label>
+      <input type="range" id="layerRotation" min="-180" max="180" step="1" value="0">
       <button class="secondary small" id="btnMove" style="width:100%;margin-top:8px">Drag to reposition selected layer: OFF</button>
     </div>
 
@@ -197,8 +203,13 @@
   <span>quick text sandbox: <input type="text" id="quickPrompt" placeholder="type + enter for a plain live-preview test" style="width:340px;display:inline-block;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:3px 6px;font-size:11px"></span>
 </footer>
 
+<div id="sandboxPreviewOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:1000;align-items:center;justify-content:center;cursor:zoom-out;">
+  <img id="sandboxPreviewImg" style="max-width:90vw;max-height:90vh;border-radius:8px;box-shadow:0 8px 40px rgba(0,0,0,.6)">
+</div>
+
 <script>
 let nextLayerId = 1;
+const SQUARE_CANVAS_SIZE = 768;
 const state = {
   original: null, cutout: null, mask: null, pose: null, depth: null,
   illumination: null,
@@ -207,6 +218,7 @@ const state = {
   lastPrompt: '', lastControlnetStrength: 0.75, lastDenoise: 0.85,
   drawingRect: null, // {x0,y0,x1,y1} in canvas space, while drawing a region
   provenanceLog: [], // every generation's metadata this session, for the disclosure card + export audit trail
+  photoWidth: null, photoHeight: null, // the analyzed photo's real pixel size, for the canvas-fit offer
 };
 const imgCache = {};
 
@@ -236,10 +248,29 @@ async function redraw(cameraOffsetPx = 0) {
     if (!layer.visible || !layer.src) continue;
     const im = await loadImg(layer.src);
     ctx.globalAlpha = layer.opacity;
-    const w = canvas.width * layer.scale * overscan, h = canvas.height * layer.scale * overscan;
+    // Cover-fit to the image's own aspect ratio instead of stretching it to
+    // the canvas's fixed square shape -- naive canvas.width x canvas.height
+    // sizing silently warped subject body proportions on any non-square
+    // upload (most real camera/phone photos). The generated background
+    // shares the subject photo's native aspect (photoshoot_bg_api.json has
+    // no resize node -- VAEEncode runs at the subject's own resolution), so
+    // both layers cover-fit identically and stay aligned.
+    const imgAspect = im.width / im.height, canvasAspect = canvas.width / canvas.height;
+    const baseW = imgAspect > canvasAspect ? canvas.height * imgAspect : canvas.width;
+    const baseH = imgAspect > canvasAspect ? canvas.height : canvas.width / imgAspect;
+    const w = baseW * layer.scale * overscan, h = baseH * layer.scale * overscan;
     const shift = cameraOffsetPx * (layer.parallax || 0);
     const x = (canvas.width - w) / 2 + layer.x + shift, y = (canvas.height - h) / 2 + layer.y;
-    ctx.drawImage(im, x, y, w, h);
+    const angle = (layer.rotation || 0) * Math.PI / 180;
+    if (angle) {
+      ctx.save();
+      ctx.translate(x + w / 2, y + h / 2);
+      ctx.rotate(angle);
+      ctx.drawImage(im, -w / 2, -h / 2, w, h);
+      ctx.restore();
+    } else {
+      ctx.drawImage(im, x, y, w, h);
+    }
   }
   ctx.globalAlpha = 1;
 
@@ -345,20 +376,36 @@ async function handleGenerationDone(msg) {
     const clipped = await clipToMask(resultUrl, pendingGeneration.regionMaskUrl);
     state.layers.push({
       id: 'obj_' + (nextLayerId++), name: pendingGeneration.label, kind: 'object',
-      src: clipped, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 0.5,
+      src: clipped, visible: true, opacity: 1, x: 0, y: 0, scale: 1, rotation: 0, parallax: 0.5,
     });
     state.activeLayerId = state.layers[state.layers.length - 1].id;
-  } else {
-    // plain background regen (or quick-sandbox image) replaces the base background layer
+    syncScaleSlider();
+  } else if (msg.kind === 'background') {
     const bg = findLayer('background');
     if (bg) bg.src = resultUrl;
+  } else {
+    // 'image' -- the footer's quick text sandbox, an isolated test of the
+    // live-preview mechanism unrelated to the actual project. Must NOT
+    // touch state.layers: earlier this shared the same branch as
+    // 'background' and would silently overwrite the real Background layer
+    // of whatever composite the user had already built, the moment they
+    // idly tried the sandbox box. Shown as a dismissable overlay instead of
+    // window.open() -- that gets blocked as a popup by Chrome since it'd
+    // fire from an async websocket callback, well outside the synchronous
+    // gesture chain of the keypress that triggered the request.
+    document.getElementById('sandboxPreviewImg').src = resultUrl;
+    document.getElementById('sandboxPreviewOverlay').style.display = 'flex';
   }
 
   pendingGeneration = null;
-  document.getElementById('btnExportPng').disabled = false;
-  document.getElementById('btnExportJson').disabled = false;
-  document.getElementById('btnExportLiving').disabled = false;
-  document.getElementById('btnSendSpout').disabled = false;
+  if (msg.kind !== 'image' && state.layers.length > 0) {
+    // sandbox-test images don't touch the project canvas, so they
+    // shouldn't flip on export/Spout buttons that describe its state
+    document.getElementById('btnExportPng').disabled = false;
+    document.getElementById('btnExportJson').disabled = false;
+    document.getElementById('btnExportLiving').disabled = false;
+    document.getElementById('btnSendSpout').disabled = false;
+  }
   if (msg.provenance) {
     state.provenanceLog.push(msg.provenance);
     renderProvenanceCard(msg.provenance);
@@ -448,13 +495,14 @@ async function handleFile(file) {
   // pose foot keypoints, not AI), so it's on and correctly grounded no
   // matter how the generated background turns out.
   state.layers = [
-    { id: 'background', name: 'Background', kind: 'background', src: state.original, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 0 },
-    { id: 'depth', name: 'Depth (debug)', kind: 'debug', src: state.depth, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1, parallax: 0 },
-    { id: 'pose', name: 'Pose (debug)', kind: 'debug', src: state.pose, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1, parallax: 0 },
-    { id: 'shadow', name: 'Contact Shadow', kind: 'shadow', src: state.shadow, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 0.1 },
-    { id: 'subject', name: 'Subject', kind: 'subject', src: state.cutout, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 1 },
+    { id: 'background', name: 'Background', kind: 'background', src: state.original, visible: true, opacity: 1, x: 0, y: 0, scale: 1, rotation: 0, parallax: 0 },
+    { id: 'depth', name: 'Depth (debug)', kind: 'debug', src: state.depth, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1, rotation: 0, parallax: 0 },
+    { id: 'pose', name: 'Pose (debug)', kind: 'debug', src: state.pose, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1, rotation: 0, parallax: 0 },
+    { id: 'shadow', name: 'Contact Shadow', kind: 'shadow', src: state.shadow, visible: true, opacity: 1, x: 0, y: 0, scale: 1, rotation: 0, parallax: 0.1 },
+    { id: 'subject', name: 'Subject', kind: 'subject', src: state.cutout, visible: true, opacity: 1, x: 0, y: 0, scale: 1, rotation: 0, parallax: 1 },
   ];
   state.activeLayerId = 'subject';
+  syncScaleSlider();
 
   document.getElementById('thumbCutout').src = state.cutout;
   document.getElementById('thumbPose').src = state.pose;
@@ -466,14 +514,72 @@ async function handleFile(file) {
     `<div class="illum-line">direction: ${data.illumination.direction} · contrast: ${data.illumination.contrast}</div>`;
 
   document.getElementById('stagesPanel').style.display = 'block';
+  state.photoWidth = data.width; state.photoHeight = data.height;
+  updateCanvasFitOffer();
   document.getElementById('scenePrompt').value =
     `${data.illumination.descriptor}, editorial photography backdrop, high detail`;
+  if (data.suggested_controlnet_strength != null) {
+    // Defaults lower automatically when the original background has real
+    // depth structure to fight against (furniture, walls at an angle) --
+    // see suggest_controlnet_strength() in photoshoot_pipeline.py. Still
+    // just a starting point: the slider remains fully user-adjustable.
+    document.getElementById('cnStrength').value = data.suggested_controlnet_strength;
+    document.getElementById('cnVal').textContent = data.suggested_controlnet_strength;
+  }
   dropzone.textContent = 'Click or drop a photo (the model to keep untouched)';
   document.getElementById('footerStatus').textContent = 'subject analyzed — ready to generate a background';
   setBusy(false);
   renderLayerPanel();
   redraw();
 }
+
+// --- canvas size: offer to fit the photo's own aspect ratio ------------------
+// The canvas was fixed at 768x768 -- fine for a square photo, but ComfyUI
+// actually generates at the *photo's own* resolution (no resize node in
+// photoshoot_bg_api.json), so a non-square upload was being cover-fit into
+// a square canvas, i.e. cropped, purely as a display/export choice, not a
+// generation constraint. Offering to resize the canvas itself removes that
+// crop entirely instead of just making it less visible. Opt-in, not
+// automatic: square stays the default so nothing changes unless asked for.
+
+function setCanvasSize(w, h) {
+  canvas.width = w;
+  canvas.height = h;
+  redraw();
+  updateCanvasFitOffer();
+}
+
+function updateCanvasFitOffer() {
+  const box = document.getElementById('canvasFitBox');
+  const hint = document.getElementById('canvasFitHint');
+  const btn = document.getElementById('btnFitCanvas');
+  if (!state.photoWidth || !state.photoHeight) { box.style.display = 'none'; return; }
+
+  const photoAspect = state.photoWidth / state.photoHeight;
+  const isSquarePhoto = Math.abs(photoAspect - 1) < 0.03;
+  if (isSquarePhoto) { box.style.display = 'none'; return; }
+
+  box.style.display = 'block';
+  const fitted = canvas.width === state.photoWidth && canvas.height === state.photoHeight;
+  if (fitted) {
+    hint.textContent = `Canvas matches this photo's own proportions (${state.photoWidth}×${state.photoHeight}) -- nothing is cropped.`;
+    btn.textContent = `Use square canvas instead (${SQUARE_CANVAS_SIZE}×${SQUARE_CANVAS_SIZE})`;
+  } else {
+    const orientation = photoAspect > 1 ? 'landscape' : 'portrait';
+    hint.textContent = `This photo is ${orientation} (${state.photoWidth}×${state.photoHeight}) but the canvas is `
+      + `square -- the photo gets cropped to fill it.`;
+    btn.textContent = `Fit canvas to this photo (${state.photoWidth}×${state.photoHeight})`;
+  }
+}
+
+document.getElementById('btnFitCanvas').onclick = () => {
+  const fitted = canvas.width === state.photoWidth && canvas.height === state.photoHeight;
+  if (fitted) {
+    setCanvasSize(SQUARE_CANVAS_SIZE, SQUARE_CANVAS_SIZE);
+  } else {
+    setCanvasSize(state.photoWidth, state.photoHeight);
+  }
+};
 
 // --- voice-driven scene direction --------------------------------------------
 // Hands-free scene direction for a photographer actively running a shoot --
@@ -533,6 +639,21 @@ function queueBackgroundGeneration(prompt) {
   const controlnet_strength = parseFloat(document.getElementById('cnStrength').value);
   const denoise = parseFloat(document.getElementById('denoise').value);
   state.lastPrompt = prompt; state.lastControlnetStrength = controlnet_strength; state.lastDenoise = denoise;
+
+  // Generate Background / Relight always condition on the ORIGINAL upload's
+  // mask+depth, not the current composite -- correct for staying anchored
+  // to the real photo's geometry, but it means any object layers added via
+  // the region-draw tool stay put (they're just drawn on top) against a
+  // brand new scene they were never generated to match. Region-edit itself
+  // doesn't have this problem: it conditions on the current composite. Flag
+  // it here rather than silently producing a mismatched result.
+  const objectLayers = state.layers.filter(l => l.kind === 'object');
+  if (objectLayers.length) {
+    logEvent(`note: regenerating the background -- ${objectLayers.length} added object layer(s) `
+      + `(${objectLayers.map(l => l.name).join(', ')}) will stay in place but were not `
+      + `re-conditioned on the new scene and may no longer match it`);
+  }
+
   setBusy(true);
   ws.send(JSON.stringify({
     action: 'generate_background',
@@ -640,11 +761,24 @@ function renderLayerPanel() {
   }
 }
 
-function selectLayer(id) {
-  state.activeLayerId = id;
-  const layer = findLayer(id);
+function syncScaleSlider() {
+  // Keeps the "Selected layer scale" slider showing whichever layer is
+  // actually active. Without this, an auto-selection (a new region/object
+  // layer landing, or the fallback pick after deleting the active layer)
+  // leaves the slider showing the *previous* layer's scale -- drag it
+  // without first clicking the row, and that stale value jumps onto the
+  // new layer instead of applying from its real current value.
+  const layer = activeLayer();
   document.getElementById('layerScale').value = layer ? layer.scale : 1;
   document.getElementById('scaleVal').textContent = (layer ? layer.scale : 1).toFixed(2);
+  const rotation = layer ? (layer.rotation || 0) : 0;
+  document.getElementById('layerRotation').value = rotation;
+  document.getElementById('rotVal').textContent = rotation + '°';
+}
+
+function selectLayer(id) {
+  state.activeLayerId = id;
+  syncScaleSlider();
   renderLayerPanel();
 }
 
@@ -659,6 +793,7 @@ function moveLayer(id, delta) {
 function deleteLayer(id) {
   state.layers = state.layers.filter(l => l.id !== id);
   if (state.activeLayerId === id) state.activeLayerId = state.layers.length ? state.layers[state.layers.length - 1].id : null;
+  syncScaleSlider();
   renderLayerPanel(); redraw();
 }
 
@@ -670,6 +805,14 @@ document.getElementById('layerScale').oninput = (e) => {
   redraw();
 };
 
+document.getElementById('layerRotation').oninput = (e) => {
+  const layer = activeLayer();
+  if (!layer) return;
+  layer.rotation = parseFloat(e.target.value);
+  document.getElementById('rotVal').textContent = e.target.value + '°';
+  redraw();
+};
+
 document.getElementById('btnAddImageLayer').onclick = () => document.getElementById('layerFileInput').click();
 document.getElementById('layerFileInput').onchange = (e) => {
   const file = e.target.files[0];
@@ -677,7 +820,7 @@ document.getElementById('layerFileInput').onchange = (e) => {
   const reader = new FileReader();
   reader.onload = () => {
     const id = 'img_' + (nextLayerId++);
-    state.layers.push({ id, name: file.name, kind: 'image', src: reader.result, visible: true, opacity: 1, x: 0, y: 0, scale: 1, parallax: 0.6 });
+    state.layers.push({ id, name: file.name, kind: 'image', src: reader.result, visible: true, opacity: 1, x: 0, y: 0, scale: 1, rotation: 0, parallax: 0.6 });
     state.activeLayerId = id;
     renderLayerPanel(); redraw();
   };
@@ -914,6 +1057,8 @@ document.getElementById('btnExportJson').onclick = () => {
     pose: state.pose, depth: state.depth, shadow: state.shadow,
     illumination: state.illumination, layers: state.layers, activeLayerId: state.activeLayerId,
     provenanceLog: state.provenanceLog, // full generation audit trail, every seed/prompt/setting used this session
+    canvasWidth: canvas.width, canvasHeight: canvas.height,
+    photoWidth: state.photoWidth, photoHeight: state.photoHeight,
     params: {
       prompt: state.lastPrompt,
       controlnet_strength: state.lastControlnetStrength,
@@ -944,8 +1089,16 @@ document.getElementById('importInput').onchange = async () => {
     lastControlnetStrength: project.params?.controlnet_strength ?? 0.75,
     lastDenoise: project.params?.denoise ?? 0.85,
     provenanceLog: project.provenanceLog || [], // older (v1/v2) project files just won't have an audit trail
+    photoWidth: project.photoWidth || null, photoHeight: project.photoHeight || null,
   });
   nextLayerId = state.layers.length + 1;
+  // Older (pre-canvas-fit) project files won't have these -- square is the
+  // long-standing default, so falling back to it here is not a behavior
+  // change for any project saved before tonight.
+  canvas.width = project.canvasWidth || SQUARE_CANVAS_SIZE;
+  canvas.height = project.canvasHeight || SQUARE_CANVAS_SIZE;
+  updateCanvasFitOffer();
+  syncScaleSlider();
   if (state.provenanceLog.length) {
     renderProvenanceCard(state.provenanceLog[state.provenanceLog.length - 1]);
     document.getElementById('btnCopyDisclosure').disabled = false;
@@ -971,6 +1124,10 @@ document.getElementById('importInput').onchange = async () => {
   setBusy(false);
   renderLayerPanel();
   redraw();
+};
+
+document.getElementById('sandboxPreviewOverlay').onclick = () => {
+  document.getElementById('sandboxPreviewOverlay').style.display = 'none';
 };
 
 connectWs();

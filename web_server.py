@@ -19,7 +19,6 @@ import io
 import json
 import struct
 import threading
-import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -30,6 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps
 
 from backends.comfy import ComfyBackend
+from spout_output import SpoutFrameBuffer, spout_sender_loop
 import photoshoot_pipeline
 
 COMFY_ADDRESS = "127.0.0.1:8188"
@@ -55,53 +55,50 @@ PHOTOBOOTH_SPOUT_HEIGHT = 768
 PHOTOBOOTH_SPOUT_FPS = 15
 
 
-class SpoutFrameBuffer:
-    def __init__(self, width: int, height: int):
-        self.width = width
-        self.height = height
-        self.lock = threading.Lock()
-        self.data = bytes([20, 20, 24, 255]) * (width * height)  # placeholder: near-black
-
-    def set_image(self, image: Image.Image):
-        if image.size != (self.width, self.height):
-            image = image.resize((self.width, self.height), Image.LANCZOS)
-        with self.lock:
-            self.data = image.convert("RGBA").tobytes()
-
-    def get_bytes(self) -> bytes:
-        with self.lock:
-            return self.data
-
-
 photobooth_frame_buffer = SpoutFrameBuffer(PHOTOBOOTH_SPOUT_WIDTH, PHOTOBOOTH_SPOUT_HEIGHT)
 spout_stop_event = threading.Event()
 
 
-def photobooth_spout_loop():
-    import SpoutGL
-    from OpenGL import GL
+def _warm_up_pipeline_models():
+    """Runs each CV stage once on a throwaway image before the server takes
+    real traffic. Without this, the *first* real upload pays for lazy model
+    construction (rembg session, OpenposeDetector, MidasDetector) inline —
+    and MiDaS's first-ever forward pass in a freshly loaded process has been
+    observed to fail outright with a tensor-size mismatch inside its DPT
+    skip connections (a cold-load race, not an input-size problem: a second
+    call in the same process succeeds every time). Warming up here moves
+    that cost and that failure mode out of the user-facing request path.
 
-    with SpoutGL.SpoutSender() as sender:
-        sender.setSenderName(PHOTOBOOTH_SPOUT_NAME)
-        print(f"[spout] sender '{PHOTOBOOTH_SPOUT_NAME}' started at "
-              f"{PHOTOBOOTH_SPOUT_WIDTH}x{PHOTOBOOTH_SPOUT_HEIGHT}")
-        while not spout_stop_event.is_set():
-            sender.sendImage(
-                photobooth_frame_buffer.get_bytes(),
-                photobooth_frame_buffer.width,
-                photobooth_frame_buffer.height,
-                GL.GL_RGBA,
-                False,
-                0,
-            )
-            sender.setFrameSync(PHOTOBOOTH_SPOUT_NAME)
-            time.sleep(1.0 / PHOTOBOOTH_SPOUT_FPS)
+    Retries once on failure precisely because it's the *first* call that's
+    been observed to trip the race — if warmup itself hits it, a second
+    attempt in the same now-partially-loaded process is the empirically
+    reliable recovery. If both attempts fail, log and let the server start
+    anyway: failing startup entirely over a cold-load race would be a worse
+    outcome than the pre-warmup behavior of only the first real request
+    failing."""
+    dummy = Image.new("RGB", (512, 512), (128, 128, 128))
+    try:
+        photoshoot_pipeline.analyze(dummy)
+    except Exception as exc:
+        print(f"[warmup] first attempt failed ({exc!r}), retrying once...")
+        try:
+            photoshoot_pipeline.analyze(dummy)
+        except Exception as exc2:
+            print(f"[warmup] retry also failed ({exc2!r}) — starting anyway, "
+                  f"first real upload may hit this instead")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print("[warmup] loading rotoscope/pose/depth models...")
+    await asyncio.to_thread(_warm_up_pipeline_models)
+    print("[warmup] done")
     asyncio.create_task(comfy_relay_loop())
-    threading.Thread(target=photobooth_spout_loop, daemon=True).start()
+    threading.Thread(
+        target=spout_sender_loop,
+        args=(photobooth_frame_buffer, PHOTOBOOTH_SPOUT_NAME, PHOTOBOOTH_SPOUT_FPS, spout_stop_event),
+        daemon=True,
+    ).start()
     yield
     spout_stop_event.set()
 
@@ -231,13 +228,19 @@ async def analyze(file: UploadFile = File(...)):
     result = await asyncio.to_thread(photoshoot_pipeline.analyze, image)
 
     return JSONResponse({
-        "original": pil_to_b64(image),
+        # result["image"] is `image` downscaled if it was oversized -- this,
+        # not the raw upload, becomes the browser's canonical "original" and
+        # is what later generation calls send back as the subject photo.
+        "original": pil_to_b64(result["image"]),
         "cutout": pil_to_b64(result["cutout"]),
         "mask": pil_to_b64(result["mask"]),
         "pose": pil_to_b64(result["pose"]),
         "depth": pil_to_b64(result["depth"]),
         "shadow": pil_to_b64(result["shadow"]),
         "illumination": result["illumination"].to_dict(),
+        "suggested_controlnet_strength": result["suggested_controlnet_strength"],
+        "width": result["image"].width,
+        "height": result["image"].height,
     })
 
 
