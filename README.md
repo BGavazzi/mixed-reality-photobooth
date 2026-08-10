@@ -1,6 +1,6 @@
 # resolume-genai-bridge
 
-[![tests](https://github.com/BGavazzi/resolume-genai-bridge/actions/workflows/tests.yml/badge.svg)](https://github.com/BGavazzi/resolume-genai-bridge/actions/workflows/tests.yml)
+[![tests](https://github.com/BGavazzi/mixed-reality-photobooth/actions/workflows/tests.yml/badge.svg)](https://github.com/BGavazzi/mixed-reality-photobooth/actions/workflows/tests.yml)
 
 Two demos in one repo, both built around orchestrating ComfyUI's real APIs
 (REST + its own progress/preview websocket) rather than just calling a
