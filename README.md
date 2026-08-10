@@ -1,4 +1,4 @@
-# resolume-genai-bridge
+# mixed-reality-photobooth
 
 Two demos in one repo, both built around orchestrating ComfyUI's real APIs
 (REST + its own progress/preview websocket) rather than just calling a
