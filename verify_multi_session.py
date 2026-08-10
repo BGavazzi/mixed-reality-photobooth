@@ -4,13 +4,28 @@ sessions, different photos, different prompts, fired close together so
 their jobs overlap in ComfyUI's own queue -- then verifies each session's
 websocket only ever receives ITS OWN result, never the other session's.
 
-Needs ComfyUI + web_server.py already running, and two subject photos:
-test_images/pexels_8217535.jpg and fallback_examples/loft_interior_preview.png
-in this repo's dev setup. Both paths are gitignored (not tracked) -- on a
-fresh clone, swap in any two of your own subject photos.
+Needs ComfyUI + web_server.py already running, plus two DIFFERENT subject
+photos -- different, so that a result leaking between sessions is visible.
+The defaults are gitignored, so pass your own on a fresh clone:
+
+    python verify_multi_session.py --image-a one.jpg --image-b two.jpg
 """
 
+import argparse
+
 from playwright.sync_api import sync_playwright
+
+import verify_common
+
+parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("--base-url", default=verify_common.DEFAULT_BASE_URL)
+parser.add_argument("--image-a", default=verify_common.DEFAULT_SECOND_PHOTO, help="subject photo for session A")
+parser.add_argument("--image-b", default=verify_common.DEFAULT_SQUARE_PHOTO, help="subject photo for session B")
+args = parser.parse_args()
+
+IMAGE_A = verify_common.resolve_image(args.image_a, "--image-a", "a subject photo for session A")
+IMAGE_B = verify_common.resolve_image(args.image_b, "--image-b", "a different subject photo for session B")
+verify_common.preflight(args.base_url)
 
 with sync_playwright() as pw:
     browser = pw.chromium.launch(headless=True)
@@ -26,14 +41,14 @@ with sync_playwright() as pw:
     page_b.on("pageerror", lambda e: session_b["errors"].append(str(e)))
 
     print("connecting both sessions...")
-    page_a.goto("http://127.0.0.1:8000")
-    page_b.goto("http://127.0.0.1:8000")
+    page_a.goto(args.base_url)
+    page_b.goto(args.base_url)
     page_a.wait_for_function("() => document.getElementById('connStatus').textContent === 'connected'")
     page_b.wait_for_function("() => document.getElementById('connStatus').textContent === 'connected'")
 
     print("uploading different photos to each session...")
-    page_a.set_input_files("#fileInput", "test_images/pexels_8217535.jpg")
-    page_b.set_input_files("#fileInput", "fallback_examples/loft_interior_preview.png")
+    page_a.set_input_files("#fileInput", IMAGE_A)
+    page_b.set_input_files("#fileInput", IMAGE_B)
     page_a.wait_for_function(
         "() => document.getElementById('footerStatus').textContent.includes('ready to generate')", timeout=90_000)
     page_b.wait_for_function(

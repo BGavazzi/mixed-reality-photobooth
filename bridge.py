@@ -35,6 +35,7 @@ from pythonosc import dispatcher, osc_server
 
 import resolume_state
 from backends import BACKENDS
+from console_encoding import use_utf8_console
 from spout_output import SpoutFrameBuffer as FrameBuffer, spout_sender_loop
 
 # --- config ---------------------------------------------------------------
@@ -74,13 +75,29 @@ class VideoLoopPlayer:
         import cv2
 
         cap = cv2.VideoCapture(self.path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 24
+        if not cap.isOpened():
+            print(f"[bridge] could not open video {self.path!r} — nothing to loop")
+            cap.release()
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0 or fps > 240:
+            fps = 24  # some containers report 0 or a nonsense value
         delay = 1.0 / fps
+
         while not self.stop_event.is_set():
             ok, frame_bgr = cap.read()
             if not ok:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop back to start
-                continue
+                ok, frame_bgr = cap.read()
+                if not ok:
+                    # A file that opened but yields no frames (truncated
+                    # download, unsupported codec) used to spin this loop at
+                    # 100% of a core forever: read fails, seek to 0,
+                    # `continue`, read fails again, with no sleep anywhere on
+                    # that path. Bail instead of burning a core silently.
+                    print(f"[bridge] video {self.path!r} yielded no frames after rewind — stopping playback")
+                    break
             rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA)
             self.frame_buffer.set_image(Image.fromarray(rgba))
             time.sleep(delay)
@@ -253,6 +270,7 @@ def make_resync_handler(backend, frame_buffer, resolume_url: str, video_manager)
 # --- main ---------------------------------------------------------------
 
 def main():
+    use_utf8_console()  # prompts are logged verbatim and can contain non-ASCII
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--backend", choices=sorted(BACKENDS), default="comfy")
     parser.add_argument("--comfy", default="127.0.0.1:8188", help="ComfyUI host:port (--backend comfy)")

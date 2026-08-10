@@ -1,23 +1,16 @@
 import io
 import json
-import sys
 import time
 import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Callable
 
 import requests
 from PIL import Image
 
 from .base import GenerationBackend
-
-# Windows consoles default to cp1252, which raises on most non-ASCII prompt
-# text (accents, emoji, non-English words) — reconfigure to UTF-8 so a
-# prompt containing them doesn't crash the request mid-generation.
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 DEFAULT_WORKFLOW_PATH = Path(__file__).parent.parent / "workflows" / "txt2img_api.json"
 POSITIVE_PROMPT_NODE = "6"
@@ -45,8 +38,22 @@ class ComfyBackend(GenerationBackend):
         self.workflow_path = Path(workflow_path)
         self.client_id = str(uuid.uuid4())
 
-    def _queue_prompt(self, workflow: dict) -> str:
-        payload = {"prompt": workflow, "client_id": self.client_id}
+    def _queue_prompt(self, workflow: dict, client_id: str | None = None,
+                       prompt_id: str | None = None) -> str:
+        """Submits a workflow to /prompt and returns the prompt_id ComfyUI
+        echoes back.
+
+        prompt_id: pass your own to know it *before* ComfyUI would ever emit
+        an event for it (confirmed empirically: /prompt honors a
+        client-supplied prompt_id and echoes it back unchanged). That lets a
+        caller register bookkeeping -- web_server.py's JOBS dict -- before
+        submitting, closing the race where an `executing` event for a
+        same-instant-queued job arrives before the caller's own tracking
+        exists.
+        """
+        payload = {"prompt": workflow, "client_id": client_id or self.client_id}
+        if prompt_id:
+            payload["prompt_id"] = prompt_id
         resp = requests.post(f"http://{self.server_address}/prompt", json=payload, timeout=10)
         resp.raise_for_status()
         return resp.json()["prompt_id"]
@@ -62,6 +69,41 @@ class ComfyBackend(GenerationBackend):
         )
         with urllib.request.urlopen(f"http://{self.server_address}/view?{params}") as resp:
             return resp.read()
+
+    def _iter_outputs(self, prompt_id: str):
+        """Yields every output item ComfyUI recorded for a finished prompt.
+
+        `SaveImage` and `SaveVideo` both report under the same "images" key
+        (the video one just adds `"animated": true`), so stills and video
+        share this one shape.
+        """
+        entry = self._get_history(prompt_id).get(prompt_id)
+        if not entry or not entry.get("outputs"):
+            return
+        for node_output in entry["outputs"].values():
+            yield from node_output.get("images", [])
+
+    def _poll_for_output(self, prompt_id: str, extract: Callable, timeout: float,
+                          interval: float, label: str):
+        """Blocks until `extract` returns something non-None for one of the
+        prompt's outputs, or `timeout` elapses.
+
+        This poll loop existed in four near-identical copies (stills, video,
+        background, and the one-shot check), each with its own subtly
+        different nesting of the same `history -> outputs -> images` walk.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for item in self._iter_outputs(prompt_id):
+                result = extract(item)
+                if result is not None:
+                    return result
+            time.sleep(interval)
+        raise TimeoutError(f"ComfyUI did not finish {label} prompt_id={prompt_id} within {timeout}s")
+
+    def _download_image(self, item: dict, mode: str = "RGBA") -> Image.Image:
+        raw = self._get_output_bytes(item["filename"], item["subfolder"], item["type"])
+        return Image.open(io.BytesIO(raw)).convert(mode)
 
     def _upload_image(self, image: Image.Image, name_hint: str) -> str:
         """Uploads a PIL image to ComfyUI's /upload/image so a workflow's
@@ -79,20 +121,16 @@ class ComfyBackend(GenerationBackend):
         resp.raise_for_status()
         return resp.json()["name"]
 
-    def queue_image_generation(self, prompt: str, client_id: str = None, prompt_id: str = None) -> tuple[str, int]:
+    def queue_image_generation(self, prompt: str, client_id: str | None = None,
+                                prompt_id: str | None = None) -> tuple[str, int]:
         """Non-blocking counterpart to generate_image(), for callers (e.g.
         the web server) that want to relay ComfyUI's own progress/preview
         websocket events instead of polling to a final result. Returns
         (prompt_id, seed) -- the seed is handed back so callers can show a
         real generation provenance record, not just "the model made this".
 
-        prompt_id: pass your own to know it *before* ComfyUI would ever
-        emit an event for it (confirmed empirically: ComfyUI's /prompt
-        honors a client-supplied prompt_id and echoes it back exactly) --
-        lets a caller register bookkeeping (e.g. web_server.py's JOBS dict)
-        before submitting, closing the race where an "executing" event for
-        a same-instant-queued job could otherwise arrive before the
-        caller's own tracking is set up."""
+        prompt_id: see _queue_prompt()'s docstring for why a caller would
+        supply its own."""
         with open(self.workflow_path) as f:
             workflow = json.load(f)
 
@@ -100,51 +138,23 @@ class ComfyBackend(GenerationBackend):
         workflow[POSITIVE_PROMPT_NODE]["inputs"]["text"] = prompt
         workflow[SEED_NODE]["inputs"]["seed"] = seed
 
-        payload = {"prompt": workflow, "client_id": client_id or self.client_id}
-        if prompt_id:
-            payload["prompt_id"] = prompt_id
-        resp = requests.post(f"http://{self.server_address}/prompt", json=payload, timeout=10)
-        resp.raise_for_status()
-        prompt_id = resp.json()["prompt_id"]
+        prompt_id = self._queue_prompt(workflow, client_id, prompt_id)
         print(f"[comfy] queued prompt_id={prompt_id} text={prompt!r}")
         return prompt_id, seed
 
     def generate_image(self, prompt: str, timeout: float = 120.0) -> Image.Image:
-        with open(self.workflow_path) as f:
-            workflow = json.load(f)
-
-        workflow[POSITIVE_PROMPT_NODE]["inputs"]["text"] = prompt
-        workflow[SEED_NODE]["inputs"]["seed"] = int.from_bytes(uuid.uuid4().bytes[:4], "big")
-
-        prompt_id = self._queue_prompt(workflow)
-        print(f"[comfy] queued prompt_id={prompt_id} text={prompt!r}")
-
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            history = self._get_history(prompt_id)
-            entry = history.get(prompt_id)
-            if entry and entry.get("outputs"):
-                for node_output in entry["outputs"].values():
-                    for image in node_output.get("images", []):
-                        raw = self._get_output_bytes(
-                            image["filename"], image["subfolder"], image["type"]
-                        )
-                        return Image.open(io.BytesIO(raw)).convert("RGBA")
-            time.sleep(0.5)
-
-        raise TimeoutError(f"ComfyUI did not finish prompt_id={prompt_id} within {timeout}s")
+        prompt_id, _seed = self.queue_image_generation(prompt)
+        return self._poll_for_output(
+            prompt_id, lambda item: self._download_image(item, "RGBA"),
+            timeout=timeout, interval=0.5, label="",
+        )
 
     def get_result_image(self, prompt_id: str) -> Image.Image | None:
         """Non-blocking single check of /history for a finished prompt's
         output image, or None if it isn't there yet. Used by callers that
         already know (via the websocket) that execution just finished."""
-        history = self._get_history(prompt_id)
-        entry = history.get(prompt_id)
-        if entry and entry.get("outputs"):
-            for node_output in entry["outputs"].values():
-                for image in node_output.get("images", []):
-                    raw = self._get_output_bytes(image["filename"], image["subfolder"], image["type"])
-                    return Image.open(io.BytesIO(raw)).convert("RGB")
+        for item in self._iter_outputs(prompt_id):
+            return self._download_image(item, "RGB")
         return None
 
     def generate_video(self, prompt: str, timeout: float = 600.0,
@@ -165,20 +175,12 @@ class ComfyBackend(GenerationBackend):
         prompt_id = self._queue_prompt(workflow)
         print(f"[comfy] queued video prompt_id={prompt_id} text={prompt!r}")
 
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            history = self._get_history(prompt_id)
-            entry = history.get(prompt_id)
-            if entry and entry.get("outputs"):
-                for node_output in entry["outputs"].values():
-                    for item in node_output.get("images", []):
-                        if item["filename"].lower().endswith(VIDEO_EXTENSIONS):
-                            return self._get_output_bytes(
-                                item["filename"], item["subfolder"], item["type"]
-                            )
-            time.sleep(1.0)
+        def extract(item):
+            if not item["filename"].lower().endswith(VIDEO_EXTENSIONS):
+                return None
+            return self._get_output_bytes(item["filename"], item["subfolder"], item["type"])
 
-        raise TimeoutError(f"ComfyUI did not finish video prompt_id={prompt_id} within {timeout}s")
+        return self._poll_for_output(prompt_id, extract, timeout=timeout, interval=1.0, label="video")
 
     def queue_background_generation(
         self,
@@ -189,8 +191,8 @@ class ComfyBackend(GenerationBackend):
         controlnet_strength: float = 0.75,
         denoise: float = 0.85,
         workflow_path: Path = DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH,
-        client_id: str = None,
-        prompt_id: str = None,
+        client_id: str | None = None,
+        prompt_id: str | None = None,
     ) -> tuple[str, int]:
         """Queues a background-only regeneration: subject_photo is used as
         the init image, background_mask (255=regenerate, 0=keep original)
@@ -200,8 +202,8 @@ class ComfyBackend(GenerationBackend):
         server) can relay ComfyUI's own websocket progress/preview events
         while it runs, instead of blocking like generate_image().
 
-        prompt_id: see queue_image_generation()'s docstring -- same
-        race-closing purpose."""
+        prompt_id: see _queue_prompt()'s docstring -- same race-closing
+        purpose."""
         with open(workflow_path) as f:
             workflow = json.load(f)
 
@@ -218,13 +220,7 @@ class ComfyBackend(GenerationBackend):
         workflow[PHOTOSHOOT_SEED_NODE]["inputs"]["seed"] = seed
         workflow[PHOTOSHOOT_SEED_NODE]["inputs"]["denoise"] = denoise
 
-        payload = {"prompt": workflow, "client_id": client_id or self.client_id}
-        if prompt_id:
-            payload["prompt_id"] = prompt_id
-        resp = requests.post(f"http://{self.server_address}/prompt", json=payload, timeout=10)
-        resp.raise_for_status()
-        prompt_id = resp.json()["prompt_id"]
-
+        prompt_id = self._queue_prompt(workflow, client_id, prompt_id)
         print(f"[comfy] queued background prompt_id={prompt_id} text={prompt!r}")
         return prompt_id, seed
 
@@ -232,16 +228,7 @@ class ComfyBackend(GenerationBackend):
         """Synchronous convenience wrapper around queue_background_generation
         for scripts/tests that don't need live progress."""
         prompt_id, _seed = self.queue_background_generation(*args, **kwargs)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            history = self._get_history(prompt_id)
-            entry = history.get(prompt_id)
-            if entry and entry.get("outputs"):
-                for node_output in entry["outputs"].values():
-                    for image in node_output.get("images", []):
-                        raw = self._get_output_bytes(
-                            image["filename"], image["subfolder"], image["type"]
-                        )
-                        return Image.open(io.BytesIO(raw)).convert("RGB")
-            time.sleep(0.5)
-        raise TimeoutError(f"ComfyUI did not finish prompt_id={prompt_id} within {timeout}s")
+        return self._poll_for_output(
+            prompt_id, lambda item: self._download_image(item, "RGB"),
+            timeout=timeout, interval=0.5, label="background",
+        )

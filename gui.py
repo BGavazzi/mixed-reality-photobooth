@@ -1,7 +1,7 @@
 """
 Minimal typing box for the bridge. No OSC/curl knowledge needed — type a
 prompt, hit a button (or Enter), it fires the same triggers
-test_trigger.py does.
+send_trigger.py does.
 
     python gui.py
 """

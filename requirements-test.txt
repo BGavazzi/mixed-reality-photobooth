@@ -1,0 +1,23 @@
+# Everything the offline suite in tests/ needs, and nothing else.
+#
+# Deliberately much smaller than requirements.txt: no rembg, no
+# controlnet_aux, no torch, no SpoutGL, no Playwright. Those pull hundreds of
+# megabytes of model runtime for code the unit tests never reach -- the CV
+# model wrappers are lazy-loaded, SpoutGL is imported inside the sender loop,
+# and the ComfyUI backend is faked. Keeping this list minimal is what lets
+# CI run in well under a minute on a clean checkout.
+#
+#     pip install -r requirements-test.txt && pytest
+
+pytest
+
+Pillow
+numpy
+opencv-python-headless   # cv2, for photoshoot_pipeline's connected-components pass
+
+fastapi                  # web_server imports these at module scope
+python-multipart         # FastAPI needs it to even *declare* the /api/analyze upload route
+httpx                    # backs fastapi.testclient, used to exercise /api/analyze
+websockets
+requests
+python-osc               # bridge.py's OSC listener, for the import check in CI

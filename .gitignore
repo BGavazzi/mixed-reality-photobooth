@@ -1,9 +1,16 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 .env
 fallback_examples/
 *_stdout.log
 *_stderr.log
 test_images/
 verify_out/
+
+# Personal interview prep / notes -- kept out of the public repo, since an
+# interviewer browsing the repo shouldn't be reading the prep for their own
+# interview. Remove these lines if you ever want them tracked.
+INTERVIEW_PREP.md
+case_study_debugging_session.md

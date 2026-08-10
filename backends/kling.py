@@ -2,7 +2,6 @@ import io
 import os
 import time
 
-import jwt
 import requests
 from PIL import Image
 
@@ -21,6 +20,15 @@ class KlingBackend(GenerationBackend):
     """
 
     def __init__(self, model: str = "kling-v1", base_url: str = DEFAULT_BASE_URL):
+        # Imported here rather than at module scope to match RunwayBackend:
+        # backends/__init__.py eagerly imports all three backends to build
+        # the BACKENDS registry, so a top-level `import jwt` made PyJWT a
+        # hard install requirement for anyone running only ComfyUI locally.
+        try:
+            import jwt  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError("pip install pyjwt to use the Kling backend") from exc
+
         self.access_key = os.environ.get("KLING_ACCESS_KEY")
         self.secret_key = os.environ.get("KLING_SECRET_KEY")
         if not (self.access_key and self.secret_key):
@@ -29,6 +37,7 @@ class KlingBackend(GenerationBackend):
         self.base_url = base_url
 
     def _token(self) -> str:
+        import jwt
         payload = {
             "iss": self.access_key,
             "exp": int(time.time()) + 1800,
