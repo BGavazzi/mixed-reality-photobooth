@@ -86,10 +86,72 @@ def test_core_group_covers_everything_web_server_imports():
 
 # --- opencv build -----------------------------------------------------------
 
+# Captured verbatim from real installs: opencv-python-headless 5.0.0.93 and
+# opencv-python 5.0.0 on Windows. Both wheels export `imshow`, so an earlier
+# hasattr()-based check called the headless build a GUI build -- these strings
+# are here so that assumption can't come back.
+HEADLESS_BUILD_INFO = """
+General configuration for OpenCV 5.0.0 =====================================
+  Version control:               5.0.0
+
+  GUI:                           NONE
+    VTK support:                 NO
+"""
+
+GUI_BUILD_INFO = """
+General configuration for OpenCV 5.0.0 =====================================
+  Version control:               5.0.0
+
+  GUI:                           WIN32UI
+    Win32 UI:                    YES
+"""
+
+# Some OpenCV builds leave the GUI: line bare and list backends beneath it.
+BARE_GUI_BUILD_INFO = """
+  GUI:
+    GTK+:                        YES (ver 3.24.33)
+    VTK support:                 NO
+"""
+
+
 class FakeCv2:
+    """Mimics the real wheels: `imshow` exists either way; only the build
+    report distinguishes them."""
+
     def __init__(self, gui):
-        if gui:
-            self.imshow = lambda *a: None
+        self.imshow = lambda *a: None  # present in BOTH builds -- that's the trap
+        self._info = GUI_BUILD_INFO if gui else HEADLESS_BUILD_INFO
+
+    def getBuildInformation(self):
+        return self._info
+
+
+def test_gui_detection_reads_the_build_report_not_the_symbol_table():
+    """The regression this was rewritten for. Both wheels export imshow; only
+    the headless one has no window backend."""
+    assert doctor.opencv_has_gui(GUI_BUILD_INFO) is True
+    assert doctor.opencv_has_gui(HEADLESS_BUILD_INFO) is False
+    assert hasattr(FakeCv2(gui=False), "imshow"), "the trap must still be present in the fake"
+
+
+def test_gui_detection_handles_a_bare_gui_line_with_backends_below():
+    assert doctor.opencv_has_gui(BARE_GUI_BUILD_INFO) is True
+
+
+def test_gui_detection_defaults_to_no_window_when_it_cannot_tell():
+    """Better to under-promise: claiming a window backend that isn't there
+    sends someone to debug the viewer instead of their install."""
+    assert doctor.opencv_has_gui("") is False
+    assert doctor.opencv_has_gui("some unrelated text") is False
+
+
+def test_unreadable_build_info_warns_instead_of_crashing():
+    class Broken:
+        def getBuildInformation(self):
+            raise RuntimeError("segfault-adjacent nonsense")
+
+    finding = doctor.check_opencv_build(Broken(), wants_viewer=True)
+    assert finding.level == doctor.WARN
 
 
 def test_headless_opencv_is_fine_for_the_photo_booth():

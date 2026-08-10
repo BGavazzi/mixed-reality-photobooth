@@ -116,6 +116,39 @@ def ascii_only(text: str) -> str:
     return str(text).encode("ascii", "replace").decode("ascii")
 
 
+def opencv_has_gui(build_information: str) -> bool:
+    """Reads OpenCV's own build report for a usable window backend.
+
+    NOT `hasattr(cv2, "imshow")`: the headless wheel exports imshow just like
+    the GUI one and only fails when you *call* it ("The function is not
+    implemented. Rebuild the library with Windows, GTK+ ... support"). That
+    was the first implementation here, and a clean-venv install disproved it
+    -- opencv-python-headless 5.0.0 reported `hasattr` True, so this would
+    have cheerfully told someone their Spout viewer was fine when it wasn't.
+
+    getBuildInformation() reports the binary actually loaded, which is the
+    right question when two distributions can both put a `cv2` on disk and
+    only the last writer survives.
+    """
+    lines = build_information.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("GUI:"):
+            continue
+        value = stripped.split(":", 1)[1].strip()
+        if value:
+            return value.upper() != "NONE"
+        # Some builds leave "GUI:" bare and list backends on the lines below
+        # (e.g. "GTK+: YES"). Treat any YES in that block as a usable backend.
+        for following in lines[index + 1:index + 5]:
+            if ":" not in following or not following.startswith((" ", "\t")):
+                break
+            if following.split(":", 1)[1].strip().upper().startswith("YES"):
+                return True
+        return False
+    return False  # no GUI line at all -- assume none rather than promise a window
+
+
 def check_opencv_build(cv2_module, wants_viewer: bool):
     """Returns a Finding, or None when there's nothing worth saying.
 
@@ -126,7 +159,11 @@ def check_opencv_build(cv2_module, wants_viewer: bool):
     """
     if cv2_module is None:
         return None  # the package-group check already reports it; don't say it twice
-    has_gui = hasattr(cv2_module, "imshow")
+    try:
+        has_gui = opencv_has_gui(cv2_module.getBuildInformation())
+    except Exception:
+        return Finding(WARN, "opencv: installed, but its build info could not be read",
+                       "  Can't tell whether it has a window backend.")
     build = "GUI" if has_gui else "headless"
     if not wants_viewer:
         return Finding(OK, f"opencv: {build} build (fine -- the photo booth needs no window)")
