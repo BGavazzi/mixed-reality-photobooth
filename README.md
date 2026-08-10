@@ -109,10 +109,12 @@ sibling directory of this repo, overridable with `COMFYUI_DIR`:
 
 ```
 $env:COMFYUI_DIR = "C:\path\to\ComfyUI"; .\start_demo.ps1
-``` (If you double-click the script rather
-than running it from an already-open PowerShell window and the services
-don't seem to stay up, open PowerShell yourself and run it directly —
-that path is the one that's fully verified end-to-end.)
+```
+
+(If you double-click the script rather than running it from an already-open
+PowerShell window and the services don't seem to stay up, open PowerShell
+yourself and run it directly — that path is the one that's fully verified
+end-to-end.)
 
 Or manually:
 ```
