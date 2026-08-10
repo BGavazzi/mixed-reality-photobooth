@@ -82,6 +82,13 @@
   footer { padding: 8px 20px; border-top: 1px solid var(--border); font-size: 11px; color: var(--dim); display: flex; justify-content: space-between; }
   input[type=file] { display: none; }
   .hint { font-size: 11px; color: var(--dim); margin-top: 6px; line-height: 1.4; }
+  /* Says *why* the controls below are dead. Disabled buttons here just went
+     flat grey with no explanation, so "nothing in this panel does anything"
+     read as broken rather than as "you haven't loaded a photo yet." */
+  .needs-subject {
+    font-size: 11px; color: var(--warn); margin-top: 10px; line-height: 1.4;
+    border-left: 2px solid var(--warn); padding-left: 8px;
+  }
 </style>
 </head>
 <body>
@@ -148,10 +155,11 @@
       <input type="range" id="cnStrength" min="0" max="1.5" step="0.05" value="0.75">
       <label class="field">Denoise <span class="val" id="dnVal">0.85</span></label>
       <input type="range" id="denoise" min="0.3" max="1" step="0.05" value="0.85">
+      <div class="needs-subject" id="needsSubjectHint">Upload a subject photo above to enable these.</div>
       <div style="margin-top:12px">
         <button id="btnGenerate" disabled>Generate Background</button>
       </div>
-      <button class="secondary small" id="btnAddObject" style="width:100%;margin-top:8px" disabled>+ Add Object (draw region): OFF</button>
+      <button class="secondary small" id="btnAddObject" style="width:100%;margin-top:8px" disabled>✏️ Draw a Region → Add Object: OFF</button>
       <div class="hint">Draws a box on the canvas, asks what goes there, and inpaints just that region onto its own layer — the rest of the composite is untouched.</div>
     </div>
 
@@ -530,9 +538,21 @@ function clipToMask(imageUrl, maskUrl) {
 let isBusy = false;
 function setBusy(busy) {
   isBusy = busy;
-  document.getElementById('btnGenerate').disabled = busy || !state.cutout;
-  document.getElementById('btnAddObject').disabled = busy || !state.cutout;
-  document.getElementById('btnRelight').disabled = busy || !state.cutout;
+  // Every control here needs BOTH a subject photo and an idle pipeline, and
+  // a flat grey button explains neither. The tooltip and the panel hint name
+  // whichever precondition is actually missing, so a disabled panel reads as
+  // "do this first" instead of "this app is broken."
+  const reason = !state.cutout
+    ? 'Upload a subject photo first — this works on the analyzed photo.'
+    : (busy ? 'A generation is already running; ComfyUI renders one at a time.' : '');
+  for (const id of ['btnGenerate', 'btnAddObject', 'btnRelight']) {
+    const btn = document.getElementById(id);
+    btn.disabled = busy || !state.cutout;
+    btn.title = reason;
+  }
+  const hint = document.getElementById('needsSubjectHint');
+  hint.textContent = reason;
+  hint.style.display = reason ? 'block' : 'none';
 }
 
 // --- upload + analyze --------------------------------------------------------
@@ -968,8 +988,11 @@ window.addEventListener('pointerup', async () => {
 // --- region draw tool (add object) ----------------------------------------------
 
 let drawMode = false;
+// Leads with the verb. It used to read "+ Add Object (draw region)", which
+// buries the one word someone scanning for this feature is looking for.
+const DRAW_BTN_LABEL = '✏️ Draw a Region → Add Object';
 function updateDrawBtn() {
-  document.getElementById('btnAddObject').textContent = '+ Add Object (draw region): ' + (drawMode ? 'ON' : 'OFF');
+  document.getElementById('btnAddObject').textContent = DRAW_BTN_LABEL + ': ' + (drawMode ? 'ON' : 'OFF');
   document.getElementById('btnAddObject').classList.toggle('active-toggle', drawMode);
   canvas.classList.toggle('drawing', drawMode);
 }
@@ -1241,7 +1264,19 @@ document.getElementById('sandboxPreviewOverlay').onclick = () => {
   document.getElementById('sandboxPreviewOverlay').style.display = 'none';
 };
 
+// Guard against losing an analyzed subject to an accidental reload. The
+// whole session lives in memory: a refresh throws away a ~30s rotoscope pass
+// and every generation built on it, with no undo and no warning. Export
+// Project (.json) is the real persistence story -- this just makes sure
+// nobody discovers that fact by losing their work.
+window.addEventListener('beforeunload', (e) => {
+  if (!state.cutout) return;  // nothing analyzed yet, nothing to lose
+  e.preventDefault();
+  e.returnValue = '';  // required by Chrome to actually show the prompt
+});
+
 connectWs();
+setBusy(false);  // paints the "upload a photo first" reason onto the disabled controls
 redraw();
 </script>
 </body>
