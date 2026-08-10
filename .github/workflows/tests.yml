@@ -40,3 +40,45 @@ jobs:
         run: |
           python -c "import bridge, web_server, photoshoot_pipeline, resolume_state, spout_output, console_encoding"
           python -c "import backends; print(sorted(backends.BACKENDS))"
+
+  install-story:
+    # Guards the promises the install path makes, none of which the unit tests
+    # can check: that doctor.py is useful on a machine where nothing is set up
+    # yet, and that the requirement files actually resolve on a non-Windows
+    # box -- the platform where the old single requirements.txt failed
+    # outright, because SpoutGL has no wheels outside Windows.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: doctor.py runs on a bare interpreter with nothing installed
+        run: |
+          set +e
+          python doctor.py --all > doctor_out.txt 2>&1
+          status=$?
+          set -e
+          cat doctor_out.txt
+          if grep -qi "Traceback" doctor_out.txt; then
+            echo "::error::doctor.py crashed instead of reporting the problem"; exit 1
+          fi
+          grep -q "packages missing" doctor_out.txt \
+            || { echo "::error::doctor.py did not report the missing packages"; exit 1; }
+          grep -q "pip install -r requirements.txt" doctor_out.txt \
+            || { echo "::error::doctor.py did not print the fix command"; exit 1; }
+          [ "$status" -eq 1 ] \
+            || { echo "::error::expected exit 1 on a broken install, got $status"; exit 1; }
+
+      - name: Requirement files resolve on Linux (no Windows-only packages leak in)
+        run: |
+          for file in requirements.txt requirements-resolume.txt \
+                      requirements-backends.txt requirements-test.txt; do
+            echo "--- $file"
+            pip install --dry-run --quiet -r "$file" \
+              || { echo "::error::$file does not resolve on Linux"; exit 1; }
+          done
+
+      - name: install.sh is valid bash
+        run: bash -n install.sh

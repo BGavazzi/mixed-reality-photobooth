@@ -77,20 +77,82 @@ verified against ComfyUI's own `server.py` (`encode_bytes`/`send_image`).
 
 ### Setup
 
+**One command.** It creates `.venv`, installs what's needed, and finishes by
+telling you what (if anything) is still missing:
+
 ```
+powershell -ExecutionPolicy Bypass -File install.ps1     # Windows
+./install.sh                                             # macOS / Linux
+```
+
+Add `-Resolume` / `--resolume` if you also want the OSC + Spout bridge,
+or `-All` / `--all` for everything. Safe to re-run — pip skips what's
+already satisfied, so an interrupted install resumes.
+
+Expect roughly **2GB and a few minutes** on a cold cache: `controlnet_aux`
+pulls in torch, torchvision, timm, scipy and scikit-image.
+
+<details>
+<summary>Prefer to do it by hand?</summary>
+
+```
+python -m venv .venv
+.venv\Scripts\activate          # source .venv/bin/activate on macOS/Linux
 pip install -r requirements.txt
-pip install --force-reinstall opencv-python
+python doctor.py
 ```
 
-The second line matters: `controlnet_aux` pulls in `opencv-python-headless`,
-which silently overwrites the GUI-capable `opencv-python` build on disk
-(same `cv2` module name, one wins) — without this, `spout_viewer.py` and
-the Resolume bridge's video preview fail with a `waitKeyImpl` error.
+Requirements are split so nobody installs a Windows-only package to try the
+browser app:
 
-Models (ComfyUI's `models/` folder):
+| file | what it's for |
+|---|---|
+| `requirements.txt` | the photo booth — all you need for the primary demo |
+| `requirements-resolume.txt` | the OSC bridge + Spout output (Windows for Spout) |
+| `requirements-backends.txt` | hosted Runway / Kling backends |
+| `requirements-test.txt` | the offline test suite |
+
+</details>
+
+#### Something not working? Run the doctor
+
+```
+python doctor.py              # photo booth
+python doctor.py --all        # every optional piece too
+```
+
+It checks the Python version, every package (naming what breaks without each
+one), which OpenCV build you ended up with, whether ComfyUI is reachable, and
+whether the models the workflow names are actually on disk — printing the
+exact command to fix each problem. It imports nothing outside the standard
+library, so it runs on a bare interpreter *before* anything is installed,
+and exits non-zero only for things that would genuinely stop the app.
+
+#### Models
+
+ComfyUI needs two files (the app checks for both at startup and `doctor.py`
+reports them):
+
 - Checkpoint: [`RealVisXL_V5.0_fp16.safetensors`](https://huggingface.co/SG161222/RealVisXL_V5.0) in `models/checkpoints/`
 - ControlNet: [`diffusers_xl_depth_full.safetensors`](https://huggingface.co/lllyasviel/sd_control_collection) in `models/controlnet/`
-- Rotoscope/pose/depth models (`birefnet-portrait`, OpenPose, MiDaS) download automatically on first use via `rembg`/`controlnet_aux`.
+
+The rotoscope/pose/depth models (`birefnet-portrait`, OpenPose, MiDaS)
+download themselves on first use via `rembg`/`controlnet_aux` — the first
+photo you analyze will be slower than the rest.
+
+#### A note on OpenCV
+
+This project used to require `pip install --force-reinstall opencv-python`
+after every install, because `controlnet_aux` depends on
+`opencv-python-headless` and both builds provide the same importable `cv2` —
+whichever lands last on disk wins.
+
+That step is gone from the main path. The photo booth only uses OpenCV for
+array work (connected components, colour conversion), which the headless
+build does perfectly, so `requirements.txt` now asks for headless
+*deliberately* and the two never fight. Exactly one optional file needs a
+real window — `spout_viewer.py`, via `cv2.imshow` — and the installer handles
+that itself when you ask for the Resolume extras.
 
 ### Run
 
@@ -301,7 +363,21 @@ Resolume state <---- |     REST API -> name+effects   |         or
 
 ### Prerequisites
 
-- Windows (Spout is Windows-only)
+```
+powershell -ExecutionPolicy Bypass -File install.ps1 -Resolume
+python doctor.py --resolume
+```
+
+This is the one path that needs the extra packages (`python-osc`, `SpoutGL`,
+`PyOpenGL`) and the GUI OpenCV build for `spout_viewer.py`'s window — the
+installer handles both, and `doctor.py --resolume` reports which OpenCV build
+you actually ended up with.
+
+- Windows for the **Spout output specifically** — the OSC trigger path and
+  generation work fine on macOS/Linux, and the requirement markers skip the
+  Spout packages there rather than failing the install. `spout_sender_loop()`
+  reports the missing module and returns instead of dying in a background
+  thread, so the app stays honest about publishing nothing.
 - A generation backend, at least one of:
   - [ComfyUI](https://github.com/comfyanonymous/ComfyUI) running locally
     with a checkpoint installed (default `127.0.0.1:8188`) — needed for
