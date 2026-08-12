@@ -26,6 +26,7 @@ PHOTOSHOOT_SUBJECT_NODE = "2"
 PHOTOSHOOT_MASK_NODE = "3"
 PHOTOSHOOT_DEPTH_NODE = "4"
 PHOTOSHOOT_POSITIVE_PROMPT_NODE = "7"
+PHOTOSHOOT_NEGATIVE_PROMPT_NODE = "8"
 PHOTOSHOOT_CONTROLNET_NODE = "10"
 PHOTOSHOOT_SEED_NODE = "11"
 
@@ -193,6 +194,8 @@ class ComfyBackend(GenerationBackend):
         workflow_path: Path = DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH,
         client_id: str | None = None,
         prompt_id: str | None = None,
+        negative_prompt: str | None = None,
+        seed: int | None = None,
     ) -> tuple[str, int]:
         """Queues a background-only regeneration: subject_photo is used as
         the init image, background_mask (255=regenerate, 0=keep original)
@@ -203,7 +206,18 @@ class ComfyBackend(GenerationBackend):
         while it runs, instead of blocking like generate_image().
 
         prompt_id: see _queue_prompt()'s docstring -- same race-closing
-        purpose."""
+        purpose.
+
+        negative_prompt: overrides the workflow's baked-in negative. Left
+        None it keeps whatever the JSON ships with, which is what every
+        caller did before brand kits existed -- and the reason the string was
+        effectively unreviewable: it lived only in the workflow file and no
+        API could see or change it.
+
+        seed: pins the sampler instead of drawing a fresh random one. This is
+        what makes a brand's approved look reproducible across a whole event
+        rather than a different image per guest.
+        """
         with open(workflow_path) as f:
             workflow = json.load(f)
 
@@ -211,11 +225,16 @@ class ComfyBackend(GenerationBackend):
         mask_name = self._upload_image(background_mask.convert("L"), "bgmask")
         depth_name = self._upload_image(depth_map.convert("RGB"), "depth")
 
-        seed = int.from_bytes(uuid.uuid4().bytes[:4], "big")
+        # Masked to 32 bits like the random path, so a caller passing a large
+        # or negative number can't produce a seed ComfyUI rejects -- and so a
+        # pinned seed and a random one are always reported in the same range.
+        seed = int.from_bytes(uuid.uuid4().bytes[:4], "big") if seed is None else int(seed) % (2 ** 32)
         workflow[PHOTOSHOOT_SUBJECT_NODE]["inputs"]["image"] = subject_name
         workflow[PHOTOSHOOT_MASK_NODE]["inputs"]["image"] = mask_name
         workflow[PHOTOSHOOT_DEPTH_NODE]["inputs"]["image"] = depth_name
         workflow[PHOTOSHOOT_POSITIVE_PROMPT_NODE]["inputs"]["text"] = prompt
+        if negative_prompt is not None:
+            workflow[PHOTOSHOOT_NEGATIVE_PROMPT_NODE]["inputs"]["text"] = negative_prompt
         workflow[PHOTOSHOOT_CONTROLNET_NODE]["inputs"]["strength"] = controlnet_strength
         workflow[PHOTOSHOOT_SEED_NODE]["inputs"]["seed"] = seed
         workflow[PHOTOSHOOT_SEED_NODE]["inputs"]["denoise"] = denoise
