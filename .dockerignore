@@ -1,0 +1,27 @@
+# Keep the build context small and the image free of local state. Without
+# this, .venv alone adds several gigabytes to every build's context transfer.
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+.git/
+.github/
+
+# Local runtime output, none of which belongs in an image.
+*.log
+verify_out/
+test_images/
+comfyui-models/
+
+# Gitignored working files and IDE state.
+.pytest_cache/
+.idea/
+.vscode/
+
+# The Resolume half of the repo (bridge.py, gui.py, spout_viewer.py) is left
+# in on purpose even though it cannot run here -- it needs SpoutGL, tkinter and
+# a GUI OpenCV build, none of which are installed. It is a few dozen KB, and
+# excluding source would silently break `pytest` inside the container the first
+# time a test touched it. requirements-resolume.txt is likewise present but
+# never installed; the Dockerfile only installs requirements.txt.

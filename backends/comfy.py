@@ -12,23 +12,35 @@ from PIL import Image
 
 from .base import GenerationBackend
 
-DEFAULT_WORKFLOW_PATH = Path(__file__).parent.parent / "workflows" / "txt2img_api.json"
-POSITIVE_PROMPT_NODE = "6"
-SEED_NODE = "3"
+import workflow_graph
+from workflow_graph import (
+    CONTROLNET,
+    DEPTH_IMAGE,
+    MASK_IMAGE,
+    NEGATIVE_PROMPT,
+    POSITIVE_PROMPT,
+    SAMPLER,
+    SUBJECT_IMAGE,
+)
 
+# Node ids used to live here as constants -- POSITIVE_PROMPT_NODE = "6" and so
+# on -- one set per workflow. They were an artifact of a particular export
+# from ComfyUI's UI, so re-exporting a workflow silently repointed them at the
+# wrong nodes. They are now resolved from each graph's own wiring at load
+# time; see workflow_graph.py for why that is worth the extra code.
+DEFAULT_WORKFLOW_PATH = Path(__file__).parent.parent / "workflows" / "txt2img_api.json"
 DEFAULT_VIDEO_WORKFLOW_PATH = Path(__file__).parent.parent / "workflows" / "text_to_video_api.json"
-VIDEO_POSITIVE_PROMPT_NODE = "6"
-VIDEO_SEED_NODE = "72"  # SamplerCustom.noise_seed
+DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH = Path(__file__).parent.parent / "workflows" / "photoshoot_bg_api.json"
+
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov")
 
-DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH = Path(__file__).parent.parent / "workflows" / "photoshoot_bg_api.json"
-PHOTOSHOOT_SUBJECT_NODE = "2"
-PHOTOSHOOT_MASK_NODE = "3"
-PHOTOSHOOT_DEPTH_NODE = "4"
-PHOTOSHOOT_POSITIVE_PROMPT_NODE = "7"
-PHOTOSHOOT_NEGATIVE_PROMPT_NODE = "8"
-PHOTOSHOOT_CONTROLNET_NODE = "10"
-PHOTOSHOOT_SEED_NODE = "11"
+# What each entry point cannot run without. Declared per call site rather than
+# globally: txt2img legitimately has no ControlNet or inpaint mask and should
+# not be held to the photoshoot graph's shape.
+TXT2IMG_ROLES = (POSITIVE_PROMPT, SAMPLER)
+VIDEO_ROLES = (POSITIVE_PROMPT, SAMPLER)
+PHOTOSHOOT_ROLES = (POSITIVE_PROMPT, NEGATIVE_PROMPT, SUBJECT_IMAGE,
+                    MASK_IMAGE, DEPTH_IMAGE, CONTROLNET, SAMPLER)
 
 
 class ComfyBackend(GenerationBackend):
@@ -132,14 +144,13 @@ class ComfyBackend(GenerationBackend):
 
         prompt_id: see _queue_prompt()'s docstring for why a caller would
         supply its own."""
-        with open(self.workflow_path) as f:
-            workflow = json.load(f)
+        resolved = workflow_graph.load(self.workflow_path, require=TXT2IMG_ROLES)
 
         seed = int.from_bytes(uuid.uuid4().bytes[:4], "big")
-        workflow[POSITIVE_PROMPT_NODE]["inputs"]["text"] = prompt
-        workflow[SEED_NODE]["inputs"]["seed"] = seed
+        resolved.set(POSITIVE_PROMPT, "text", prompt)
+        resolved.set_seed(seed)
 
-        prompt_id = self._queue_prompt(workflow, client_id, prompt_id)
+        prompt_id = self._queue_prompt(resolved.workflow, client_id, prompt_id)
         print(f"[comfy] queued prompt_id={prompt_id} text={prompt!r}")
         return prompt_id, seed
 
@@ -167,13 +178,15 @@ class ComfyBackend(GenerationBackend):
         "animated": [true] flag alongside it — so this reuses the same
         polling shape as generate_image(), filtered to video filenames.
         """
-        with open(workflow_path) as f:
-            workflow = json.load(f)
+        resolved = workflow_graph.load(workflow_path, require=VIDEO_ROLES)
 
-        workflow[VIDEO_POSITIVE_PROMPT_NODE]["inputs"]["text"] = prompt
-        workflow[VIDEO_SEED_NODE]["inputs"]["noise_seed"] = int.from_bytes(uuid.uuid4().bytes[:6], "big")
+        resolved.set(POSITIVE_PROMPT, "text", prompt)
+        # set_seed() picks `noise_seed` here and `seed` for the image
+        # workflows, off the sampler's own class -- that difference used to be
+        # a comment next to a hardcoded node id.
+        resolved.set_seed(int.from_bytes(uuid.uuid4().bytes[:6], "big"))
 
-        prompt_id = self._queue_prompt(workflow)
+        prompt_id = self._queue_prompt(resolved.workflow)
         print(f"[comfy] queued video prompt_id={prompt_id} text={prompt!r}")
 
         def extract(item):
@@ -218,8 +231,10 @@ class ComfyBackend(GenerationBackend):
         what makes a brand's approved look reproducible across a whole event
         rather than a different image per guest.
         """
-        with open(workflow_path) as f:
-            workflow = json.load(f)
+        # Resolved before the uploads: a workflow that can't satisfy these
+        # roles should fail immediately, not after pushing three PNGs at
+        # ComfyUI's /upload/image.
+        resolved = workflow_graph.load(workflow_path, require=PHOTOSHOOT_ROLES)
 
         subject_name = self._upload_image(subject_photo.convert("RGB"), "subject")
         mask_name = self._upload_image(background_mask.convert("L"), "bgmask")
@@ -229,17 +244,17 @@ class ComfyBackend(GenerationBackend):
         # or negative number can't produce a seed ComfyUI rejects -- and so a
         # pinned seed and a random one are always reported in the same range.
         seed = int.from_bytes(uuid.uuid4().bytes[:4], "big") if seed is None else int(seed) % (2 ** 32)
-        workflow[PHOTOSHOOT_SUBJECT_NODE]["inputs"]["image"] = subject_name
-        workflow[PHOTOSHOOT_MASK_NODE]["inputs"]["image"] = mask_name
-        workflow[PHOTOSHOOT_DEPTH_NODE]["inputs"]["image"] = depth_name
-        workflow[PHOTOSHOOT_POSITIVE_PROMPT_NODE]["inputs"]["text"] = prompt
+        resolved.set(SUBJECT_IMAGE, "image", subject_name)
+        resolved.set(MASK_IMAGE, "image", mask_name)
+        resolved.set(DEPTH_IMAGE, "image", depth_name)
+        resolved.set(POSITIVE_PROMPT, "text", prompt)
         if negative_prompt is not None:
-            workflow[PHOTOSHOOT_NEGATIVE_PROMPT_NODE]["inputs"]["text"] = negative_prompt
-        workflow[PHOTOSHOOT_CONTROLNET_NODE]["inputs"]["strength"] = controlnet_strength
-        workflow[PHOTOSHOOT_SEED_NODE]["inputs"]["seed"] = seed
-        workflow[PHOTOSHOOT_SEED_NODE]["inputs"]["denoise"] = denoise
+            resolved.set(NEGATIVE_PROMPT, "text", negative_prompt)
+        resolved.set(CONTROLNET, "strength", controlnet_strength)
+        resolved.set_seed(seed)
+        resolved.set(SAMPLER, "denoise", denoise)
 
-        prompt_id = self._queue_prompt(workflow, client_id, prompt_id)
+        prompt_id = self._queue_prompt(resolved.workflow, client_id, prompt_id)
         print(f"[comfy] queued background prompt_id={prompt_id} text={prompt!r}")
         return prompt_id, seed
 

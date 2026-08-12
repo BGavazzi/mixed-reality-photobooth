@@ -23,6 +23,7 @@ from PIL import Image
 
 import brand_kit
 import web_server
+from conftest import run_queued
 
 
 class FakeWebSocket:
@@ -106,7 +107,7 @@ def generate(msg_extra=None, action="background"):
     }
     handler = (web_server.handle_generate_background if action == "background"
                else web_server.handle_edit_region)
-    asyncio.run(handler("s1", message))
+    run_queued(lambda: handler("s1", message))
     return message
 
 

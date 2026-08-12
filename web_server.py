@@ -39,11 +39,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 import brand_kit
-from backends.comfy import (
-    ComfyBackend,
-    DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH,
-    PHOTOSHOOT_NEGATIVE_PROMPT_NODE,
-)
+import job_queue
+import workflow_graph
+from backends.comfy import ComfyBackend, DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH
 from brand_kit import BrandKitError
 from console_encoding import use_utf8_console
 from spout_output import SpoutFrameBuffer, spout_sender_loop
@@ -69,59 +67,56 @@ INDEX_HTML_PATH = Path(__file__).parent / "web" / "index.html"
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
 
-def _read_model_names_from_workflow(workflow_path) -> tuple[str, str]:
-    """Reads the checkpoint/ControlNet names straight out of the workflow
-    JSON that's actually used at generation time, by node class_type rather
-    than a hardcoded node ID (more robust to the workflow being re-exported
-    with different node numbering). Previously these were separate
-    hardcoded constants that duplicated the workflow file — if someone
-    swapped the model inside the workflow JSON without also updating the
-    constants here, every provenance record would silently keep reporting
-    the old model name even though a different one produced the image."""
-    with open(workflow_path) as f:
-        workflow = json.load(f)
-    checkpoint_name = controlnet_name = None
-    for node in workflow.values():
-        class_type = node.get("class_type")
-        if class_type == "CheckpointLoaderSimple":
-            checkpoint_name = node["inputs"]["ckpt_name"]
-        elif class_type == "ControlNetLoader":
-            controlnet_name = node["inputs"]["control_net_name"]
-    # Warn rather than raise: a missing name only degrades the provenance
-    # record, and refusing to import the module over it would take the whole
-    # app down for a cosmetic field. Silence, though, would let every
-    # disclosure card quietly read "checkpoint: null".
-    if checkpoint_name is None or controlnet_name is None:
-        print(f"[provenance] warning: {workflow_path} has no "
-              f"{'CheckpointLoaderSimple' if checkpoint_name is None else 'ControlNetLoader'} node; "
-              f"generated images will have an incomplete provenance record")
-    return checkpoint_name, controlnet_name
+def _read_workflow_facts(workflow_path) -> tuple[str | None, str | None, str]:
+    """Reads the model names and the quality-guard negative prompt out of the
+    workflow that actually runs at generation time.
 
+    All three used to be hardcoded constants duplicating the workflow file --
+    swap a model inside the JSON without editing here and every provenance
+    record would keep reporting the old one. They are now read from the file,
+    and the negative prompt is located by *role* rather than by node id, so a
+    re-export can't repoint it at the positive conditioning (see
+    workflow_graph.py).
 
-CHECKPOINT_NAME, CONTROLNET_NAME = _read_model_names_from_workflow(DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH)
-
-
-def _read_base_negative_prompt(workflow_path) -> str:
-    """Reads the quality-guard negative prompt out of the workflow.
-
-    Brand kits *extend* this rather than replace it: the baked string handles
-    generic failure modes (blurry, extra limbs, visible seams) that have
-    nothing to do with any client, and a brand manager writing a brand.json
-    should not have to re-type them to avoid losing them. Reading it here
-    instead of duplicating it as a constant keeps one copy -- editing the
-    workflow in ComfyUI's own UI stays the way to change it.
+    Warns rather than raises: an unreadable workflow here only degrades the
+    disclosure card and the brand-kit base negative, and taking the whole app
+    down at import over a cosmetic field would be the worse trade. Silence
+    would not -- that would let every card quietly read "checkpoint: null".
     """
     try:
         with open(workflow_path) as f:
             workflow = json.load(f)
-        return workflow[PHOTOSHOOT_NEGATIVE_PROMPT_NODE]["inputs"]["text"]
-    except (OSError, KeyError, json.JSONDecodeError) as exc:
-        print(f"[brands] warning: could not read the base negative prompt from "
-              f"{workflow_path} ({exc}); brand kits will contribute theirs alone")
-        return ""
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[provenance] warning: could not read {workflow_path} ({exc}); "
+              f"provenance records will be incomplete and brand kits will "
+              f"contribute their blocklist alone")
+        return None, None, ""
+
+    names = workflow_graph.model_names(workflow)
+    if names["checkpoint"] is None or names["controlnet"] is None:
+        print(f"[provenance] warning: {workflow_path} has no "
+              f"{'CheckpointLoaderSimple' if names['checkpoint'] is None else 'ControlNetLoader'} "
+              f"node; generated images will have an incomplete provenance record")
+
+    # Resolved separately, and allowed to fail on its own: reading a model
+    # name only needs a loader node, while locating the negative prompt needs
+    # the graph to be drivable. A workflow too broken for the second is still
+    # worth reporting the first from.
+    negative = ""
+    try:
+        resolved = workflow_graph.resolve(workflow, source=workflow_path)
+        if resolved.has(workflow_graph.NEGATIVE_PROMPT):
+            node_id = resolved.node_id(workflow_graph.NEGATIVE_PROMPT)
+            negative = resolved.workflow[node_id]["inputs"].get("text", "")
+    except workflow_graph.WorkflowSchemaError as exc:
+        print(f"[brands] warning: no negative prompt resolved from {workflow_path} "
+              f"({exc}); brand kits will contribute their blocklist alone")
+
+    return names["checkpoint"], names["controlnet"], negative
 
 
-BASE_NEGATIVE_PROMPT = _read_base_negative_prompt(DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH)
+CHECKPOINT_NAME, CONTROLNET_NAME, BASE_NEGATIVE_PROMPT = _read_workflow_facts(
+    DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH)
 
 # Loaded once at import. A brand pack is static configuration for the length
 # of an event, and reloading it per request would mean a half-saved JSON edit
@@ -184,6 +179,7 @@ async def lifespan(app: FastAPI):
     print("[warmup] loading rotoscope/pose/depth models...")
     await asyncio.to_thread(_warm_up_pipeline_models)
     print("[warmup] done")
+    await GENERATION_QUEUE.start()
     asyncio.create_task(comfy_relay_loop())
     threading.Thread(
         target=spout_sender_loop,
@@ -192,6 +188,7 @@ async def lifespan(app: FastAPI):
         daemon=True,
     ).start()
     yield
+    await GENERATION_QUEUE.stop()
     spout_stop_event.set()
 
 
@@ -405,7 +402,15 @@ def config():
         "comfy_address": COMFY_ADDRESS,
         "base_negative_prompt": BASE_NEGATIVE_PROMPT,
         "brands": [b.to_dict() for b in BRANDS.values()],
+        "queue": GENERATION_QUEUE.stats(),
     })
+
+
+@app.get("/api/queue")
+def queue_stats():
+    """Live queue depth. Separate from /api/config -- config is read once at
+    page load, this is the bit that changes, and a batch run polls it."""
+    return JSONResponse(GENERATION_QUEUE.stats())
 
 
 @app.get("/api/brands/{brand_id}/logo")
@@ -497,43 +502,82 @@ async def ws_endpoint(websocket: WebSocket):
         # can't crash the relay loop or leak into another session's results.
 
 
+async def _on_job_accepted(job: job_queue.GenerationJob, prompt_id: str, seed: int):
+    """A worker got the job into ComfyUI. Attach provenance and tell the
+    browser it is really queued -- not when it was *submitted to us*, which
+    is what the client used to be told."""
+    entry = JOBS.get(prompt_id)
+    if entry is None:
+        # The session vanished and cleanup already ran; nothing to attach to.
+        return
+    entry["provenance"] = {
+        "kind": job.kind, "seed": seed, "checkpoint": CHECKPOINT_NAME,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        **job.provenance,
+    }
+    await send_json_to(job.session_id, {
+        "type": "queued", "prompt_id": prompt_id, "waited_seconds": round(job.waited, 1),
+    })
+
+
+async def _on_job_failed(job: job_queue.GenerationJob, exc: Exception):
+    """Submission failed (ComfyUI unreachable, bad workflow). The JOBS entry
+    was registered before submission, so it has to be rolled back or it sits
+    there for the life of the process while the browser waits on a `done`
+    that can never arrive."""
+    JOBS.pop(job.job_id, None)
+    await send_json_to(job.session_id, {
+        "type": "error", "message": f"failed to queue generation: {exc}"})
+
+
+GENERATION_QUEUE = job_queue.InProcessJobQueue(
+    on_accepted=_on_job_accepted,
+    on_failed=_on_job_failed,
+    workers=int(os.environ.get("GENERATION_WORKERS", job_queue.DEFAULT_WORKERS)),
+    max_depth=int(os.environ.get("GENERATION_QUEUE_DEPTH", job_queue.DEFAULT_MAX_DEPTH)),
+)
+
+
 async def _queue_job(session_id: str, kind: str, submit, provenance: dict):
-    """Shared submit-and-track path for every generation action.
+    """Shared enqueue-and-track path for every generation action.
 
     The three handlers below were the same eleven lines of bookkeeping three
     times over -- pre-register, submit, roll back on failure, attach
     provenance, notify -- differing only in what they submit. Keeping the
     ordering correct in one place matters more than usual here, because two
-    separate bugs already lived in it (see the comments below); triplicating
-    it meant triplicating both.
+    separate bugs already lived in it; triplicating it meant triplicating both.
 
-    `submit` is a zero-arg callable returning (prompt_id, seed); it runs in a
-    worker thread because the backend's HTTP calls are blocking.
+    Submission itself now goes through GENERATION_QUEUE rather than straight
+    onto a thread, so there is admission control and a real queue position to
+    report. What has *not* changed is the ordering below, which is load-bearing.
     """
-    # Registered *before* the submit call, with our own pre-generated
-    # prompt_id, not after -- the ComfyUI relay is a concurrent task and can
-    # start delivering events for a same-instant-queued job before this
-    # coroutine's own await returns; without pre-registering, that first
-    # event would look up a JOBS entry that doesn't exist yet and be
-    # silently dropped. ComfyUI's /prompt honors a client-supplied prompt_id
-    # and echoes it back unchanged (confirmed empirically).
+    # Registered *before* the job is handed to the queue, with our own
+    # pre-generated prompt_id -- the ComfyUI relay is a concurrent task and
+    # can start delivering events for a same-instant-queued job before the
+    # accept callback runs; without pre-registering, that first event would
+    # look up a JOBS entry that doesn't exist yet and be silently dropped.
+    # ComfyUI's /prompt honors a client-supplied prompt_id and echoes it back
+    # unchanged (confirmed empirically), which is what lets job_id double as
+    # the prompt_id here.
     prompt_id = str(uuid.uuid4())
     JOBS[prompt_id] = {"session_id": session_id, "kind": kind, "provenance": None}
+    job = job_queue.GenerationJob(
+        session_id=session_id, kind=kind, submit=submit,
+        provenance=provenance, job_id=prompt_id,
+    )
     try:
-        _, seed = await asyncio.to_thread(submit, prompt_id)
-    except Exception as exc:
-        # Pre-registering means a failed submission (ComfyUI unreachable,
-        # bad workflow) would otherwise leave this JOBS entry orphaned for
-        # the life of the process -- roll it back and tell the client.
+        position = await GENERATION_QUEUE.submit(job)
+    except job_queue.QueueFullError as exc:
         JOBS.pop(prompt_id, None)
-        await send_json_to(session_id, {"type": "error", "message": f"failed to queue generation: {exc}"})
+        await send_json_to(session_id, {"type": "error", "message": str(exc)})
         return
-    JOBS[prompt_id]["provenance"] = {
-        "kind": kind, "seed": seed, "checkpoint": CHECKPOINT_NAME,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        **provenance,
-    }
-    await send_json_to(session_id, {"type": "queued", "prompt_id": prompt_id})
+
+    if position > 1:
+        # Only when there is genuinely a line. Announcing "position 1" on an
+        # idle booth would invent a wait that isn't there.
+        await send_json_to(session_id, {
+            "type": "queue_position", "prompt_id": prompt_id, "position": position,
+        })
 
 
 async def handle_generate_image(session_id: str, msg: dict):

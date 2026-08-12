@@ -1,0 +1,31 @@
+# Resolume live VJ bridge (bridge.py, spout_viewer.py, gui.py) -- optional.
+#
+#     pip install -r requirements-resolume.txt
+#
+# Only needed if you want the OSC bridge and Spout output. The photo booth
+# doesn't use any of it.
+
+-r requirements.txt
+
+python-osc                              # OSC listener for Resolume clip triggers
+
+# Spout is a Windows-only technology. The markers keep this file installable on
+# macOS/Linux, where everything except the Spout sender still works -- and
+# spout_sender_loop() reports the missing module and returns instead of dying
+# in a daemon thread, so the app stays honest about publishing nothing.
+SpoutGL; sys_platform == "win32"
+PyOpenGL; sys_platform == "win32"
+
+# --- opencv, the GUI build ---------------------------------------------------
+# spout_viewer.py opens a real window (cv2.imshow / waitKey), which the headless
+# build in requirements.txt cannot do -- it fails with "waitKeyImpl ... Rebuild
+# the library with Windows, GTK+ ... support".
+#
+# Both builds provide the same importable `cv2`, so they cannot coexist
+# meaningfully: whichever pip writes last wins on disk. Listing it here does
+# NOT reliably win, because pip may install in any order. If you want the
+# viewer, run this afterwards to make the GUI build the one on disk:
+#
+#     pip install --force-reinstall opencv-python
+#
+# `python doctor.py --resolume` checks which build you actually ended up with.
