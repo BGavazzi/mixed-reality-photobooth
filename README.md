@@ -138,6 +138,71 @@ Two things that matter for this to actually work, found empirically:
   where this reliably stopped failing in testing; the UI enforces that
   as a minimum.
 
+### Brand kits — making a generation something a client can sign off on
+
+A free-text prompt box is fine for a personal tool and unusable for branded
+work. Three things were wrong with it, and a brand kit fixes each:
+
+| Problem | Before | Now |
+|---|---|---|
+| Nothing was repeatable | `seed = uuid4()` on every call — 200 guests, 200 unrelated images | `seed_policy: locked` derives a stable seed from (brand, look) |
+| Nothing was enforced | The negative prompt was welded into the workflow JSON, unreviewable and unreachable from the API | The kit's blocklist is appended server-side to every generation |
+| Nothing was recorded | Provenance named the model and seed, not the client or the approved look | Brand, kit revision, approved look, operator's addition and the exclusion list all land in the disclosure |
+
+A kit is a directory under `brands/` holding a `brand.json` and its logo
+artwork. The operator picks a client and one of that client's **approved
+looks**; the prompt is then composed, not typed:
+
+```
+approved look   ->  "seamless white studio backdrop"        (from the kit)
+operator adds   ->  "with a red chair"                      (free text, optional)
+kit styling     ->  "clean editorial finish"                (always appended)
+kit blocklist   ->  "competitor logos, alcohol, ..."        (always excluded)
+```
+
+Free text can only ever be *added* to what the kit mandates. The approved
+look leads because SDXL weights leading tokens most heavily, so an
+operator's addition colours the scene instead of displacing it.
+
+**Composition happens on the server** (`brand_kit.compose`, called from
+`web_server.py`), not in the browser. The page sends `{brand_id, look_id,
+free text}` and never a finished prompt — a locked negative that the client
+assembles is a locked negative a modified or stale client can drop, which
+would make the guarantee decorative. `tests/test_brand_enforcement.py`
+asserts this directly, including that a request trying to pass its own
+`negative_prompt` or `seed` is ignored.
+
+The region-draw tool inherits the kit's **blocklist but not its styling**:
+"never generate a competitor's logo" is a rule about every pixel, while
+"rugged outdoor photography, film grain" describes a scene and reads as
+noise when what's being generated is one prop inside an existing one. The
+region label is also the only prompt in the app typed live at a booth, so
+it is the one the blocklist most needs to reach.
+
+#### The logo is composited, never generated
+
+SDXL cannot draw a legible mark — this is why `text, watermark` sits in the
+workflow's negative prompt in the first place. So the model is told to keep
+text out of the frame, and the real artwork goes on top as its own layer.
+Unlike every other layer it is **contain**-fit rather than cover-fit, with
+its height derived from the file's own aspect ratio, so the single most
+common brand-guideline violation in the wild — a stretched logo — is not
+expressible in the UI. Two more rules from the kit are enforced live:
+
+- `min_width_pct` — the scale slider's floor moves so the mark cannot be
+  shrunk below legibility.
+- `clear_space_pct` — a dashed guide on the canvas, and a warning if the
+  logo is dragged outside it. A warning rather than a clamp, because
+  position is a judgement call in a way that minimum size is not. The guide
+  is an editing aid and is suppressed from the exported PNG, the .webm and
+  the live Spout feed.
+
+Two fictional demo kits ship with the repo (`brands/aurora`,
+`brands/northwind`) with generated placeholder artwork — see
+`brands/_make_demo_logos.py`. Adding a real client is a file drop, not a
+code change. Running with no `brands/` directory at all is supported and
+gives you exactly the free-prompt tool that existed before.
+
 ### Real-photo hardening
 
 Everything above was originally validated against one curated 1024x1024

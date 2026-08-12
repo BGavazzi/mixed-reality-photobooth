@@ -38,7 +38,13 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSock
 from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from backends.comfy import ComfyBackend, DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH
+import brand_kit
+from backends.comfy import (
+    ComfyBackend,
+    DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH,
+    PHOTOSHOOT_NEGATIVE_PROMPT_NODE,
+)
+from brand_kit import BrandKitError
 from console_encoding import use_utf8_console
 from spout_output import SpoutFrameBuffer, spout_sender_loop
 import photoshoot_pipeline
@@ -93,6 +99,35 @@ def _read_model_names_from_workflow(workflow_path) -> tuple[str, str]:
 
 
 CHECKPOINT_NAME, CONTROLNET_NAME = _read_model_names_from_workflow(DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH)
+
+
+def _read_base_negative_prompt(workflow_path) -> str:
+    """Reads the quality-guard negative prompt out of the workflow.
+
+    Brand kits *extend* this rather than replace it: the baked string handles
+    generic failure modes (blurry, extra limbs, visible seams) that have
+    nothing to do with any client, and a brand manager writing a brand.json
+    should not have to re-type them to avoid losing them. Reading it here
+    instead of duplicating it as a constant keeps one copy -- editing the
+    workflow in ComfyUI's own UI stays the way to change it.
+    """
+    try:
+        with open(workflow_path) as f:
+            workflow = json.load(f)
+        return workflow[PHOTOSHOOT_NEGATIVE_PROMPT_NODE]["inputs"]["text"]
+    except (OSError, KeyError, json.JSONDecodeError) as exc:
+        print(f"[brands] warning: could not read the base negative prompt from "
+              f"{workflow_path} ({exc}); brand kits will contribute theirs alone")
+        return ""
+
+
+BASE_NEGATIVE_PROMPT = _read_base_negative_prompt(DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH)
+
+# Loaded once at import. A brand pack is static configuration for the length
+# of an event, and reloading it per request would mean a half-saved JSON edit
+# could take out a generation mid-shoot.
+BRANDS = brand_kit.load_brands()
+print(f"[brands] loaded {len(BRANDS)} brand kit(s): {', '.join(BRANDS) or 'none'}")
 
 # Virtual-production tie-in: pushes a generated composite out as its own
 # Spout source, so a real LED wall / projector on set can show it live
@@ -355,6 +390,40 @@ def index():
     return FileResponse(INDEX_HTML_PATH)
 
 
+@app.get("/api/config")
+def config():
+    """Everything the browser needs that only the server knows.
+
+    `comfy_address` is here because COMFY_ADDRESS is server-side
+    configuration -- ComfyUI may well be on a GPU box across the LAN, and
+    hardcoding a link to 127.0.0.1:8188 in the page would send every operator
+    to their own machine instead. The browser rewrites a loopback address to
+    whatever host it reached *this* server on, which is the only address it
+    can be sure is reachable from where it is sitting.
+    """
+    return JSONResponse({
+        "comfy_address": COMFY_ADDRESS,
+        "base_negative_prompt": BASE_NEGATIVE_PROMPT,
+        "brands": [b.to_dict() for b in BRANDS.values()],
+    })
+
+
+@app.get("/api/brands/{brand_id}/logo")
+def brand_logo(brand_id: str):
+    """Serves a brand's logo artwork.
+
+    Note what this route does *not* do: it never joins a client-supplied
+    string onto a filesystem path. `brand_id` is only ever used as a
+    dictionary key, and the path comes from the already-validated kit -- so
+    there is no traversal to defend against rather than a defence to get
+    right.
+    """
+    brand = BRANDS.get(brand_id)
+    if brand is None or brand.logo is None:
+        raise HTTPException(status_code=404, detail=f"no logo for brand {brand_id!r}")
+    return FileResponse(brand.logo_path)
+
+
 @app.post("/api/analyze")
 async def analyze(file: UploadFile = File(...)):
     raw = await file.read()
@@ -478,6 +547,31 @@ async def handle_generate_image(session_id: str, msg: dict):
     )
 
 
+def _compose_for_request(msg: dict) -> brand_kit.ComposedPrompt:
+    """Applies the requested brand kit to an incoming generation message.
+
+    This is the enforcement point, and it is on the server for a reason: the
+    browser sends a brand id and a look id, never the finished prompt. A
+    client that has been modified -- or simply left open on an older version
+    of the page -- therefore cannot strip the brand's locked negative or
+    quietly widen its own free text into the mandated styling. The worst it
+    can do is name a brand that doesn't exist, which is an error, not a
+    silent downgrade.
+    """
+    brand_id = msg.get("brand_id") or None
+    brand = None
+    if brand_id:
+        brand = BRANDS.get(brand_id)
+        if brand is None:
+            raise BrandKitError(f"unknown brand kit {brand_id!r}")
+    return brand_kit.compose(
+        brand,
+        msg.get("look_id") or None,
+        msg.get("prompt") or "",
+        base_negative=BASE_NEGATIVE_PROMPT,
+    )
+
+
 async def handle_generate_background(session_id: str, msg: dict):
     try:
         subject = b64_to_pil(msg["subject"]).convert("RGB")
@@ -486,21 +580,30 @@ async def handle_generate_background(session_id: str, msg: dict):
         # UI sends the subject mask (255=subject); the workflow needs the
         # inverse (255=background=regenerate).
         background_mask = ImageOps.invert(mask)
-        prompt = (msg.get("prompt") or "").strip()
+        composed = _compose_for_request(msg)
         controlnet_strength = float(msg.get("controlnet_strength", 0.75))
         denoise = float(msg.get("denoise", 0.85))
     except Exception as exc:
         await send_json_to(session_id, {"type": "error", "message": f"bad request: {exc}"})
         return
 
+    if not composed.positive:
+        await send_json_to(session_id, {
+            "type": "error",
+            "message": "nothing to generate: pick an approved look or type a scene prompt",
+        })
+        return
+
     await _queue_job(
         session_id, "background",
         lambda prompt_id: backend.queue_background_generation(
-            subject, background_mask, depth, prompt, controlnet_strength, denoise,
+            subject, background_mask, depth, composed.positive, controlnet_strength, denoise,
             client_id=COMFY_CLIENT_ID, prompt_id=prompt_id,
+            negative_prompt=composed.negative, seed=composed.seed,
         ),
-        {"prompt": prompt, "controlnet": CONTROLNET_NAME,
-         "controlnet_strength": controlnet_strength, "denoise": denoise},
+        {"prompt": composed.positive, "controlnet": CONTROLNET_NAME,
+         "controlnet_strength": controlnet_strength, "denoise": denoise,
+         **composed.to_provenance()},
     )
 
 
@@ -515,13 +618,25 @@ async def handle_edit_region(session_id: str, msg: dict):
     0.75): the depth map reflects the scene *before* the new object exists,
     so conditioning on it fights the model trying to introduce new geometry
     that wasn't there — empirically this suppressed the object entirely at
-    background-regen strength."""
+    background-regen strength.
+
+    A brand kit's *negative* applies here, but its positive styling does not.
+    The distinction is deliberate: "never generate a competitor's logo" is a
+    rule about every pixel in the frame, while "rugged outdoor lifestyle
+    photography, film grain" describes a scene and reads as noise when
+    what's being generated is a single prop dropped into an existing one.
+    This is also the highest-risk input in the whole app -- the region label
+    is free text typed live at a booth, so it is the one prompt a brand's
+    blocklist most needs to reach."""
     try:
         composite = b64_to_pil(msg["subject"]).convert("RGB")
         region_mask = b64_to_pil(msg["mask"]).convert("L")
         depth = b64_to_pil(msg["depth"]).convert("RGB")
         label = (msg.get("prompt") or "").strip()
         prompt = f"{label}, seamlessly blended, matching lighting and perspective"
+        # look_id is dropped on purpose -- see the docstring; only the
+        # blocklist half of the kit is wanted here.
+        composed = _compose_for_request({"brand_id": msg.get("brand_id"), "prompt": ""})
         controlnet_strength = float(msg.get("controlnet_strength", 0.1))
         denoise = float(msg.get("denoise", 1.0))
     except Exception as exc:
@@ -533,9 +648,13 @@ async def handle_edit_region(session_id: str, msg: dict):
         lambda prompt_id: backend.queue_background_generation(
             composite, region_mask, depth, prompt, controlnet_strength, denoise,
             client_id=COMFY_CLIENT_ID, prompt_id=prompt_id,
+            negative_prompt=composed.negative,
         ),
         {"prompt": prompt, "controlnet": CONTROLNET_NAME,
-         "controlnet_strength": controlnet_strength, "denoise": denoise},
+         "controlnet_strength": controlnet_strength, "denoise": denoise,
+         "brand": composed.brand_name, "brand_id": composed.brand_id,
+         "brand_version": composed.brand_version,
+         "negative_prompt": composed.negative, "operator_text": label},
     )
 
 

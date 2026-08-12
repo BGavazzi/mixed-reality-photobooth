@@ -38,5 +38,21 @@ jobs:
         # error in an entry point, or a module-scope side effect that only
         # works on the dev machine.
         run: |
-          python -c "import bridge, web_server, photoshoot_pipeline, resolume_state, spout_output, console_encoding"
+          python -c "import bridge, web_server, photoshoot_pipeline, resolume_state, spout_output, console_encoding, brand_kit"
           python -c "import backends; print(sorted(backends.BACKENDS))"
+
+      - name: Every shipped brand kit loads
+        # The packs are hand-edited JSON that no unit test can pin to reality:
+        # load_brands() skips a broken pack rather than crashing (correct at an
+        # event, useless in CI), so a typo would otherwise reach a demo as a
+        # silently missing client.
+        run: |
+          python -c "
+          import brand_kit, pathlib
+          packs = [p for p in brand_kit.BRANDS_DIR.iterdir() if (p / 'brand.json').exists()]
+          loaded = brand_kit.load_brands()
+          assert len(loaded) == len(packs), f'{len(packs)} packs on disk, {len(loaded)} loaded'
+          for brand in loaded.values():
+              assert brand.logo_path is None or brand.logo_path.exists()
+              print(f'{brand.id}: {len(brand.looks)} looks, seed_policy={brand.seed_policy}')
+          "

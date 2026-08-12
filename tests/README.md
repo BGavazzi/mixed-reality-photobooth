@@ -11,9 +11,17 @@ pytest
 They cover the parts of the pipeline that are pure logic and were previously
 verified only by eye during a live demo — mask cleanup, illumination
 estimation, resolution capping, ControlNet-strength heuristics, provenance
-extraction, cover-fit geometry, and the multi-session job routing in
-`web_server.py` (against a fake backend, so the routing is tested without a
-GPU in the loop).
+extraction, cover-fit geometry, brand-kit parsing and prompt composition,
+and the multi-session job routing in `web_server.py` (against a fake
+backend, so the routing is tested without a GPU in the loop).
+
+`test_brand_enforcement.py` is a different shape from the rest and worth
+reading as such: it drives the real websocket handlers with a recording
+backend to assert a *security-ish* property rather than a computed value --
+that the browser can only ever send `{brand_id, look_id, free text}`, and
+that a request smuggling its own `negative_prompt` or `seed` is ignored. If
+that stops holding, a modified client could drop a client's blocklist while
+every other brand-kit test still passed.
 
 ## Why this exists separately from the `verify_*.py` scripts
 

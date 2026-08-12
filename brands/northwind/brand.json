@@ -1,0 +1,51 @@
+{
+  "id": "northwind",
+  "name": "Northwind Outdoor",
+  "version": "2026.07-r4",
+  "notes": "Fictional demo brand, deliberately the opposite of Aurora: warm, rugged, low sun. Two contrasting kits make it obvious in a demo that the composed prompt is really driving the output.",
+
+  "palette": [
+    { "name": "Pine", "hex": "#2F4A3C" },
+    { "name": "Ember", "hex": "#C2542D" },
+    { "name": "Granite", "hex": "#6B6F73" },
+    { "name": "Bone", "hex": "#E8E2D5" }
+  ],
+
+  "prompt": {
+    "positive_suffix": "rugged outdoor lifestyle photography, natural low sun, earthy green and ember colour grade, film grain, wide landscape depth, authentic unstyled feel",
+    "negative_suffix": "competing brand logos, brand names, visible text, signage, urban skyline, neon, plastic props, studio backdrop, alcohol, weapons, gore, political imagery"
+  },
+
+  "seed_policy": "locked",
+
+  "looks": [
+    {
+      "id": "ridgeline",
+      "label": "Ridgeline at Dusk",
+      "prompt": "exposed mountain ridgeline, layered blue ranges receding into haze, last warm light on the rock"
+    },
+    {
+      "id": "pineforest",
+      "label": "Pine Forest Trail",
+      "prompt": "dense pine forest trail, shafts of low sun through trunks, damp needle floor, cool green shade"
+    },
+    {
+      "id": "basecamp",
+      "label": "Basecamp Evening",
+      "prompt": "high alpine basecamp at evening, canvas tents, warm lantern glow, cooling blue landscape beyond"
+    },
+    {
+      "id": "riverbed",
+      "label": "River Crossing",
+      "prompt": "wide shallow river crossing over smooth stones, overcast soft light, muted greens and greys"
+    }
+  ],
+
+  "logo": {
+    "file": "logo.png",
+    "min_width_pct": 14,
+    "clear_space_pct": 6,
+    "default_corner": "bottom-left",
+    "locked_aspect": true
+  }
+}
