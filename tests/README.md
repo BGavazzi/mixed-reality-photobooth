@@ -4,16 +4,26 @@ Fast, offline unit tests. No ComfyUI, no GPU, no network, no Playwright, no
 model downloads, no photos you have to supply yourself:
 
 ```
-pip install pytest
+pip install -r ../requirements-test.txt
 pytest
 ```
+
+That file is deliberately much smaller than `requirements.txt` — no rembg, no
+controlnet_aux, no torch, no SpoutGL. The model wrappers are lazy-loaded and
+the ComfyUI backend is faked, so the suite never reaches them, which is what
+keeps a full run under a couple of seconds.
 
 They cover the parts of the pipeline that are pure logic and were previously
 verified only by eye during a live demo — mask cleanup, illumination
 estimation, resolution capping, ControlNet-strength heuristics, provenance
-extraction, cover-fit geometry, and the multi-session job routing in
-`web_server.py` (against a fake backend, so the routing is tested without a
-GPU in the loop).
+extraction, cover-fit geometry, the Resolume prompt descriptors, the
+`/api/analyze` request handling, `doctor.py`'s diagnosis logic, and the
+multi-session job routing in `web_server.py` (against a fake backend, so the
+routing is tested without a GPU in the loop).
+
+`test_doctor.py` is the reason the checks in `doctor.py` take their facts as
+arguments rather than discovering them: a diagnostic can only be tested
+against a broken environment if it doesn't need to *be* in one.
 
 ## Why this exists separately from the `verify_*.py` scripts
 

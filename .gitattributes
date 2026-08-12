@@ -1,0 +1,21 @@
+# Line endings, pinned per file type.
+#
+# This repo is developed on Windows, where git's autocrlf checks files out
+# with CRLF. That is fine for Python and Markdown, and fatal for a shell
+# script: Linux reads `#!/usr/bin/env bash\r` as a request for an interpreter
+# literally named "bash\r" and fails with a confusing "bad interpreter" or
+# "no such file or directory". An install script that only works on the
+# machine it was written on is not much of an install script.
+*.sh text eol=lf
+
+# PowerShell is the opposite case: keep it CRLF so it behaves in every Windows
+# editor and console host.
+*.ps1 text eol=crlf
+
+# Never let a text filter touch binary assets.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webm binary
+*.mp4 binary
+*.safetensors binary
