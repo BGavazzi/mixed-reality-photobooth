@@ -1,0 +1,17 @@
+# Hosted generation backends -- optional, and only for `bridge.py --backend
+# runway` / `--backend kling`.
+#
+#     pip install -r requirements-backends.txt
+#
+# The default ComfyUI backend needs neither. Both imports are deferred into
+# their backend's __init__, so backends/__init__.py can build its registry --
+# and `bridge.py --backend comfy` can run -- with neither package installed;
+# you only get an error (naming the package to install) if you actually select
+# that backend.
+#
+# Credentials come from the environment, never from a file in the repo:
+#     Runway  RUNWAYML_API_SECRET      https://docs.dev.runwayml.com
+#     Kling   KLING_ACCESS_KEY / KLING_SECRET_KEY   https://kling.ai/document-api
+
+runwayml
+PyJWT

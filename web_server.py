@@ -34,16 +34,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import websockets
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+import batch
 import brand_kit
-from backends.comfy import (
-    ComfyBackend,
-    DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH,
-    PHOTOSHOOT_NEGATIVE_PROMPT_NODE,
-)
+import job_queue
+import workflow_graph
+from backends.comfy import ComfyBackend, DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH
 from brand_kit import BrandKitError
 from console_encoding import use_utf8_console
 from spout_output import SpoutFrameBuffer, spout_sender_loop
@@ -53,7 +52,16 @@ import photoshoot_pipeline
 # the same LAN) without editing source. The relay URL, the REST backend, and
 # the /prompt submissions all derive from this one value.
 COMFY_ADDRESS = os.environ.get("COMFY_ADDRESS", "127.0.0.1:8188")
-COMFY_CLIENT_ID = "web-photoshoot-bridge"
+# Unique per process, and deliberately so. ComfyUI keys its websocket clients
+# by clientId and keeps only the most recent socket per id, so two instances of
+# this app sharing one constant meant the second to connect silently stole the
+# first's events: the older instance's generations still ran to completion, but
+# it never heard about them and its browser sat on "queued..." forever. That is
+# not exotic -- it happens the moment the Docker image is run alongside a
+# native `python web_server.py`, which is exactly how you'd compare the two.
+# Override only if something external needs to predict the id.
+COMFY_CLIENT_ID = os.environ.get(
+    "COMFY_CLIENT_ID", f"web-photoshoot-bridge-{uuid.uuid4().hex[:8]}")
 BINARY_PREVIEW_EVENT = 1  # ComfyUI's BinaryEventTypes.PREVIEW_IMAGE
 
 # Resolved against this file, not the process's working directory -- the
@@ -68,60 +76,62 @@ INDEX_HTML_PATH = Path(__file__).parent / "web" / "index.html"
 # upload takes the server down mid-shoot" is a bad failure mode regardless.
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
-
-def _read_model_names_from_workflow(workflow_path) -> tuple[str, str]:
-    """Reads the checkpoint/ControlNet names straight out of the workflow
-    JSON that's actually used at generation time, by node class_type rather
-    than a hardcoded node ID (more robust to the workflow being re-exported
-    with different node numbering). Previously these were separate
-    hardcoded constants that duplicated the workflow file — if someone
-    swapped the model inside the workflow JSON without also updating the
-    constants here, every provenance record would silently keep reporting
-    the old model name even though a different one produced the image."""
-    with open(workflow_path) as f:
-        workflow = json.load(f)
-    checkpoint_name = controlnet_name = None
-    for node in workflow.values():
-        class_type = node.get("class_type")
-        if class_type == "CheckpointLoaderSimple":
-            checkpoint_name = node["inputs"]["ckpt_name"]
-        elif class_type == "ControlNetLoader":
-            controlnet_name = node["inputs"]["control_net_name"]
-    # Warn rather than raise: a missing name only degrades the provenance
-    # record, and refusing to import the module over it would take the whole
-    # app down for a cosmetic field. Silence, though, would let every
-    # disclosure card quietly read "checkpoint: null".
-    if checkpoint_name is None or controlnet_name is None:
-        print(f"[provenance] warning: {workflow_path} has no "
-              f"{'CheckpointLoaderSimple' if checkpoint_name is None else 'ControlNetLoader'} node; "
-              f"generated images will have an incomplete provenance record")
-    return checkpoint_name, controlnet_name
+# A batch is bounded for the same reason the queue is: fifty photos is
+# already ~30 minutes of serial GPU time, and accepting a thousand would be
+# promising something the machine cannot deliver in any useful timeframe.
+MAX_BATCH_FILES = 50
 
 
-CHECKPOINT_NAME, CONTROLNET_NAME = _read_model_names_from_workflow(DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH)
+def _read_workflow_facts(workflow_path) -> tuple[str | None, str | None, str]:
+    """Reads the model names and the quality-guard negative prompt out of the
+    workflow that actually runs at generation time.
 
+    All three used to be hardcoded constants duplicating the workflow file --
+    swap a model inside the JSON without editing here and every provenance
+    record would keep reporting the old one. They are now read from the file,
+    and the negative prompt is located by *role* rather than by node id, so a
+    re-export can't repoint it at the positive conditioning (see
+    workflow_graph.py).
 
-def _read_base_negative_prompt(workflow_path) -> str:
-    """Reads the quality-guard negative prompt out of the workflow.
-
-    Brand kits *extend* this rather than replace it: the baked string handles
-    generic failure modes (blurry, extra limbs, visible seams) that have
-    nothing to do with any client, and a brand manager writing a brand.json
-    should not have to re-type them to avoid losing them. Reading it here
-    instead of duplicating it as a constant keeps one copy -- editing the
-    workflow in ComfyUI's own UI stays the way to change it.
+    Warns rather than raises: an unreadable workflow here only degrades the
+    disclosure card and the brand-kit base negative, and taking the whole app
+    down at import over a cosmetic field would be the worse trade. Silence
+    would not -- that would let every card quietly read "checkpoint: null".
     """
     try:
         with open(workflow_path) as f:
             workflow = json.load(f)
-        return workflow[PHOTOSHOOT_NEGATIVE_PROMPT_NODE]["inputs"]["text"]
-    except (OSError, KeyError, json.JSONDecodeError) as exc:
-        print(f"[brands] warning: could not read the base negative prompt from "
-              f"{workflow_path} ({exc}); brand kits will contribute theirs alone")
-        return ""
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[provenance] warning: could not read {workflow_path} ({exc}); "
+              f"provenance records will be incomplete and brand kits will "
+              f"contribute their blocklist alone")
+        return None, None, ""
+
+    names = workflow_graph.model_names(workflow)
+    if names["checkpoint"] is None or names["controlnet"] is None:
+        print(f"[provenance] warning: {workflow_path} has no "
+              f"{'CheckpointLoaderSimple' if names['checkpoint'] is None else 'ControlNetLoader'} "
+              f"node; generated images will have an incomplete provenance record")
+
+    # Resolved separately, and allowed to fail on its own: reading a model
+    # name only needs a loader node, while locating the negative prompt needs
+    # the graph to be drivable. A workflow too broken for the second is still
+    # worth reporting the first from.
+    negative = ""
+    try:
+        resolved = workflow_graph.resolve(workflow, source=workflow_path)
+        if resolved.has(workflow_graph.NEGATIVE_PROMPT):
+            node_id = resolved.node_id(workflow_graph.NEGATIVE_PROMPT)
+            negative = resolved.workflow[node_id]["inputs"].get("text", "")
+    except workflow_graph.WorkflowSchemaError as exc:
+        print(f"[brands] warning: no negative prompt resolved from {workflow_path} "
+              f"({exc}); brand kits will contribute their blocklist alone")
+
+    return names["checkpoint"], names["controlnet"], negative
 
 
-BASE_NEGATIVE_PROMPT = _read_base_negative_prompt(DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH)
+CHECKPOINT_NAME, CONTROLNET_NAME, BASE_NEGATIVE_PROMPT = _read_workflow_facts(
+    DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH)
 
 # Loaded once at import. A brand pack is static configuration for the length
 # of an event, and reloading it per request would mean a half-saved JSON edit
@@ -184,6 +194,7 @@ async def lifespan(app: FastAPI):
     print("[warmup] loading rotoscope/pose/depth models...")
     await asyncio.to_thread(_warm_up_pipeline_models)
     print("[warmup] done")
+    await GENERATION_QUEUE.start()
     asyncio.create_task(comfy_relay_loop())
     threading.Thread(
         target=spout_sender_loop,
@@ -192,6 +203,7 @@ async def lifespan(app: FastAPI):
         daemon=True,
     ).start()
     yield
+    await GENERATION_QUEUE.stop()
     spout_stop_event.set()
 
 
@@ -346,17 +358,23 @@ async def handle_comfy_message(message):
                 print(f"[relay] fetching result for {prompt_id} failed: {exc!r}")
                 image = None
             if image is not None:
-                await send_json_to(session_id, {
-                    "type": "done",
-                    "image_base64": pil_to_b64(image),
-                    "kind": job["kind"],
-                    "provenance": job["provenance"],
-                })
+                # Two sinks, one relay. A batch run outlives the page that
+                # started it -- and can be started with no page at all -- so
+                # its results are written to the run directory rather than
+                # pushed at a websocket that may not exist.
+                if job.get("batch_run_id"):
+                    await asyncio.to_thread(_finish_batch_item, job, prompt_id, image)
+                else:
+                    await send_json_to(session_id, {
+                        "type": "done",
+                        "image_base64": pil_to_b64(image),
+                        "kind": job["kind"],
+                        "provenance": job["provenance"],
+                    })
             else:
-                await send_json_to(session_id, {
-                    "type": "error",
-                    "message": "generation finished but its output image could not be retrieved from ComfyUI",
-                })
+                await _report_job_error(
+                    job, prompt_id,
+                    "generation finished but its output image could not be retrieved from ComfyUI")
             JOBS.pop(prompt_id, None)
             if executing_prompt_id == prompt_id:
                 executing_prompt_id = None
@@ -365,7 +383,7 @@ async def handle_comfy_message(message):
             await send_json_to(session_id, {"type": "executing", "node": node})
 
     elif etype == "execution_error":
-        await send_json_to(session_id, {"type": "error", "message": str(data.get("exception_message", "generation failed"))})
+        await _report_job_error(job, prompt_id, str(data.get("exception_message", "generation failed")))
         JOBS.pop(prompt_id, None)
         if executing_prompt_id == prompt_id:
             executing_prompt_id = None
@@ -377,10 +395,87 @@ async def handle_comfy_message(message):
         # prompt_id and would sit there for the life of the process, a slow
         # per-cancelled-job memory leak on what's meant to be a long-running
         # server.
-        await send_json_to(session_id, {"type": "error", "message": "generation was interrupted"})
+        await _report_job_error(job, prompt_id, "generation was interrupted")
         JOBS.pop(prompt_id, None)
         if executing_prompt_id == prompt_id:
             executing_prompt_id = None
+
+
+async def _report_job_error(job: dict, prompt_id: str, message: str):
+    """One error path for both sinks. Before batch mode this was three inline
+    `send_json_to(...)` calls; a batch job routed through those would fail
+    silently, since its session id belongs to no socket and send_json_to
+    no-ops rather than raising."""
+    run_id = job.get("batch_run_id")
+    if run_id:
+        run = batch.RUNS.get(run_id)
+        item = run.item_by_prompt(prompt_id) if run else None
+        if run and item:
+            run.set_status(item, batch.FAILED, message)
+            run.write_manifest()
+            print(f"[batch] {run_id} item {item.stem} failed: {message}")
+        return
+    await send_json_to(job["session_id"], {"type": "error", "message": message})
+
+
+def _finish_batch_item(job: dict, prompt_id: str, image: Image.Image):
+    """Composites the untouched subject back over its generated background and
+    writes the frame. Runs in a thread: it is PIL work plus disk I/O, and
+    doing it on the event loop would stall the relay -- which during a batch
+    is delivering another item's progress at the same time."""
+    run = batch.RUNS.get(job["batch_run_id"])
+    if run is None:
+        return  # run was deleted mid-flight; the frame has nowhere to go
+    item = run.item_by_prompt(prompt_id)
+    if item is None:
+        return
+    try:
+        composite = batch.composite_subject_over(image, run.path_for("cutout", item))
+        composite.save(run.path_for("output", item))
+        with run.lock:
+            item.provenance = job["provenance"]
+            item.status = batch.DONE
+        run.write_manifest()
+        print(f"[batch] {run.run_id} item {item.stem} done "
+              f"({run.counts()[batch.DONE]}/{len(run.items)})")
+    except Exception as exc:
+        run.set_status(item, batch.FAILED, f"compositing failed: {exc}")
+        run.write_manifest()
+
+
+def _batch_submit(run: batch.BatchRun, item: batch.BatchItem, composed, settings: dict):
+    """The whole per-photo pipeline, run inside a queue worker.
+
+    Analysis lives here rather than in the request handler on purpose: it is
+    ~20s of CPU per photo, and doing it up front would mean a fifty-photo
+    batch sits silent for fifteen minutes before the GPU sees anything. Inside
+    the job, the worker pool overlaps one photo's rotoscope with another
+    photo's generation.
+    """
+    run.set_status(item, batch.ANALYZING)
+    raw = run.path_for("input", item, ".orig")
+    image = ImageOps.exif_transpose(Image.open(raw)).convert("RGB")
+    result = photoshoot_pipeline.analyze(image)
+
+    # Persisted rather than kept in memory: fifty subjects' worth of decoded
+    # images waiting on a serial GPU is how a long batch becomes an OOM, and
+    # these are worth having when a client asks why one frame looks wrong.
+    result["cutout"].save(run.path_for("cutout", item))
+    result["image"].save(run.path_for("analyzed", item))
+
+    run.set_status(item, batch.GENERATING)
+    return backend.queue_background_generation(
+        result["image"],
+        ImageOps.invert(result["mask"].convert("L")),
+        result["depth"].convert("RGB"),
+        composed.positive,
+        settings["controlnet_strength"],
+        settings["denoise"],
+        client_id=COMFY_CLIENT_ID,
+        prompt_id=item.prompt_id,
+        negative_prompt=composed.negative,
+        seed=composed.seed,
+    )
 
 
 # --- HTTP routes --------------------------------------------------------------
@@ -405,7 +500,140 @@ def config():
         "comfy_address": COMFY_ADDRESS,
         "base_negative_prompt": BASE_NEGATIVE_PROMPT,
         "brands": [b.to_dict() for b in BRANDS.values()],
+        "queue": GENERATION_QUEUE.stats(),
     })
+
+
+@app.post("/api/batch")
+async def start_batch(
+    files: list[UploadFile] = File(...),
+    brand_id: str = Form(""),
+    look_id: str = Form(""),
+    prompt: str = Form(""),
+    controlnet_strength: float = Form(0.75),
+    denoise: float = Form(0.85),
+):
+    """Starts a batch: N photos, one approved look, one consistent set.
+
+    Returns as soon as the work is queued rather than when it is done -- a
+    fifty-photo run is half an hour of GPU time, which is not an HTTP request.
+    Poll GET /api/batch/{run_id} and download the zip when it reports finished.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="no files uploaded")
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{len(files)} photos; the limit is {MAX_BATCH_FILES} per run")
+
+    try:
+        composed = _compose_for_request({"brand_id": brand_id, "look_id": look_id, "prompt": prompt})
+    except BrandKitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not composed.positive:
+        raise HTTPException(
+            status_code=400,
+            detail="nothing to generate: pick an approved look or supply a scene prompt")
+
+    run = batch.create_run([f.filename or f"photo_{i}" for i, f in enumerate(files)],
+                           composed.brand_id, composed.look_id, composed.look_label)
+
+    # Uploads are read and written to disk here, in the request, because the
+    # UploadFile objects are only valid for its lifetime -- a queue worker
+    # picking one up later would find a closed file.
+    for item, upload in zip(run.items, files):
+        raw = await upload.read()
+        if len(raw) > MAX_UPLOAD_BYTES:
+            run.set_status(item, batch.FAILED,
+                           f"{len(raw) // (1024 * 1024)}MB exceeds the "
+                           f"{MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit")
+            continue
+        try:
+            # Validated now rather than inside the worker: a directory of
+            # mixed files should reject its non-images immediately, not
+            # twenty minutes into a run.
+            Image.open(io.BytesIO(raw)).verify()
+        except Exception as exc:
+            run.set_status(item, batch.FAILED, f"not a readable image: {exc}")
+            continue
+        run.path_for("input", item, ".orig").write_bytes(raw)
+
+    settings = {"controlnet_strength": float(controlnet_strength), "denoise": float(denoise)}
+    queued = 0
+    for item in run.items:
+        if item.status == batch.FAILED:
+            continue
+        item.prompt_id = str(uuid.uuid4())
+        JOBS[item.prompt_id] = {
+            "session_id": f"batch:{run.run_id}",  # no socket; keeps the shape uniform
+            "kind": "background",
+            "provenance": None,
+            "batch_run_id": run.run_id,
+        }
+        job = job_queue.GenerationJob(
+            session_id=f"batch:{run.run_id}",
+            kind="background",
+            submit=lambda _pid, it=item: _batch_submit(run, it, composed, settings),
+            provenance={"prompt": composed.positive, "controlnet": CONTROLNET_NAME,
+                        "controlnet_strength": settings["controlnet_strength"],
+                        "denoise": settings["denoise"], **composed.to_provenance()},
+            job_id=item.prompt_id,
+        )
+        try:
+            await GENERATION_QUEUE.submit(job)
+            queued += 1
+        except job_queue.QueueFullError as exc:
+            JOBS.pop(item.prompt_id, None)
+            run.set_status(item, batch.FAILED, str(exc))
+
+    run.write_manifest()
+    print(f"[batch] {run.run_id}: queued {queued}/{len(run.items)} photo(s), "
+          f"brand={composed.brand_id} look={composed.look_id} seed={composed.seed}")
+    return JSONResponse({**run.to_dict(), "queued": queued}, status_code=202)
+
+
+@app.get("/api/batch/{run_id}")
+def batch_status(run_id: str):
+    run = batch.RUNS.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"no batch run {run_id!r}")
+    return JSONResponse(run.to_dict())
+
+
+@app.get("/api/batch/{run_id}/download")
+def batch_download(run_id: str):
+    """The finished frames plus the manifest, as a zip.
+
+    Allowed before the run finishes on purpose: an operator who has to leave
+    should be able to take what is ready rather than lose it.
+    """
+    run = batch.RUNS.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"no batch run {run_id!r}")
+    if run.counts()[batch.DONE] == 0:
+        raise HTTPException(status_code=409, detail="no frames have finished yet")
+    buffer = batch.zip_run(run)
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="batch_{run_id}.zip"'},
+    )
+
+
+@app.delete("/api/batch/{run_id}")
+def batch_delete(run_id: str):
+    """Deletes a run and its files -- including the subjects' photographs,
+    which is why this exists rather than letting a booth accumulate them."""
+    if not batch.delete_run(run_id):
+        raise HTTPException(status_code=404, detail=f"no batch run {run_id!r}")
+    return JSONResponse({"deleted": run_id})
+
+
+@app.get("/api/queue")
+def queue_stats():
+    """Live queue depth. Separate from /api/config -- config is read once at
+    page load, this is the bit that changes, and a batch run polls it."""
+    return JSONResponse(GENERATION_QUEUE.stats())
 
 
 @app.get("/api/brands/{brand_id}/logo")
@@ -497,43 +725,82 @@ async def ws_endpoint(websocket: WebSocket):
         # can't crash the relay loop or leak into another session's results.
 
 
+async def _on_job_accepted(job: job_queue.GenerationJob, prompt_id: str, seed: int):
+    """A worker got the job into ComfyUI. Attach provenance and tell the
+    browser it is really queued -- not when it was *submitted to us*, which
+    is what the client used to be told."""
+    entry = JOBS.get(prompt_id)
+    if entry is None:
+        # The session vanished and cleanup already ran; nothing to attach to.
+        return
+    entry["provenance"] = {
+        "kind": job.kind, "seed": seed, "checkpoint": CHECKPOINT_NAME,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        **job.provenance,
+    }
+    await send_json_to(job.session_id, {
+        "type": "queued", "prompt_id": prompt_id, "waited_seconds": round(job.waited, 1),
+    })
+
+
+async def _on_job_failed(job: job_queue.GenerationJob, exc: Exception):
+    """Submission failed (ComfyUI unreachable, bad workflow). The JOBS entry
+    was registered before submission, so it has to be rolled back or it sits
+    there for the life of the process while the browser waits on a `done`
+    that can never arrive."""
+    JOBS.pop(job.job_id, None)
+    await send_json_to(job.session_id, {
+        "type": "error", "message": f"failed to queue generation: {exc}"})
+
+
+GENERATION_QUEUE = job_queue.InProcessJobQueue(
+    on_accepted=_on_job_accepted,
+    on_failed=_on_job_failed,
+    workers=int(os.environ.get("GENERATION_WORKERS", job_queue.DEFAULT_WORKERS)),
+    max_depth=int(os.environ.get("GENERATION_QUEUE_DEPTH", job_queue.DEFAULT_MAX_DEPTH)),
+)
+
+
 async def _queue_job(session_id: str, kind: str, submit, provenance: dict):
-    """Shared submit-and-track path for every generation action.
+    """Shared enqueue-and-track path for every generation action.
 
     The three handlers below were the same eleven lines of bookkeeping three
     times over -- pre-register, submit, roll back on failure, attach
     provenance, notify -- differing only in what they submit. Keeping the
     ordering correct in one place matters more than usual here, because two
-    separate bugs already lived in it (see the comments below); triplicating
-    it meant triplicating both.
+    separate bugs already lived in it; triplicating it meant triplicating both.
 
-    `submit` is a zero-arg callable returning (prompt_id, seed); it runs in a
-    worker thread because the backend's HTTP calls are blocking.
+    Submission itself now goes through GENERATION_QUEUE rather than straight
+    onto a thread, so there is admission control and a real queue position to
+    report. What has *not* changed is the ordering below, which is load-bearing.
     """
-    # Registered *before* the submit call, with our own pre-generated
-    # prompt_id, not after -- the ComfyUI relay is a concurrent task and can
-    # start delivering events for a same-instant-queued job before this
-    # coroutine's own await returns; without pre-registering, that first
-    # event would look up a JOBS entry that doesn't exist yet and be
-    # silently dropped. ComfyUI's /prompt honors a client-supplied prompt_id
-    # and echoes it back unchanged (confirmed empirically).
+    # Registered *before* the job is handed to the queue, with our own
+    # pre-generated prompt_id -- the ComfyUI relay is a concurrent task and
+    # can start delivering events for a same-instant-queued job before the
+    # accept callback runs; without pre-registering, that first event would
+    # look up a JOBS entry that doesn't exist yet and be silently dropped.
+    # ComfyUI's /prompt honors a client-supplied prompt_id and echoes it back
+    # unchanged (confirmed empirically), which is what lets job_id double as
+    # the prompt_id here.
     prompt_id = str(uuid.uuid4())
     JOBS[prompt_id] = {"session_id": session_id, "kind": kind, "provenance": None}
+    job = job_queue.GenerationJob(
+        session_id=session_id, kind=kind, submit=submit,
+        provenance=provenance, job_id=prompt_id,
+    )
     try:
-        _, seed = await asyncio.to_thread(submit, prompt_id)
-    except Exception as exc:
-        # Pre-registering means a failed submission (ComfyUI unreachable,
-        # bad workflow) would otherwise leave this JOBS entry orphaned for
-        # the life of the process -- roll it back and tell the client.
+        position = await GENERATION_QUEUE.submit(job)
+    except job_queue.QueueFullError as exc:
         JOBS.pop(prompt_id, None)
-        await send_json_to(session_id, {"type": "error", "message": f"failed to queue generation: {exc}"})
+        await send_json_to(session_id, {"type": "error", "message": str(exc)})
         return
-    JOBS[prompt_id]["provenance"] = {
-        "kind": kind, "seed": seed, "checkpoint": CHECKPOINT_NAME,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        **provenance,
-    }
-    await send_json_to(session_id, {"type": "queued", "prompt_id": prompt_id})
+
+    if position > 1:
+        # Only when there is genuinely a line. Announcing "position 1" on an
+        # idle booth would invent a wait that isn't there.
+        await send_json_to(session_id, {
+            "type": "queue_position", "prompt_id": prompt_id, "position": position,
+        })
 
 
 async def handle_generate_image(session_id: str, msg: dict):

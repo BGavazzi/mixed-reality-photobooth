@@ -9,6 +9,10 @@ fallback_examples/
 test_images/
 verify_out/
 
+# Batch output: other people's photographs, plus every intermediate the
+# pipeline wrote for them. Never committed.
+batch_runs/
+
 # Personal interview prep / notes -- kept out of the public repo, since an
 # interviewer browsing the repo shouldn't be reading the prep for their own
 # interview. Remove these lines if you ever want them tracked.

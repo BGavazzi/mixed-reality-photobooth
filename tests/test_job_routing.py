@@ -23,6 +23,7 @@ import pytest
 from PIL import Image
 
 import web_server
+from conftest import run_queued
 
 
 class FakeWebSocket:
@@ -68,7 +69,7 @@ def two_sessions():
 
 def queue_fake_job(session_id, kind="background", seed=1234):
     """Runs the real _queue_job() with a submit that always succeeds."""
-    asyncio.run(web_server._queue_job(
+    run_queued(lambda: web_server._queue_job(
         session_id, kind,
         lambda prompt_id: (prompt_id, seed),
         {"prompt": f"prompt for {session_id}", "controlnet": "depth.safetensors",
@@ -111,7 +112,7 @@ def test_failed_submission_rolls_back_its_job_entry(two_sessions):
     def failing_submit(prompt_id):
         raise ConnectionError("ComfyUI unreachable")
 
-    asyncio.run(web_server._queue_job("session-a", "image", failing_submit, {"prompt": "x"}))
+    run_queued(lambda: web_server._queue_job("session-a", "image", failing_submit, {"prompt": "x"}))
 
     assert web_server.JOBS == {}, "the pre-registered entry must be rolled back"
     assert two_sessions["a"].types() == ["error"]
