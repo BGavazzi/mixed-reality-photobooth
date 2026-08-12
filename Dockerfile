@@ -34,7 +34,15 @@ WORKDIR /app
 # part (torch and friends), and copying source before it would invalidate that
 # layer on every code change.
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# torch comes in via controlnet_aux, and on Linux pip defaults to the CUDA
+# build: ~6GB of nvidia/cu* wheels for a container that, by the design note
+# above, never touches a GPU. Pinning the CPU index first means the later
+# `torch` requirement is already satisfied, and the image drops from ~9.4GB to
+# ~3GB. If this image is ever given a GPU, delete this line -- don't try to
+# have both.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+        torch torchvision \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Model weights for rembg/controlnet_aux download on first use and are large.
 # Kept on a volume (see docker-compose.yml) so a rebuilt container doesn't

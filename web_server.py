@@ -34,10 +34,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import websockets
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+import batch
 import brand_kit
 import job_queue
 import workflow_graph
@@ -51,7 +52,16 @@ import photoshoot_pipeline
 # the same LAN) without editing source. The relay URL, the REST backend, and
 # the /prompt submissions all derive from this one value.
 COMFY_ADDRESS = os.environ.get("COMFY_ADDRESS", "127.0.0.1:8188")
-COMFY_CLIENT_ID = "web-photoshoot-bridge"
+# Unique per process, and deliberately so. ComfyUI keys its websocket clients
+# by clientId and keeps only the most recent socket per id, so two instances of
+# this app sharing one constant meant the second to connect silently stole the
+# first's events: the older instance's generations still ran to completion, but
+# it never heard about them and its browser sat on "queued..." forever. That is
+# not exotic -- it happens the moment the Docker image is run alongside a
+# native `python web_server.py`, which is exactly how you'd compare the two.
+# Override only if something external needs to predict the id.
+COMFY_CLIENT_ID = os.environ.get(
+    "COMFY_CLIENT_ID", f"web-photoshoot-bridge-{uuid.uuid4().hex[:8]}")
 BINARY_PREVIEW_EVENT = 1  # ComfyUI's BinaryEventTypes.PREVIEW_IMAGE
 
 # Resolved against this file, not the process's working directory -- the
@@ -65,6 +75,11 @@ INDEX_HTML_PATH = Path(__file__).parent / "web" / "index.html"
 # memory during Image.open() itself -- this is a local demo, but "one bad
 # upload takes the server down mid-shoot" is a bad failure mode regardless.
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
+
+# A batch is bounded for the same reason the queue is: fifty photos is
+# already ~30 minutes of serial GPU time, and accepting a thousand would be
+# promising something the machine cannot deliver in any useful timeframe.
+MAX_BATCH_FILES = 50
 
 
 def _read_workflow_facts(workflow_path) -> tuple[str | None, str | None, str]:
@@ -343,17 +358,23 @@ async def handle_comfy_message(message):
                 print(f"[relay] fetching result for {prompt_id} failed: {exc!r}")
                 image = None
             if image is not None:
-                await send_json_to(session_id, {
-                    "type": "done",
-                    "image_base64": pil_to_b64(image),
-                    "kind": job["kind"],
-                    "provenance": job["provenance"],
-                })
+                # Two sinks, one relay. A batch run outlives the page that
+                # started it -- and can be started with no page at all -- so
+                # its results are written to the run directory rather than
+                # pushed at a websocket that may not exist.
+                if job.get("batch_run_id"):
+                    await asyncio.to_thread(_finish_batch_item, job, prompt_id, image)
+                else:
+                    await send_json_to(session_id, {
+                        "type": "done",
+                        "image_base64": pil_to_b64(image),
+                        "kind": job["kind"],
+                        "provenance": job["provenance"],
+                    })
             else:
-                await send_json_to(session_id, {
-                    "type": "error",
-                    "message": "generation finished but its output image could not be retrieved from ComfyUI",
-                })
+                await _report_job_error(
+                    job, prompt_id,
+                    "generation finished but its output image could not be retrieved from ComfyUI")
             JOBS.pop(prompt_id, None)
             if executing_prompt_id == prompt_id:
                 executing_prompt_id = None
@@ -362,7 +383,7 @@ async def handle_comfy_message(message):
             await send_json_to(session_id, {"type": "executing", "node": node})
 
     elif etype == "execution_error":
-        await send_json_to(session_id, {"type": "error", "message": str(data.get("exception_message", "generation failed"))})
+        await _report_job_error(job, prompt_id, str(data.get("exception_message", "generation failed")))
         JOBS.pop(prompt_id, None)
         if executing_prompt_id == prompt_id:
             executing_prompt_id = None
@@ -374,10 +395,87 @@ async def handle_comfy_message(message):
         # prompt_id and would sit there for the life of the process, a slow
         # per-cancelled-job memory leak on what's meant to be a long-running
         # server.
-        await send_json_to(session_id, {"type": "error", "message": "generation was interrupted"})
+        await _report_job_error(job, prompt_id, "generation was interrupted")
         JOBS.pop(prompt_id, None)
         if executing_prompt_id == prompt_id:
             executing_prompt_id = None
+
+
+async def _report_job_error(job: dict, prompt_id: str, message: str):
+    """One error path for both sinks. Before batch mode this was three inline
+    `send_json_to(...)` calls; a batch job routed through those would fail
+    silently, since its session id belongs to no socket and send_json_to
+    no-ops rather than raising."""
+    run_id = job.get("batch_run_id")
+    if run_id:
+        run = batch.RUNS.get(run_id)
+        item = run.item_by_prompt(prompt_id) if run else None
+        if run and item:
+            run.set_status(item, batch.FAILED, message)
+            run.write_manifest()
+            print(f"[batch] {run_id} item {item.stem} failed: {message}")
+        return
+    await send_json_to(job["session_id"], {"type": "error", "message": message})
+
+
+def _finish_batch_item(job: dict, prompt_id: str, image: Image.Image):
+    """Composites the untouched subject back over its generated background and
+    writes the frame. Runs in a thread: it is PIL work plus disk I/O, and
+    doing it on the event loop would stall the relay -- which during a batch
+    is delivering another item's progress at the same time."""
+    run = batch.RUNS.get(job["batch_run_id"])
+    if run is None:
+        return  # run was deleted mid-flight; the frame has nowhere to go
+    item = run.item_by_prompt(prompt_id)
+    if item is None:
+        return
+    try:
+        composite = batch.composite_subject_over(image, run.path_for("cutout", item))
+        composite.save(run.path_for("output", item))
+        with run.lock:
+            item.provenance = job["provenance"]
+            item.status = batch.DONE
+        run.write_manifest()
+        print(f"[batch] {run.run_id} item {item.stem} done "
+              f"({run.counts()[batch.DONE]}/{len(run.items)})")
+    except Exception as exc:
+        run.set_status(item, batch.FAILED, f"compositing failed: {exc}")
+        run.write_manifest()
+
+
+def _batch_submit(run: batch.BatchRun, item: batch.BatchItem, composed, settings: dict):
+    """The whole per-photo pipeline, run inside a queue worker.
+
+    Analysis lives here rather than in the request handler on purpose: it is
+    ~20s of CPU per photo, and doing it up front would mean a fifty-photo
+    batch sits silent for fifteen minutes before the GPU sees anything. Inside
+    the job, the worker pool overlaps one photo's rotoscope with another
+    photo's generation.
+    """
+    run.set_status(item, batch.ANALYZING)
+    raw = run.path_for("input", item, ".orig")
+    image = ImageOps.exif_transpose(Image.open(raw)).convert("RGB")
+    result = photoshoot_pipeline.analyze(image)
+
+    # Persisted rather than kept in memory: fifty subjects' worth of decoded
+    # images waiting on a serial GPU is how a long batch becomes an OOM, and
+    # these are worth having when a client asks why one frame looks wrong.
+    result["cutout"].save(run.path_for("cutout", item))
+    result["image"].save(run.path_for("analyzed", item))
+
+    run.set_status(item, batch.GENERATING)
+    return backend.queue_background_generation(
+        result["image"],
+        ImageOps.invert(result["mask"].convert("L")),
+        result["depth"].convert("RGB"),
+        composed.positive,
+        settings["controlnet_strength"],
+        settings["denoise"],
+        client_id=COMFY_CLIENT_ID,
+        prompt_id=item.prompt_id,
+        negative_prompt=composed.negative,
+        seed=composed.seed,
+    )
 
 
 # --- HTTP routes --------------------------------------------------------------
@@ -404,6 +502,131 @@ def config():
         "brands": [b.to_dict() for b in BRANDS.values()],
         "queue": GENERATION_QUEUE.stats(),
     })
+
+
+@app.post("/api/batch")
+async def start_batch(
+    files: list[UploadFile] = File(...),
+    brand_id: str = Form(""),
+    look_id: str = Form(""),
+    prompt: str = Form(""),
+    controlnet_strength: float = Form(0.75),
+    denoise: float = Form(0.85),
+):
+    """Starts a batch: N photos, one approved look, one consistent set.
+
+    Returns as soon as the work is queued rather than when it is done -- a
+    fifty-photo run is half an hour of GPU time, which is not an HTTP request.
+    Poll GET /api/batch/{run_id} and download the zip when it reports finished.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="no files uploaded")
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{len(files)} photos; the limit is {MAX_BATCH_FILES} per run")
+
+    try:
+        composed = _compose_for_request({"brand_id": brand_id, "look_id": look_id, "prompt": prompt})
+    except BrandKitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not composed.positive:
+        raise HTTPException(
+            status_code=400,
+            detail="nothing to generate: pick an approved look or supply a scene prompt")
+
+    run = batch.create_run([f.filename or f"photo_{i}" for i, f in enumerate(files)],
+                           composed.brand_id, composed.look_id, composed.look_label)
+
+    # Uploads are read and written to disk here, in the request, because the
+    # UploadFile objects are only valid for its lifetime -- a queue worker
+    # picking one up later would find a closed file.
+    for item, upload in zip(run.items, files):
+        raw = await upload.read()
+        if len(raw) > MAX_UPLOAD_BYTES:
+            run.set_status(item, batch.FAILED,
+                           f"{len(raw) // (1024 * 1024)}MB exceeds the "
+                           f"{MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit")
+            continue
+        try:
+            # Validated now rather than inside the worker: a directory of
+            # mixed files should reject its non-images immediately, not
+            # twenty minutes into a run.
+            Image.open(io.BytesIO(raw)).verify()
+        except Exception as exc:
+            run.set_status(item, batch.FAILED, f"not a readable image: {exc}")
+            continue
+        run.path_for("input", item, ".orig").write_bytes(raw)
+
+    settings = {"controlnet_strength": float(controlnet_strength), "denoise": float(denoise)}
+    queued = 0
+    for item in run.items:
+        if item.status == batch.FAILED:
+            continue
+        item.prompt_id = str(uuid.uuid4())
+        JOBS[item.prompt_id] = {
+            "session_id": f"batch:{run.run_id}",  # no socket; keeps the shape uniform
+            "kind": "background",
+            "provenance": None,
+            "batch_run_id": run.run_id,
+        }
+        job = job_queue.GenerationJob(
+            session_id=f"batch:{run.run_id}",
+            kind="background",
+            submit=lambda _pid, it=item: _batch_submit(run, it, composed, settings),
+            provenance={"prompt": composed.positive, "controlnet": CONTROLNET_NAME,
+                        "controlnet_strength": settings["controlnet_strength"],
+                        "denoise": settings["denoise"], **composed.to_provenance()},
+            job_id=item.prompt_id,
+        )
+        try:
+            await GENERATION_QUEUE.submit(job)
+            queued += 1
+        except job_queue.QueueFullError as exc:
+            JOBS.pop(item.prompt_id, None)
+            run.set_status(item, batch.FAILED, str(exc))
+
+    run.write_manifest()
+    print(f"[batch] {run.run_id}: queued {queued}/{len(run.items)} photo(s), "
+          f"brand={composed.brand_id} look={composed.look_id} seed={composed.seed}")
+    return JSONResponse({**run.to_dict(), "queued": queued}, status_code=202)
+
+
+@app.get("/api/batch/{run_id}")
+def batch_status(run_id: str):
+    run = batch.RUNS.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"no batch run {run_id!r}")
+    return JSONResponse(run.to_dict())
+
+
+@app.get("/api/batch/{run_id}/download")
+def batch_download(run_id: str):
+    """The finished frames plus the manifest, as a zip.
+
+    Allowed before the run finishes on purpose: an operator who has to leave
+    should be able to take what is ready rather than lose it.
+    """
+    run = batch.RUNS.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"no batch run {run_id!r}")
+    if run.counts()[batch.DONE] == 0:
+        raise HTTPException(status_code=409, detail="no frames have finished yet")
+    buffer = batch.zip_run(run)
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="batch_{run_id}.zip"'},
+    )
+
+
+@app.delete("/api/batch/{run_id}")
+def batch_delete(run_id: str):
+    """Deletes a run and its files -- including the subjects' photographs,
+    which is why this exists rather than letting a booth accumulate them."""
+    if not batch.delete_run(run_id):
+        raise HTTPException(status_code=404, detail=f"no batch run {run_id!r}")
+    return JSONResponse({"deleted": run_id})
 
 
 @app.get("/api/queue")

@@ -157,6 +157,16 @@
     </div>
 
     <div class="panel">
+      <h2>Batch</h2>
+      <div class="hint" style="margin-top:0">Many photos, one approved look. Uses the brand kit selected on the right -- with a locked seed, the whole set renders as one campaign instead of one image per guest. Runs server-side, so it survives closing this tab.</div>
+      <button class="secondary small" id="btnBatchPick" style="width:100%;margin-top:10px">Choose Photos…</button>
+      <input type="file" id="batchInput" accept="image/*" multiple>
+      <div class="hint" id="batchStatus" style="display:none"></div>
+      <div class="progress-bar" id="batchBar" style="display:none"><div id="batchFill"></div></div>
+      <button class="secondary small" id="btnBatchDownload" style="width:100%;margin-top:8px;display:none">Download Frames (.zip)</button>
+    </div>
+
+    <div class="panel">
       <h2>Project</h2>
       <button class="secondary small" id="btnExportJson" style="width:100%;margin-bottom:6px" disabled>Export Project (.json)</button>
       <button class="secondary small" id="btnImportJson" style="width:100%">Import Project (.json)</button>
@@ -1372,6 +1382,98 @@ function renderBrandViolations() {
   box.style.display = problems.length ? 'block' : 'none';
   box.textContent = problems.join(' ');
 }
+
+// --- batch mode -------------------------------------------------------------------
+// Everything here is a thin client over /api/batch. The run lives on the
+// server, which is what lets it outlive this tab -- so the UI polls a run id
+// rather than holding any state of its own beyond that id.
+
+let batchRunId = null;
+let batchPoll = null;
+
+document.getElementById('btnBatchPick').onclick = () => document.getElementById('batchInput').click();
+
+document.getElementById('batchInput').onchange = async (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';  // so picking the same folder twice fires change again
+  if (!files.length) return;
+
+  const form = new FormData();
+  for (const file of files) form.append('files', file);
+  form.append('brand_id', state.brandId || '');
+  form.append('look_id', state.lookId || '');
+  form.append('prompt', document.getElementById('scenePrompt').value.trim());
+  form.append('controlnet_strength', document.getElementById('cnStrength').value);
+  form.append('denoise', document.getElementById('denoise').value);
+
+  setBatchStatus(`uploading ${files.length} photo(s)…`);
+  let run;
+  try {
+    const resp = await fetch('/api/batch', { method: 'POST', body: form });
+    run = await resp.json();
+    if (!resp.ok) throw new Error(run.detail || `HTTP ${resp.status}`);
+  } catch (err) {
+    setBatchStatus(`batch rejected: ${err.message}`);
+    return;
+  }
+
+  batchRunId = run.run_id;
+  logEvent(`batch ${run.run_id}: queued ${run.queued} of ${run.total} photo(s)`);
+  document.getElementById('batchBar').style.display = 'block';
+  pollBatch();
+  // A whole batch is ~35s per photo, so a slow poll is plenty and keeps this
+  // from being the thing competing with the generation for the event loop.
+  batchPoll = setInterval(pollBatch, 3000);
+};
+
+function setBatchStatus(text) {
+  const el = document.getElementById('batchStatus');
+  el.style.display = 'block';
+  el.textContent = text;
+}
+
+async function pollBatch() {
+  if (!batchRunId) return;
+  let status;
+  try {
+    const resp = await fetch(`/api/batch/${batchRunId}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    status = await resp.json();
+  } catch (err) {
+    // Transient: the server may be busy compositing. Keep polling rather than
+    // abandoning a run that is still perfectly alive.
+    return;
+  }
+
+  const c = status.counts;
+  const finishedCount = c.done + c.failed;
+  document.getElementById('batchFill').style.width = `${Math.round(100 * finishedCount / status.total)}%`;
+  setBatchStatus(
+    `${c.done}/${status.total} done`
+    + (c.generating ? ` · ${c.generating} generating` : '')
+    + (c.analyzing ? ` · ${c.analyzing} analyzing` : '')
+    + (c.pending ? ` · ${c.pending} queued` : '')
+    + (c.failed ? ` · ${c.failed} failed` : '')
+    + (status.look_label ? `\n${status.look_label}` : ''));
+
+  // Offered as soon as anything has finished, not only at the end: an
+  // operator who has to leave should be able to take what is ready.
+  document.getElementById('btnBatchDownload').style.display = c.done ? 'block' : 'none';
+
+  if (status.finished) {
+    clearInterval(batchPoll);
+    batchPoll = null;
+    logEvent(`batch ${batchRunId} finished: ${c.done} frame(s), ${c.failed} failed`,
+             c.failed ? 'ev-error' : 'ev-done');
+    for (const item of status.items.filter(i => i.status === 'failed')) {
+      logEvent(`  ${item.filename}: ${item.error}`, 'ev-error');
+    }
+  }
+}
+
+document.getElementById('btnBatchDownload').onclick = () => {
+  if (batchRunId) window.location.href = `/api/batch/${batchRunId}/download`;
+};
 
 // --- drag to reposition selected layer -----------------------------------------
 
