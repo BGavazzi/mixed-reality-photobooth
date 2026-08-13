@@ -69,7 +69,10 @@ class Stage:
     label: str
     floor_near: float = 0.62      # depth at the bottom edge of the frame
     floor_far: float = 0.18       # depth where the floor reaches the horizon
-    backdrop: float = 0.10        # depth above the horizon; 0 would be infinity again
+    backdrop: float = 0.10        # depth of the wall standing above the horizon
+    wall_height: float = 1.0      # how far above the horizon that wall reaches, as a
+                                  # fraction of frame height; >=1 means all the way up
+    sky: float = 0.02             # depth above the wall's top edge -- genuinely distant
     side_walls: float = 0.0       # >0 pulls the frame edges nearer, reading as an interior
     horizon_bias: float = 0.12    # where eye level sits between head (0) and feet (1)
     blur: float = 24.0            # smoothing; a sharp prior gets traced instead of obeyed
@@ -77,6 +80,7 @@ class Stage:
     def to_dict(self) -> dict:
         return {"id": self.id, "label": self.label, "floor_near": self.floor_near,
                 "floor_far": self.floor_far, "backdrop": self.backdrop,
+                "wall_height": self.wall_height, "sky": self.sky,
                 "side_walls": self.side_walls}
 
 
@@ -84,15 +88,25 @@ class Stage:
 # line here; letting each look invent its own numbers would mean nobody could
 # say why two looks composite differently.
 STAGES: dict[str, Stage] = {
+    # A parapet standing on the far edge of the floor, and sky above it. The
+    # first version of this stage made everything above the horizon one flat
+    # plane, and got exactly what it asked for: a clean wall and an empty sky,
+    # on a look whose prompt says "city skyline softly out of focus". A skyline
+    # needs somewhere to *be* -- a depth step at the parapet's top edge, with
+    # real distance behind it.
     "terrace": Stage(
         "terrace", "Open terrace — floor, low wall, distance beyond",
-        floor_near=0.66, floor_far=0.20, backdrop=0.12),
+        floor_near=0.66, floor_far=0.20, backdrop=0.20, wall_height=0.11, sky=0.03),
+    # An interior has no sky: the back wall runs to the top of the frame, so
+    # the band is the whole region above the horizon.
     "room": Stage(
         "room", "Interior — floor, near back wall, side walls",
         floor_near=0.70, floor_far=0.34, backdrop=0.30, side_walls=0.22, blur=18.0),
+    # Open ground: barely any wall at all, just the far edge of the world.
     "landscape": Stage(
         "landscape", "Open ground running to a far horizon",
-        floor_near=0.60, floor_far=0.10, backdrop=0.05, horizon_bias=0.18),
+        floor_near=0.60, floor_far=0.10, backdrop=0.09, wall_height=0.04, sky=0.02,
+        horizon_bias=0.18),
     "studio": Stage(
         "studio", "Seamless cyclorama — floor curving into the backdrop",
         floor_near=0.68, floor_far=0.42, backdrop=0.40, blur=34.0),
@@ -181,7 +195,16 @@ def build_depth(depth: Image.Image, mask: Image.Image, stage: Stage | str | None
     floor_t = np.clip((ys - y_horizon) / max(1e-3, 1.0 - y_horizon), 0.0, 1.0)
     floor = stage.floor_far + (stage.floor_near - stage.floor_far) * floor_t
 
-    background = np.where(ys >= y_horizon, floor, np.float32(stage.backdrop))
+    # Above the horizon, two bands rather than one plane. The wall stands on
+    # the floor's far edge; above its top there is real distance. A single
+    # constant here is a complete description of a wall and a useless one for
+    # anything behind a wall, which is how a "city skyline" prompt produced an
+    # empty sky. The step at the wall's top edge is the whole point: it is an
+    # occluding edge, and the model paints something behind an occluding edge.
+    wall_top = y_horizon - stage.wall_height
+    background = np.where(
+        ys >= y_horizon, floor,
+        np.where(ys >= wall_top, np.float32(stage.backdrop), np.float32(stage.sky)))
     background = np.repeat(background, width, axis=1)
 
     if stage.side_walls > 0:

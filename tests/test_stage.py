@@ -126,6 +126,32 @@ def test_landscape_has_no_side_walls():
     assert abs(float(row[0]) - float(row[len(row) // 2])) < 0.05
 
 
+def test_a_terrace_puts_distance_above_its_parapet():
+    """The bug this fixes was visible on the GPU, not in a test: one flat plane
+    above the horizon is a complete description of a wall and a useless one for
+    a city behind a wall, so a 'skyline softly out of focus' prompt came back
+    with a clean wall and an empty sky. The step at the parapet's top is what
+    gives a skyline somewhere to be."""
+    staged = as_array(stage.build_depth(void_depth(), standing_subject(), "terrace"))
+    column = staged[:, 2]
+    horizon = stage.horizon_for(standing_subject(), stage.get("terrace"))
+    horizon_px = int(horizon * len(column))
+
+    parapet = column[max(0, horizon_px - 8):horizon_px].mean()
+    sky = column[:8].mean()
+    assert parapet > sky + 0.05, "there is no depth step for a skyline to sit behind"
+
+
+def test_an_interior_has_no_sky_band():
+    """A room's back wall runs to the top of the frame. Punching a hole of sky
+    through the ceiling would be a worse prior than the flat one it replaced."""
+    staged = as_array(stage.build_depth(void_depth(), standing_subject(), "room"))
+    column = staged[:, 2]
+    horizon_px = int(stage.horizon_for(standing_subject(), stage.get("room")) * len(column))
+
+    assert abs(column[:8].mean() - column[max(0, horizon_px - 8):horizon_px].mean()) < 0.05
+
+
 def test_the_prior_is_smooth_enough_to_be_obeyed_rather_than_traced():
     """A high-frequency fake shows through in the output as banding or a hard
     seam. Neighbouring background rows should differ gently."""

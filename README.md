@@ -317,6 +317,18 @@ optionally side walls that read as an interior. The horizon is derived from the
 subject rather than fixed — a standing figure tells you where the camera was,
 and a booth photographs children and seated guests too.
 
+**A wall has a height, and there is distance above it.** This part was found by
+looking at output rather than at tests. The first version made everything above
+the horizon a single flat plane — which is a complete description of *a wall*,
+and a useless one for anything *behind* a wall. Aurora's rooftop look prompts
+for a "city skyline softly out of focus" and got a clean parapet and an empty
+pale sky, because nothing in the depth map said there was anywhere for a city
+to be. The wall now stops, and above its top edge there is real distance. That
+step is an occluding edge, and a model will paint something behind an occluding
+edge: the same seed, the same prompt and the same photograph now come back with
+the skyline behind the parapet. An interior gets no sky band, because a room's
+back wall runs to the top of the frame.
+
 The prior is deliberately smooth and low-detail. It is a constraint on *where
 surfaces are*, not an edge map to trace; a high-frequency fake shows through in
 the output. The subject's own measured depth is copied through untouched.
@@ -333,7 +345,7 @@ result *reliable* rather than merely possible.
 
 Each item's manifest carries a `stage_relief` score, so "the prior fired" is a
 number rather than an impression. The void scores 0.0 by construction; a real
-stage scores 0.2–0.5.
+stage scores 0.2–0.6.
 
 Note the ordering against `suggest_controlnet_strength()`: that still measures
 the *guest's own* depth, before the stage is built. It is asking how much real
@@ -859,7 +871,7 @@ pip install -r requirements-test.txt
 pytest
 ```
 
-409 tests covering the pure-logic parts of the pipeline (mask blob cleanup,
+411 tests covering the pure-logic parts of the pipeline (mask blob cleanup,
 illumination estimation, resolution capping, the ControlNet-strength heuristic,
 contact shadow geometry, cover-fit), the stage-depth prior, the frame finisher
 (grade, contact shadow, logo geometry), the output-surface model, brand-kit
@@ -961,16 +973,9 @@ stale.
 - The watchdog can only recover a render that ComfyUI still has in `/history`.
   If ComfyUI is restarted, the history goes with it and those jobs are failed —
   correctly, but the picture is genuinely gone.
-- **The stage prior can suppress distant detail the look asks for.** Observed on
-  the real GPU: Aurora's `rooftop` look prompts for a "city skyline softly out
-  of focus", and with the `terrace` stage the result was a clean wall and an
-  empty pale sky — no city. The backdrop above the horizon is a single constant
-  depth, which is a perfectly good instruction for *a wall* and a poor one for
-  *a skyline behind a wall*. The floor, the wall and the grounded subject are a
-  large net gain and the frames no longer read as stickers, but a look whose
-  value is in the far distance may want `landscape`, or `void` and a spatially
-  explicit prompt. The stage set does not currently model "near parapet, far
-  city", and that is the obvious next stage to add.
+- The stage set is five hand-tuned presets, not a scene description language. A
+  look that wants something the presets don't model — a doorway, a table in
+  the foreground, a low camera — has no way to ask for it beyond the prompt.
 - The subject grade is grey-world colour balance, not relighting. It fixes the
   case where the plate and the subject disagree about the *colour* of the
   light. It cannot fix a disagreement about its *direction* — a subject lit
