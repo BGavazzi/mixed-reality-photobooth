@@ -47,13 +47,16 @@ and still tested. What changed is the default, not the capability.
 
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 
+import config
+
 # Whether a run with no consent declaration is refused. Off by default; see the
 # module docstring. `web_server.py --require-consent` and batch_cli flip it.
-REQUIRED = os.environ.get("BOOTH_REQUIRE_CONSENT", "").lower() in ("1", "true", "yes")
+REQUIRED = config.env_bool(
+    "BOOTH_REQUIRE_CONSENT", False,
+    "refuse a batch run that declares no consent basis")
 
 # The bases the booth actually supports, with the wording an operator would
 # use. Deliberately a closed set rather than free text: "consent: yes" in a

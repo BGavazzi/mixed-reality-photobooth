@@ -28,6 +28,7 @@ import json
 import os
 import struct
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -41,9 +42,12 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 import attention
 import batch
 import brand_kit
+import config
 import consent
 import job_queue
+import obs
 import resilience
+import watchdog
 import workflow_graph
 from backends.comfy import ComfyBackend, DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH
 from brand_kit import BrandKitError
@@ -54,7 +58,8 @@ import photoshoot_pipeline
 # Env-configurable so ComfyUI can live on another box (a GPU workstation on
 # the same LAN) without editing source. The relay URL, the REST backend, and
 # the /prompt submissions all derive from this one value.
-COMFY_ADDRESS = os.environ.get("COMFY_ADDRESS", "127.0.0.1:8188")
+COMFY_ADDRESS = config.env_str("COMFY_ADDRESS", "127.0.0.1:8188",
+                               "host:port of the ComfyUI this app drives")
 # Unique per process, and deliberately so. ComfyUI keys its websocket clients
 # by clientId and keeps only the most recent socket per id, so two instances of
 # this app sharing one constant meant the second to connect silently stole the
@@ -63,8 +68,9 @@ COMFY_ADDRESS = os.environ.get("COMFY_ADDRESS", "127.0.0.1:8188")
 # not exotic -- it happens the moment the Docker image is run alongside a
 # native `python web_server.py`, which is exactly how you'd compare the two.
 # Override only if something external needs to predict the id.
-COMFY_CLIENT_ID = os.environ.get(
-    "COMFY_CLIENT_ID", f"web-photoshoot-bridge-{uuid.uuid4().hex[:8]}")
+COMFY_CLIENT_ID = config.env_str(
+    "COMFY_CLIENT_ID", f"web-photoshoot-bridge-{uuid.uuid4().hex[:8]}",
+    "websocket client id; unique per process unless pinned")
 BINARY_PREVIEW_EVENT = 1  # ComfyUI's BinaryEventTypes.PREVIEW_IMAGE
 
 # Resolved against this file, not the process's working directory -- the
@@ -83,6 +89,26 @@ MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 # already ~30 minutes of serial GPU time, and accepting a thousand would be
 # promising something the machine cannot deliver in any useful timeframe.
 MAX_BATCH_FILES = 50
+
+SHUTDOWN_DRAIN_SECONDS = config.env_float(
+    "SHUTDOWN_DRAIN_SECONDS", 30.0,
+    "seconds a shutdown waits for queued work to reach ComfyUI",
+    minimum=0, maximum=3600)
+
+# Three separate facts, deliberately not one "healthy" flag.
+#
+# MODELS_READY: the ~40s of rotoscope/pose/depth loading at startup. Until it
+#   is set the process answers HTTP but every generation would block on the
+#   import lock, which looks like a hang rather than a warm-up.
+# READY: the composite answer /readyz gives. Cleared first at shutdown so a
+#   load balancer stops sending work *before* anything is torn down, which is
+#   the entire point of having readiness separate from liveness.
+# ACCEPTING: whether new work may be admitted. A draining server is alive and
+#   still finishing what it has -- it just must not take more.
+MODELS_READY = threading.Event()
+READY = threading.Event()
+ACCEPTING = threading.Event()
+ACCEPTING.set()
 
 
 def _read_workflow_facts(workflow_path) -> tuple[str | None, str | None, str]:
@@ -214,26 +240,146 @@ async def retention_loop(interval_seconds: float = 3600):
         await asyncio.sleep(interval_seconds)
 
 
+async def _probe_comfy(prompt_id: str):
+    """What does ComfyUI say about a prompt that has gone quiet?
+
+    Ordered by consequence. `/history` first, because "it finished and we
+    missed the event" is both the most likely cause and the only one where
+    getting it wrong destroys a picture that exists. Only if history has
+    nothing do we ask whether it is still queued.
+    """
+    image = await asyncio.to_thread(backend.get_result_image, prompt_id)
+    if image is not None:
+        return watchdog.FINISHED, image
+    landed = await asyncio.to_thread(backend._prompt_landed, prompt_id)
+    return (watchdog.QUEUED if landed else watchdog.UNKNOWN), None
+
+
+async def _recover_job(prompt_id: str, image: Image.Image):
+    job = JOBS.pop(prompt_id, None)
+    if job is None:
+        return
+    await _deliver_result(job, prompt_id, image)
+    # Worth an operator's attention even though it ended well: a recovered job
+    # means events were lost, and losing events silently is how the clientId
+    # collision went unnoticed for a day. Low severity, because nobody has to
+    # do anything -- but it should be visible that it happened.
+    attention.raise_item(
+        attention.BATCH_ITEM_FAILED, "a render finished but its event was missed",
+        detail=f"recovered {prompt_id} from /history; check for a second process "
+               f"sharing COMFY_CLIENT_ID, or a websocket that reconnected mid-render")
+
+
+async def _abandon_job(prompt_id: str, item: watchdog.Overdue):
+    job = JOBS.pop(prompt_id, None)
+    if job is None:
+        return
+    global executing_prompt_id
+    if executing_prompt_id == prompt_id:
+        executing_prompt_id = None
+    await _report_job_error(job, prompt_id, item.message)
+    if item.reason == "stall":
+        attention.raise_item(
+            attention.DEPENDENCY_DOWN, "ComfyUI accepted work and went silent",
+            detail=f"no events for {watchdog.STALL_SECONDS:.0f}s with jobs in flight; "
+                   f"{prompt_id} was given up after {item.age:.0f}s")
+
+
+async def watchdog_loop():
+    """The only loop here that exists because of something that does *not*
+    happen. Failures announce themselves; a job that is simply never spoken of
+    again does not, so it takes a timer to notice."""
+    while True:
+        await asyncio.sleep(watchdog.INTERVAL_SECONDS)
+        try:
+            if not JOBS:
+                continue
+            tally = await watchdog.sweep(
+                dict(JOBS), probe=_probe_comfy, recover=_recover_job, fail=_abandon_job)
+            if tally["checked"]:
+                obs.log("watchdog", "swept overdue jobs", **tally)
+        except Exception as exc:                        # noqa: BLE001
+            # Must not take the server down, must not go unnoticed: this is the
+            # component whose whole job is spotting silence.
+            obs.log("watchdog", "sweep failed", error=repr(exc))
+            attention.raise_item(
+                attention.DEPENDENCY_DOWN, "the job watchdog is failing",
+                detail=f"{exc!r} -- stuck generations will not be detected")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print(config.banner())
     print("[warmup] loading rotoscope/pose/depth models...")
     await asyncio.to_thread(_warm_up_pipeline_models)
+    MODELS_READY.set()
     print("[warmup] done")
     swept = await asyncio.to_thread(batch.sweep_expired)
     print(f"[batch] retention: {batch.DEFAULT_RETAIN_DAYS:g} day(s), "
           f"{len(swept)} expired run(s) removed at startup")
     await GENERATION_QUEUE.start()
-    asyncio.create_task(retention_loop())
-    asyncio.create_task(comfy_relay_loop())
+    background = [
+        asyncio.create_task(retention_loop()),
+        asyncio.create_task(comfy_relay_loop()),
+        asyncio.create_task(watchdog_loop()),
+    ]
     threading.Thread(
         target=spout_sender_loop,
         args=(photobooth_frame_buffer, PHOTOBOOTH_SPOUT_NAME, PHOTOBOOTH_SPOUT_FPS,
               spout_stop_event, spout_live_event),
         daemon=True,
     ).start()
+    READY.set()
+
     yield
+
+    await _shutdown(background)
+
+
+async def _shutdown(background: list[asyncio.Task]):
+    """Stop taking work, finish what was taken, then stop.
+
+    The old shutdown was one line -- `await GENERATION_QUEUE.stop()` -- which
+    cancels the worker tasks. Anything mid-submission died there and then, and
+    anything still waiting in the queue was dropped without so much as an
+    error frame: `docker stop` or a Ctrl-C during a batch lost a guest's photo
+    and told nobody. `drain()` existed on the queue interface the whole time
+    and nothing called it.
+
+    The boundary is worth being precise about, because it is not "wait for
+    every photo to be finished". Draining waits for queued work to be *handed
+    to ComfyUI*, which is where the app stops being the thing that can lose it:
+    once ComfyUI has the prompt it renders regardless of this process, and the
+    result is recoverable from /history afterwards. Waiting for renders instead
+    would mean a shutdown that takes half an hour on a full queue, which is how
+    you teach an operator to use `kill -9`.
+
+    Bounded, because a drain that cannot finish must not become a hang: past
+    the deadline the remaining jobs are failed loudly rather than dropped
+    silently, which is the whole difference from before.
+    """
+    READY.clear()          # /readyz starts failing here, before anything is torn down
+    ACCEPTING.clear()      # new submissions are refused with a 503, not queued into a dying process
+    stats = GENERATION_QUEUE.stats()
+    print(f"[shutdown] draining {stats['waiting']} waiting + {stats['running']} running "
+          f"(deadline {SHUTDOWN_DRAIN_SECONDS:g}s)")
+
+    started = time.monotonic()
+    try:
+        await asyncio.wait_for(GENERATION_QUEUE.drain(), timeout=SHUTDOWN_DRAIN_SECONDS)
+        print(f"[shutdown] queue drained in {time.monotonic() - started:.1f}s")
+    except asyncio.TimeoutError:
+        stats = GENERATION_QUEUE.stats()
+        print(f"[shutdown] drain deadline passed with {stats['waiting']} job(s) still "
+              f"waiting; failing them rather than dropping them")
+        await _fail_orphaned_jobs("the server shut down before this generation was submitted")
+
     await GENERATION_QUEUE.stop()
+    for task in background:
+        task.cancel()
+    await asyncio.gather(*background, return_exceptions=True)
     spout_stop_event.set()
+    print("[shutdown] done")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -355,6 +501,11 @@ async def handle_comfy_message(message):
     data = event.get("data", {})
     prompt_id = data.get("prompt_id")
 
+    # Every ComfyUI event proves the dependency is alive, whichever job it
+    # names. The watchdog reads this to tell "our job is stuck" apart from
+    # "ComfyUI is wedged", which are different problems with different fixes.
+    watchdog.note_event()
+
     if etype == "status":
         # Not job-specific -- every connected session sees overall queue
         # depth, not just whichever session happens to have a job in flight.
@@ -384,22 +535,10 @@ async def handle_comfy_message(message):
             try:
                 image = await asyncio.to_thread(backend.get_result_image, prompt_id)
             except Exception as exc:
-                print(f"[relay] fetching result for {prompt_id} failed: {exc!r}")
+                obs.log("relay", "fetching result failed", error=repr(exc))
                 image = None
             if image is not None:
-                # Two sinks, one relay. A batch run outlives the page that
-                # started it -- and can be started with no page at all -- so
-                # its results are written to the run directory rather than
-                # pushed at a websocket that may not exist.
-                if job.get("batch_run_id"):
-                    await asyncio.to_thread(_finish_batch_item, job, prompt_id, image)
-                else:
-                    await send_json_to(session_id, {
-                        "type": "done",
-                        "image_base64": pil_to_b64(image),
-                        "kind": job["kind"],
-                        "provenance": job["provenance"],
-                    })
+                await _deliver_result(job, prompt_id, image)
             else:
                 await _report_job_error(
                     job, prompt_id,
@@ -428,6 +567,29 @@ async def handle_comfy_message(message):
         JOBS.pop(prompt_id, None)
         if executing_prompt_id == prompt_id:
             executing_prompt_id = None
+
+
+async def _deliver_result(job: dict, prompt_id: str, image: Image.Image):
+    """Hands a finished render to whichever sink the job belongs to.
+
+    Two sinks, one path. A batch run outlives the page that started it -- and
+    can be started with no page at all -- so its results are written to the run
+    directory rather than pushed at a websocket that may not exist.
+
+    Extracted from the relay because the watchdog needs exactly this: a render
+    it found sitting in /history after its event was missed has to reach the
+    same place by the same route, or "recovered" would quietly mean something
+    different from "completed".
+    """
+    if job.get("batch_run_id"):
+        await asyncio.to_thread(_finish_batch_item, job, prompt_id, image)
+    else:
+        await send_json_to(job["session_id"], {
+            "type": "done",
+            "image_base64": pil_to_b64(image),
+            "kind": job["kind"],
+            "provenance": job["provenance"],
+        })
 
 
 async def _report_job_error(job: dict, prompt_id: str, message: str):
@@ -532,9 +694,65 @@ def index():
     return FileResponse(INDEX_HTML_PATH)
 
 
+@app.get("/healthz")
+def healthz():
+    """Is the process alive? Nothing else.
+
+    Deliberately checks nothing: a liveness probe that consults a dependency
+    is a restart loop waiting for that dependency to have a bad minute.
+    ComfyUI being down is not a reason to kill this process -- it is the exact
+    situation the breaker, the attention queue and the guest-facing message
+    were built for, and all of them need the process to still be running.
+    """
+    return JSONResponse({"status": "alive", **config.version_info()})
+
+
+@app.get("/readyz")
+def readyz():
+    """Should this instance be given work right now?
+
+    Every "no" carries a reason, because a probe that fails without saying why
+    turns into somebody reading source at 2am. 503 rather than 200-with-a-flag
+    so the answer is legible to anything that speaks HTTP and nothing else.
+    """
+    breaker = getattr(backend, "breaker", None)
+    breaker_stats = breaker.stats() if breaker else {}
+    queue_stats = GENERATION_QUEUE.stats()
+
+    reasons = []
+    if not MODELS_READY.is_set():
+        reasons.append("the CPU pipeline models are still loading")
+    if not READY.is_set():
+        reasons.append("the server has not finished starting, or is shutting down")
+    if not ACCEPTING.is_set():
+        reasons.append("the server is draining and is not accepting new work")
+    if breaker_stats.get("state") == "open":
+        reasons.append("ComfyUI is not answering; the circuit breaker is open")
+    if queue_stats["waiting"] >= queue_stats["max_depth"]:
+        reasons.append(f"the queue is full ({queue_stats['waiting']} waiting)")
+
+    payload = {
+        "ready": not reasons,
+        "reasons": reasons,
+        **config.version_info(),
+        "queue": queue_stats,
+        "breaker": breaker_stats,
+        "attention": {"open": attention.snapshot()["open"]},
+        "jobs_in_flight": len(JOBS),
+        "comfy_silent_for": round(watchdog.silence(), 1) if JOBS else None,
+        "settings": config.describe(),
+    }
+    return JSONResponse(payload, status_code=200 if not reasons else 503)
+
+
 @app.get("/api/config")
-def config():
+def browser_config():
     """Everything the browser needs that only the server knows.
+
+    Named `browser_config` rather than `config` because the module of that name
+    is imported here; the route path is unchanged. FastAPI never uses the
+    function name for routing, but Python does -- as a shadowed global it made
+    every later `config.env_int(...)` an AttributeError at import.
 
     `comfy_address` is here because COMFY_ADDRESS is server-side
     configuration -- ComfyUI may well be on a GPU box across the LAN, and
@@ -544,6 +762,7 @@ def config():
     can be sure is reachable from where it is sitting.
     """
     return JSONResponse({
+        **config.version_info(),
         "comfy_address": COMFY_ADDRESS,
         "base_negative_prompt": BASE_NEGATIVE_PROMPT,
         "brands": [b.to_dict() for b in BRANDS.values()],
@@ -579,6 +798,13 @@ async def start_batch(
     fifty-photo run is half an hour of GPU time, which is not an HTTP request.
     Poll GET /api/batch/{run_id} and download the zip when it reports finished.
     """
+    if not ACCEPTING.is_set():
+        # 503 before reading a single upload. A draining server that accepted
+        # fifty photographs and then dropped them would be worse than one that
+        # never took them, and it would write them to disk on the way.
+        raise HTTPException(
+            status_code=503,
+            detail="the server is shutting down and is not accepting new batches")
     if not files:
         raise HTTPException(status_code=400, detail="no files uploaded")
     if len(files) > MAX_BATCH_FILES:
@@ -837,6 +1063,12 @@ async def _on_job_accepted(job: job_queue.GenerationJob, prompt_id: str, seed: i
     if entry is None:
         # The session vanished and cleanup already ran; nothing to attach to.
         return
+    # The watchdog's clock starts here, not when the job was registered:
+    # waiting in *our* queue is bounded by admission control and reported to
+    # the client as a position, and timing that out would fail exactly the
+    # work the queue exists to hold. What has no bound until now is the time
+    # between ComfyUI accepting a prompt and saying anything about it again.
+    entry["accepted_at"] = time.monotonic()
     entry["provenance"] = {
         "kind": job.kind, "seed": seed, "checkpoint": CHECKPOINT_NAME,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -881,8 +1113,12 @@ async def _on_job_failed(job: job_queue.GenerationJob, exc: Exception):
 GENERATION_QUEUE = job_queue.InProcessJobQueue(
     on_accepted=_on_job_accepted,
     on_failed=_on_job_failed,
-    workers=int(os.environ.get("GENERATION_WORKERS", job_queue.DEFAULT_WORKERS)),
-    max_depth=int(os.environ.get("GENERATION_QUEUE_DEPTH", job_queue.DEFAULT_MAX_DEPTH)),
+    workers=config.env_int("GENERATION_WORKERS", job_queue.DEFAULT_WORKERS,
+                           "concurrent submitters in front of the serial GPU",
+                           minimum=1, maximum=32),
+    max_depth=config.env_int("GENERATION_QUEUE_DEPTH", job_queue.DEFAULT_MAX_DEPTH,
+                             "jobs allowed to wait before submission is refused",
+                             minimum=1, maximum=10000),
 )
 
 
@@ -907,6 +1143,12 @@ async def _queue_job(session_id: str, kind: str, submit, provenance: dict):
     # ComfyUI's /prompt honors a client-supplied prompt_id and echoes it back
     # unchanged (confirmed empirically), which is what lets job_id double as
     # the prompt_id here.
+    if not ACCEPTING.is_set():
+        await send_json_to(session_id, {
+            "type": "error",
+            "message": "the server is shutting down and is not taking new generations"})
+        return
+
     prompt_id = str(uuid.uuid4())
     JOBS[prompt_id] = {"session_id": session_id, "kind": kind, "provenance": None}
     job = job_queue.GenerationJob(

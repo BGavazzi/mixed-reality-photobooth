@@ -13,6 +13,8 @@ from PIL import Image
 
 from .base import GenerationBackend
 
+import config
+import obs
 import resilience
 import workflow_graph
 from workflow_graph import (
@@ -55,23 +57,34 @@ class ComfyBackend(GenerationBackend):
         self.workflow_path = Path(workflow_path)
         self.client_id = str(uuid.uuid4())
         self.retry_policy = retry_policy or resilience.RetryPolicy(
-            attempts=int(os.environ.get("COMFY_RETRY_ATTEMPTS", "4")),
-            budget_seconds=float(os.environ.get("COMFY_RETRY_BUDGET", "20")),
+            attempts=config.env_int(
+                "COMFY_RETRY_ATTEMPTS", 4, "how many times a failed ComfyUI call is retried",
+                minimum=1, maximum=20),
+            budget_seconds=config.env_float(
+                "COMFY_RETRY_BUDGET", 20.0, "wall-clock seconds the retry ladder may spend",
+                minimum=0.1, maximum=600),
         )
         # One breaker per backend instance, shared across every call type:
         # /upload/image failing and /prompt failing are the same news about the
         # same box, and counting them separately would triple the time it takes
         # to notice ComfyUI is gone.
         self.breaker = breaker if breaker is not None else resilience.CircuitBreaker(
-            failure_threshold=int(os.environ.get("COMFY_BREAKER_THRESHOLD", "5")),
-            recovery_seconds=float(os.environ.get("COMFY_BREAKER_RECOVERY", "30")),
+            failure_threshold=config.env_int(
+                "COMFY_BREAKER_THRESHOLD", 5, "consecutive failures before the breaker opens",
+                minimum=1, maximum=100),
+            recovery_seconds=config.env_float(
+                "COMFY_BREAKER_RECOVERY", 30.0, "seconds an open breaker waits before probing",
+                minimum=1, maximum=3600),
         )
 
     def _log_attempt(self, label: str):
         def log(attempt: int, exc: BaseException, delay: float | None):
-            verdict = resilience.classify(exc).value
-            tail = f"retrying in {delay:.1f}s" if delay is not None else "giving up"
-            print(f"[comfy] {label} attempt {attempt} failed ({verdict}): {exc!r} -- {tail}")
+            # Attributed to whichever photo is being submitted, without this
+            # module knowing that photos exist: the queue worker bound the id
+            # before calling in, and the context follows across the thread hop.
+            obs.log("comfy", "call failed", call=label, attempt=attempt,
+                    verdict=resilience.classify(exc).value, error=repr(exc),
+                    next=(f"retry in {delay:.1f}s" if delay is not None else "give up"))
         return log
 
     def _call(self, fn, *, label: str, reconcile=None):
@@ -139,7 +152,7 @@ class ComfyBackend(GenerationBackend):
                     if len(entry) > 1 and entry[1] == prompt_id:
                         return prompt_id
         except Exception as exc:              # noqa: BLE001 -- best effort by design
-            print(f"[comfy] could not reconcile prompt_id={prompt_id}: {exc!r}")
+            obs.log("comfy", "could not reconcile", prompt_id=prompt_id, error=repr(exc))
         return None
 
     def _get_history(self, prompt_id: str) -> dict:
@@ -247,7 +260,7 @@ class ComfyBackend(GenerationBackend):
         resolved.set_seed(seed)
 
         prompt_id = self._queue_prompt(resolved.workflow, client_id, prompt_id)
-        print(f"[comfy] queued prompt_id={prompt_id} text={prompt!r}")
+        obs.log("comfy", "queued", prompt_id=prompt_id, text=prompt)
         return prompt_id, seed
 
     def generate_image(self, prompt: str, timeout: float = 120.0) -> Image.Image:
@@ -283,7 +296,7 @@ class ComfyBackend(GenerationBackend):
         resolved.set_seed(int.from_bytes(uuid.uuid4().bytes[:6], "big"))
 
         prompt_id = self._queue_prompt(resolved.workflow)
-        print(f"[comfy] queued video prompt_id={prompt_id} text={prompt!r}")
+        obs.log("comfy", "queued video", prompt_id=prompt_id, text=prompt)
 
         def extract(item):
             if not item["filename"].lower().endswith(VIDEO_EXTENSIONS):
@@ -351,7 +364,7 @@ class ComfyBackend(GenerationBackend):
         resolved.set(SAMPLER, "denoise", denoise)
 
         prompt_id = self._queue_prompt(resolved.workflow, client_id, prompt_id)
-        print(f"[comfy] queued background prompt_id={prompt_id} text={prompt!r}")
+        obs.log("comfy", "queued background", prompt_id=prompt_id, text=prompt)
         return prompt_id, seed
 
     def generate_background(self, *args, timeout: float = 180.0, **kwargs) -> Image.Image:

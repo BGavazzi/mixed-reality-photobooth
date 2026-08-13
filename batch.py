@@ -60,6 +60,8 @@ from pathlib import Path
 
 from PIL import Image
 
+import config
+
 BATCH_ROOT = Path(__file__).parent / "batch_runs"
 
 # How long a finished run's files survive. Seven days is a working week: long
@@ -67,12 +69,22 @@ BATCH_ROOT = Path(__file__).parent / "batch_runs"
 # Monday, short enough that a booth is not quietly accumulating a season's
 # worth of strangers' faces. Overridable, because the right number is a
 # business decision -- but the default is a policy, not "forever".
-DEFAULT_RETAIN_DAYS = float(os.environ.get("BATCH_RETAIN_DAYS", "7"))
+#
+# Floored at zero rather than accepted as any number: a negative window means
+# "retention off" to sweep_expired, so `BATCH_RETAIN_DAYS=-1` -- a plausible
+# typo for "unset" -- used to silently disable the deletion of strangers'
+# photographs while looking configured. Switching retention off is a decision,
+# and it should be spelled `0`.
+DEFAULT_RETAIN_DAYS = config.env_float(
+    "BATCH_RETAIN_DAYS", 7.0, "days a finished batch run survives (0 = keep indefinitely)",
+    minimum=0, maximum=3650)
 
 # Keep the original uploads and the analysed copies. Off by default: the
 # pipeline does not need them past analysis, and they are the most sensitive
 # thing the app ever writes down.
-KEEP_INTERMEDIATES = os.environ.get("BATCH_KEEP_INTERMEDIATES", "").lower() in ("1", "true", "yes")
+KEEP_INTERMEDIATES = config.env_bool(
+    "BATCH_KEEP_INTERMEDIATES", False,
+    "keep original uploads and analysed copies for debugging")
 
 # Statuses an item moves through. Deliberately explicit rather than a bool:
 # "queued but not yet analyzed" and "analyzed, waiting on the GPU" look the
@@ -208,6 +220,11 @@ class BatchRun:
         """
         manifest = {
             "run_id": self.run_id,
+            # Which build made these frames. The kit revision was already here,
+            # which answers "what were the rules?" but not "what was the code?"
+            # -- and when a client asks in November why the September set looks
+            # different, those are different questions with different fixes.
+            "produced_by": config.version_info(),
             "brand_id": self.brand_id,
             "look_id": self.look_id,
             "look_label": self.look_label,

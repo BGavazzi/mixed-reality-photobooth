@@ -41,6 +41,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
+import obs
+
 # Beyond this many waiting jobs, submission is refused rather than accepted
 # and quietly starved. At ~35s per generation a depth of 64 is already a
 # 35-minute wait; anything past that is a promise the app can't keep.
@@ -141,7 +143,7 @@ class InProcessJobQueue(JobQueue):
         self._queue = asyncio.Queue()
         self._tasks = [asyncio.create_task(self._worker(i), name=f"jobqueue-worker-{i}")
                        for i in range(self._workers)]
-        print(f"[queue] started {self._workers} worker(s), max depth {self._max_depth}")
+        obs.log("queue", "started", workers=self._workers, max_depth=self._max_depth)
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -181,31 +183,42 @@ class InProcessJobQueue(JobQueue):
         while True:
             job = await self._queue.get()
             self._running += 1
-            try:
-                # The backend's submit is blocking HTTP (it uploads several
-                # PNGs), so it runs off the event loop -- otherwise a single
-                # upload would stall the ComfyUI relay and every other
-                # session's progress events with it.
-                prompt_id, seed = await self._run_blocking(job.submit, job.job_id)
-                self._submitted += 1
-                await self._on_accepted(job, prompt_id, seed)
-            except asyncio.CancelledError:
-                # Shutdown, not failure. Re-raised so the task actually ends;
-                # swallowing it here would make stop() hang forever.
-                raise
-            except Exception as exc:
-                self._failed += 1
-                # A worker that dies on a bad job takes the pool's capacity
-                # down with it and every later job waits forever. Report and
-                # keep serving.
-                print(f"[queue] worker {index} job {job.job_id} failed: {exc!r}")
+            # Everything this job touches logs under its id, including code
+            # that has never heard of a job -- the retry ladder inside the
+            # backend, for one. `asyncio.to_thread` copies the current context
+            # into the worker thread, so the attribution survives the hop off
+            # the event loop that the submit below depends on.
+            with obs.bind(job.job_id):
                 try:
-                    await self._on_failed(job, exc)
-                except Exception as callback_exc:
-                    print(f"[queue] failure callback itself raised: {callback_exc!r}")
-            finally:
-                self._running -= 1
-                self._queue.task_done()
+                    # The backend's submit is blocking HTTP (it uploads several
+                    # PNGs), so it runs off the event loop -- otherwise a single
+                    # upload would stall the ComfyUI relay and every other
+                    # session's progress events with it.
+                    started = time.monotonic()
+                    prompt_id, seed = await self._run_blocking(job.submit, job.job_id)
+                    self._submitted += 1
+                    obs.log("queue", "submitted to ComfyUI", worker=index, kind=job.kind,
+                            waited_s=round(job.waited, 2),
+                            submit_s=round(time.monotonic() - started, 2))
+                    await self._on_accepted(job, prompt_id, seed)
+                except asyncio.CancelledError:
+                    # Shutdown, not failure. Re-raised so the task actually ends;
+                    # swallowing it here would make stop() hang forever.
+                    raise
+                except Exception as exc:
+                    self._failed += 1
+                    # A worker that dies on a bad job takes the pool's capacity
+                    # down with it and every later job waits forever. Report and
+                    # keep serving.
+                    obs.log("queue", "job failed", worker=index, error=repr(exc))
+                    try:
+                        await self._on_failed(job, exc)
+                    except Exception as callback_exc:
+                        obs.log("queue", "failure callback itself raised",
+                                error=repr(callback_exc))
+                finally:
+                    self._running -= 1
+                    self._queue.task_done()
 
     # --- introspection -----------------------------------------------------
 

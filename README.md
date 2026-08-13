@@ -38,6 +38,7 @@ the original cutout goes back on top.
 - [When ComfyUI has a bad night](#when-comfyui-has-a-bad-night)
 - [The people in the photographs](#the-people-in-the-photographs)
 - [When something needs a person](#when-something-needs-a-person)
+- [Running it as a service](#running-it-as-a-service) · [runbook](RUNBOOK.md)
 - [Testing](#testing)
 - [Known limitations](#known-limitations)
 - [Also in this repo: the Resolume VJ bridge](docs/resolume-bridge.md)
@@ -56,6 +57,7 @@ Not "it calls an image API". The parts worth reading:
 | **A real queue seam** | Bounded worker pool with admission control in front of a serial GPU, behind an interface a Redis/Celery version could satisfy unchanged. [→](#the-queue) |
 | **Failure handling you can reproduce** | Retry that knows which failures are worth retrying and which are *ambiguous*, a circuit breaker, and a fake ComfyUI that fails on a seed so the whole thing is demonstrable. [→](#when-comfyui-has-a-bad-night) |
 | **A privacy posture, not a promise** | Consent recorded before the shutter (recorded, not enforced — a deliberate trade, argued below), the original photograph deleted the moment a cutout exists, and a retention sweep that runs whether or not anyone remembers. [→](#the-people-in-the-photographs) |
+| **Built to be operated** | A watchdog for the failure that sends no event, a shutdown that drains instead of cancelling, split liveness/readiness, one correlation id per photo, and a soak harness that produced real numbers. [→](#running-it-as-a-service) |
 | **Workflow roles resolved from the graph** | No hardcoded node IDs: `workflow_graph.py` walks the wiring to find the sampler, the encoders, the ControlNet. Re-export from ComfyUI and it still works. [→](#workflow-roles-instead-of-magic-node-ids) |
 | **Findings from real photos** | Four failures that a curated 1024×1024 test image never shows. [→](#real-photo-hardening) |
 
@@ -522,6 +524,113 @@ The mechanism is a dict; the value is in the criteria:
   itself the moment ComfyUI answers again, because an alert that outlives its
   problem is how an operator learns to distrust the panel.
 
+## Running it as a service
+
+Everything above is about the app working. This section is about the app being
+*operated* — the things that only matter once it is a process somebody else has
+to keep alive.
+
+### The failure that does not announce itself
+
+Every other failure here arrives as an event: an exception, an `execution_error`,
+a dropped socket. The one that doesn't is a job ComfyUI accepts and then never
+mentions again — the render OOMed, or the websocket reconnected during the one
+second carrying the `executed` event, or two processes shared a `clientId` and
+the events went to the other one. *That last one happened in this repo*, and the
+symptom was a browser on "queued…" forever while the GPU had long since finished
+the picture. Nothing noticed, because not receiving a message is not an event.
+
+So `watchdog.py` works on a timer, with two clocks:
+
+- **A total budget** per job (`JOB_MAX_SECONDS`, default 1800). A backstop, not
+  an SLA.
+- **A stall detector** (`JOB_STALL_SECONDS`, default 300) that reads the
+  *global* event stream, not the job's own. A photo sitting in ComfyUI's queue
+  behind forty others emits nothing for a long time and is perfectly healthy —
+  progress on somebody else's photo is evidence about yours. Only when the whole
+  relay goes silent are in-flight jobs suspect.
+
+And it **asks before declaring death**. An overdue job is most likely a *missed
+event*, so the sweep checks `/history` first and recovers the finished render
+through the same delivery path a normal completion uses. Failing a photo that
+actually succeeded would be worse than the bug being fixed, and it is the bug
+the naive version of a timeout ships with.
+
+### Shutdown drains, it doesn't cancel
+
+The old shutdown was `await GENERATION_QUEUE.stop()`, which cancels the workers:
+`docker stop` mid-batch lost a guest's photo and told nobody. `drain()` had been
+sitting on the queue interface the whole time with no caller.
+
+The boundary is deliberately *"queued work reaches ComfyUI"*, not *"every render
+finishes"* — once ComfyUI has the prompt it renders regardless of this process,
+and waiting for renders would mean a half-hour shutdown, which is how you teach
+someone to use `kill -9`. Bounded by `SHUTDOWN_DRAIN_SECONDS` (default 30), and
+past the deadline the stragglers are **failed loudly** rather than dropped.
+
+Measured on a live 12-photo batch: 2 photos reached ComfyUI during the drain, 8
+were failed at the deadline with a message, process gone at 30.8s.
+
+### Health, split in two
+
+- **`/healthz`** — is the process alive. Checks nothing else, on purpose: a
+  liveness probe that consults a dependency is a restart loop waiting for that
+  dependency to have a bad minute, and restarting *this* process while ComfyUI
+  is down destroys the queue and the attention list to fix nothing.
+- **`/readyz`** — should this instance be given work. Models warm, not draining,
+  breaker closed, queue not full. Every "no" comes with a reason, because a probe
+  that fails without saying why turns into somebody reading source at 2am.
+
+### One id, one photo, one grep
+
+`obs.py` puts the `prompt_id` — which this app generates itself and ComfyUI
+echoes back — into a context variable, so `grep 'job=a1b2c3d4'` returns that
+photo's admission, retry ladder, relay and compositor lines together. The
+context survives the hop into `asyncio.to_thread`, which is what lets the retry
+code log attributably without ever hearing about jobs. `BOOTH_LOG_FORMAT=json`
+for one object per line.
+
+### Settings that cannot be wrong quietly
+
+`config.py` declares every knob, validates it, and prints the effective values
+at boot with `*` on the overridden ones. This is not tidiness. `BATCH_RETAIN_DAYS=-1`
+— a plausible way to type "unset" — used to validate fine and silently mean
+*keep strangers' photographs forever*, because the sweep reads a non-positive
+window as "retention off". It is now refused, and switching retention off has to
+be spelled `0`.
+
+### Measured, not argued
+
+`soak.py` drives the real HTTP API against `chaos_comfy.py`, no GPU required.
+Two runs of 40 photos against the same process, two workers, fake renders at
+0.3s so the numbers are this app's behaviour rather than somebody's sampler:
+
+| measure | value |
+| --- | --- |
+| finished / failed | 40 / 0 |
+| seconds per photo | 12.7s (all of it this app's CPU analysis) |
+| RSS, first 40 photos | 9409 MB → 14692 MB (**+5283 MB**) |
+| RSS, next 40 on the same process | 14692 MB → 14797 MB (**+105 MB**) |
+| at saturation (150 submitted) | 66 accepted, 84 refused per-item with a reason |
+| readiness at saturation | 503, `the queue is full (64 waiting)` |
+
+The two memory rows are the point, and neither is legible alone. The first run
+looks like a 130 MB-per-photo leak; the second shows it is a plateau — model and
+allocator caches filling once, not growth per photo. **Budget ~16 GB of RAM**,
+and do not go looking for a leak that isn't there.
+
+Saturation behaves as designed: admission control refuses the excess *per item*
+with the reason written into the run manifest, rather than accepting work the
+machine cannot do, and readiness goes red so nothing else routes to it.
+
+```
+python chaos_comfy.py --port 8189 --render-seconds 0.3 --failure-rate 0
+COMFY_ADDRESS=127.0.0.1:8189 python web_server.py --port 8011
+python soak.py --server 127.0.0.1:8011 --photos 40      # pip install psutil for the RSS rows
+```
+
+See **[RUNBOOK.md](RUNBOOK.md)** for symptom → check → do.
+
 ### Workflow roles instead of magic node IDs
 
 Node IDs in an exported ComfyUI workflow are an implementation detail of the
@@ -608,23 +717,30 @@ pip install -r requirements-test.txt
 pytest
 ```
 
-291 tests covering the pure-logic parts of the pipeline (mask blob cleanup,
+347 tests covering the pure-logic parts of the pipeline (mask blob cleanup,
 illumination estimation, resolution capping, the ControlNet-strength heuristic,
 contact shadow geometry, cover-fit), brand-kit loading and enforcement, workflow
 role resolution, the queue's admission control and failure isolation, the retry
 ladder and circuit breaker, consent/retention/minimisation, the attention
-queue's escalation criteria, batch bookkeeping and result routing, provenance
-extraction, and multi-session job routing in `web_server.py` — the last driven
-against a fake backend, so cross-session-leak cases can be checked without a GPU
-in the loop. Runs in CI on Python 3.10 and 3.12
-(`.github/workflows/tests.yml`).
+queue's escalation criteria, the watchdog's two clocks and its recover-before-
+failing rule, settings validation, the shutdown drain, the health probes, batch
+bookkeeping and result routing, provenance extraction, and multi-session job
+routing in `web_server.py` — the last driven against a fake backend, so
+cross-session-leak cases can be checked without a GPU in the loop. Runs in CI on
+Python 3.10 and 3.12 (`.github/workflows/tests.yml`).
 
-Two details worth stealing. The breaker is tested against an **injected clock**,
-so "it reopens after exactly 30 seconds" is a claim the suite makes rather than
-a delay it waits out. And the chaos tests convert the TestClient's `httpx`
-responses back into `requests` ones — without that, `raise_for_status()` raises
-a type the classifier has never heard of, and the suite would cheerfully "prove"
-that a 503 is not retried.
+Three details worth stealing. The breaker is tested against an **injected
+clock**, so "it reopens after exactly 30 seconds" is a claim the suite makes
+rather than a delay it waits out. The chaos tests convert the TestClient's
+`httpx` responses back into `requests` ones — without that, `raise_for_status()`
+raises a type the classifier has never heard of, and the suite would cheerfully
+"prove" that a 503 is not retried.
+
+And the drain test deliberately uses a **slow** submit. The first version used
+an instant one, so every job finished before the drain was even reached and the
+test passed whether or not the drain did anything — it would have gone green
+against the exact bug it was written to catch. Removing the drain now fails
+three tests; that was checked by removing it.
 
 **2. End-to-end verification** — needs the real stack running.
 
@@ -676,8 +792,9 @@ stale.
   `InProcessJobQueue` is an `asyncio.Queue`; restarting the server loses both.
   They're deliberately small and serialisable so the move to Redis or a table is
   cheap, and the `JobQueue` interface is already the seam for it — but that move
-  hasn't been made. The retention sweep covers the resulting orphans on disk;
-  the in-flight *work* is still lost.
+  hasn't been made. The retention sweep covers the resulting orphans on disk,
+  and shutdown now drains rather than cancels — but a *crash* still loses
+  in-flight work, and no amount of graceful shutdown helps with a crash.
 - The attention queue is in memory too, so a restart clears it. Acceptable for
   now because its items are transient by nature and the underlying conditions
   re-raise themselves, but it means it is not an audit log and shouldn't be
@@ -689,6 +806,17 @@ stale.
   Nothing here reaches the exposures that matter most at a live event — the
   operator's screenshot, the camera roll on the capture device, the SD card —
   and the manifest is a record, not a control.
+- **Budget ~16 GB of RAM.** Measured, not guessed: 9.4 GB once the CPU models
+  are warm, rising to a ~15 GB plateau under load (see the soak table). It is a
+  plateau and not a leak — the second 40 photos added 105 MB — but the first
+  number is what the box has to have.
+- The soak numbers come from a *fake* ComfyUI, so they measure this app's
+  overhead and admission behaviour and say nothing about GPU throughput. That is
+  deliberate, but it means "12.7s per photo" is a CPU-analysis figure and a real
+  run is dominated by the sampler instead.
+- The watchdog can only recover a render that ComfyUI still has in `/history`.
+  If ComfyUI is restarted, the history goes with it and those jobs are failed —
+  correctly, but the picture is genuinely gone.
 - The illumination estimate is classic CV (per-quadrant luminance, highlight
   color, contrast), not a learned model — a useful heuristic for
   prompt-grounding, not a physically accurate light probe.
