@@ -127,9 +127,12 @@ class BatchRun:
     look_id: str | None
     look_label: str | None
     items: list[BatchItem]
-    # Who said these photographs could be processed, and on what basis. Not
-    # optional and not free text: see consent.py for why the app refuses to
-    # start a run without it.
+    # Who said these photographs could be processed, and on what basis. Never
+    # free text, and always present: a run where nobody declared anything is
+    # recorded as `not_recorded` rather than left blank, so a later reader can
+    # tell "nobody said" apart from "the field did not exist yet". Whether an
+    # empty declaration blocks the run is consent.REQUIRED, off by default --
+    # see consent.py for that argument.
     consent: dict = field(default_factory=dict)
     retain_days: float = DEFAULT_RETAIN_DAYS
     created_at: float = field(default_factory=time.time)

@@ -231,9 +231,10 @@ def client(monkeypatch):
 
 def post_batch(client, count=2, **fields):
     files = [("files", (f"photo{i}.png", png_bytes(), "image/png")) for i in range(count)]
-    # Consent is required by the endpoint (see consent.py and
-    # tests/test_privacy.py, which is where its enforcement is tested). Supplied
-    # here so these tests stay about batching.
+    # Consent is optional at the endpoint by default (see consent.py, and
+    # tests/test_privacy.py where both modes are tested). Declared here anyway,
+    # honestly -- these are synthetic images, which is exactly what
+    # `internal_test` means -- so that these tests stay about batching.
     data = {"prompt": "a rooftop", "consent_basis": "internal_test",
             "consent_by": "test suite", **fields}
     return client.post("/api/batch", files=files, data=data)

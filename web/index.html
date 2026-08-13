@@ -176,16 +176,16 @@
       <h2>Batch</h2>
       <div class="hint" style="margin-top:0">Many photos, one approved look. Uses the brand kit selected on the right -- with a locked seed, the whole set renders as one campaign instead of one image per guest. Runs server-side, so it survives closing this tab.</div>
 
-      <!-- The consent gate. The server rejects a batch without this (see
-           consent.py), so the page could omit it entirely and simply show the
-           400 -- but an operator who is about to photograph strangers should
-           be asked before selecting the files, not after. The button stays
-           disabled until both fields are filled: the aim is a deliberate
-           declaration, not a dismissed dialog. -->
+      <!-- The consent record. Optional by default (see consent.py): whatever
+           is declared here is written into the run's manifest and travels with
+           the images, but an empty form does not block the picker. The server
+           is the authority on that -- `consent_required` in /api/config -- so
+           a booth started with --require-consent gets the blocking version of
+           this same form without a second code path. -->
       <div style="margin-top:12px;padding:10px;border:1px solid var(--line);border-radius:6px">
-        <label class="hint" style="margin:0 0 4px;display:block">Consent basis (required)</label>
+        <label class="hint" style="margin:0 0 4px;display:block" id="consentLabel">Consent basis</label>
         <select id="consentBasis" style="width:100%">
-          <option value="">— pick how consent was obtained —</option>
+          <option value="">— not recorded —</option>
         </select>
         <div class="hint" id="consentDescription" style="margin:6px 0 0"></div>
         <input type="text" id="consentBy" placeholder="Recorded by (your name)"
@@ -1491,9 +1491,14 @@ function renderBrandViolations() {
 let batchRunId = null;
 let batchPoll = null;
 
-// --- the consent gate ---------------------------------------------------------
+// --- the consent record -------------------------------------------------------
 // The options come from /api/config rather than being written here, so the list
 // the operator picks from and the list the server accepts cannot drift apart.
+// So does `consent_required`: whether this blocks is the server's decision, and
+// a page that guessed would either lock out a test run or let a strict booth
+// upload fifty photos before showing the 400.
+
+let consentRequired = false;
 
 function populateConsent(config) {
   const select = document.getElementById('consentBasis');
@@ -1504,6 +1509,13 @@ function populateConsent(config) {
     option.dataset.description = basis.description;
     select.appendChild(option);
   }
+  consentRequired = !!config.consent_required;
+  select.options[0].textContent = consentRequired
+    ? '— pick how consent was obtained —'
+    : '— not recorded —';
+  document.getElementById('consentLabel').textContent = consentRequired
+    ? 'Consent basis (required)'
+    : 'Consent basis (optional — recorded in the manifest)';
   const retention = config.retention || {};
   document.getElementById('retentionNote').textContent = retention.retain_days
     ? `Photos and frames are deleted after ${retention.retain_days} day(s).`
@@ -1518,11 +1530,23 @@ function refreshConsentGate() {
   const select = document.getElementById('consentBasis');
   const by = document.getElementById('consentBy').value.trim();
   const chosen = select.selectedOptions[0];
-  document.getElementById('consentDescription').textContent =
-    chosen && chosen.dataset.description ? chosen.dataset.description : '';
-  // Both fields, not just the dropdown: a record with nobody's name on it
-  // cannot be followed up when a guest later asks to be deleted.
-  document.getElementById('btnBatchPick').disabled = !(select.value && by);
+  const complete = !!(select.value && by);
+  const empty = !select.value && !by;
+
+  let description = chosen && chosen.dataset.description ? chosen.dataset.description : '';
+  // Half-filled is refused in both modes, because a basis with nobody's name on
+  // it reads as a record and cannot be followed up when a guest later asks to
+  // be deleted. Said here rather than left to the server's 400, so the operator
+  // finds out before selecting fifty files.
+  if (!complete && !empty) {
+    description = select.value
+      ? 'Name who recorded this, or clear the basis to run without a record.'
+      : 'Pick a basis, or clear the name to run without a record.';
+  }
+  document.getElementById('consentDescription').textContent = description;
+
+  document.getElementById('btnBatchPick').disabled =
+    consentRequired ? !complete : !(complete || empty);
 }
 
 document.getElementById('consentBasis').onchange = refreshConsentGate;

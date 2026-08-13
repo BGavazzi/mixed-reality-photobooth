@@ -551,6 +551,11 @@ def config():
         # Served rather than duplicated in the page, so the list an operator
         # picks from and the list the server accepts cannot drift apart.
         "consent_bases": consent.options(),
+        # Off by default. The page uses this to decide whether the consent
+        # fields block the file picker or merely offer to record something;
+        # both states are the same form, so an operator who wants the record
+        # never has to be told about a flag.
+        "consent_required": consent.REQUIRED,
         "retention": {"retain_days": batch.DEFAULT_RETAIN_DAYS,
                       "keep_intermediates": batch.KEEP_INTERMEDIATES},
     })
@@ -582,8 +587,10 @@ async def start_batch(
             detail=f"{len(files)} photos; the limit is {MAX_BATCH_FILES} per run")
 
     # Checked before a single byte is written. A run that is going to be
-    # rejected for having no consent basis should not first spend thirty
-    # seconds putting fifty photographs of strangers on disk.
+    # rejected for a half-filled consent form should not first spend thirty
+    # seconds putting fifty photographs of strangers on disk. With the gate off
+    # (the default) an empty declaration is recorded as `not_recorded` and the
+    # run proceeds -- see consent.py for why that default is what it is.
     try:
         consent_record = consent.parse(consent_basis, consent_by, consent_note)
     except consent.ConsentError as exc:
@@ -1086,6 +1093,11 @@ def main():
                         help="keep the original uploads and analysed copies for "
                              "debugging; off by default because they are the most "
                              "sensitive thing this app writes down")
+    parser.add_argument("--require-consent", action="store_true",
+                        help="refuse a batch that declares no consent basis. Off "
+                             "by default -- the fields are still there and still "
+                             "written to the manifest, they just do not block "
+                             "(see consent.py for the reasoning)")
     args = parser.parse_args()
 
     if args.retain_days is not None:
@@ -1093,6 +1105,11 @@ def main():
     if args.keep_intermediates:
         batch.KEEP_INTERMEDIATES = True
         print("[batch] --keep-intermediates: original photographs will be retained")
+    if args.require_consent:
+        consent.REQUIRED = True
+    print(f"[consent] declaration is "
+          f"{'required' if consent.REQUIRED else 'optional (--require-consent to enforce)'}"
+          f"; runs without one are recorded as '{consent.NOT_RECORDED}'")
 
     uvicorn.run(app, host=args.host, port=args.port)
 

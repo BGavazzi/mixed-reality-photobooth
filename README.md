@@ -55,7 +55,7 @@ Not "it calls an image API". The parts worth reading:
 | **A locked seed makes a set** | 200 guests used to mean 200 unrelated images. A seed derived from (brand, look) makes them one campaign. [→](#batch-mode--many-photos-one-approved-look) |
 | **A real queue seam** | Bounded worker pool with admission control in front of a serial GPU, behind an interface a Redis/Celery version could satisfy unchanged. [→](#the-queue) |
 | **Failure handling you can reproduce** | Retry that knows which failures are worth retrying and which are *ambiguous*, a circuit breaker, and a fake ComfyUI that fails on a seed so the whole thing is demonstrable. [→](#when-comfyui-has-a-bad-night) |
-| **A privacy posture, not a promise** | Consent recorded before the shutter, the original photograph deleted the moment a cutout exists, and a retention sweep that runs whether or not anyone remembers. [→](#the-people-in-the-photographs) |
+| **A privacy posture, not a promise** | Consent recorded before the shutter (recorded, not enforced — a deliberate trade, argued below), the original photograph deleted the moment a cutout exists, and a retention sweep that runs whether or not anyone remembers. [→](#the-people-in-the-photographs) |
 | **Workflow roles resolved from the graph** | No hardcoded node IDs: `workflow_graph.py` walks the wiring to find the sampler, the encoders, the ControlNet. Re-export from ComfyUI and it still works. [→](#workflow-roles-instead-of-magic-node-ids) |
 | **Findings from real photos** | Four failures that a curated 1024×1024 test image never shows. [→](#real-photo-hardening) |
 
@@ -255,9 +255,10 @@ python batch_cli.py photos/ --brand aurora --look coastline -o shoot.zip \
     --consent guest_verbal --consent-by "your name"
 ```
 
-The consent flags are not optional and the CLI does not default them — a client
-that quietly supplied `internal_test` for anyone who forgot would turn a
-deliberate declaration into a formality.
+The consent flags are optional (see below) but never defaulted — a client that
+quietly supplied `internal_test` for anyone who forgot would put a claim in the
+manifest that nobody made. Omit them and the run is recorded as `not_recorded`;
+supply half of them and it is refused.
 
 The CLI is a *client* of `POST /api/batch`, not a second implementation, so
 there is one code path through the queue, the brand kit and the compositor. It
@@ -284,8 +285,9 @@ Design decisions worth knowing:
   status, plus the consent basis and retention window. It's the artifact a
   brand-safety reviewer actually gets handed. It's rewritten as the run goes, so
   an interrupted batch still leaves a usable record.
-- A run **requires a consent basis** and expires on a retention clock; the
-  uploaded photographs are deleted as soon as their cutouts exist. See
+- A run **records a consent basis** (optional by default, `--require-consent` to
+  make it blocking) and expires on a retention clock; the uploaded photographs
+  are deleted as soon as their cutouts exist. See
   [The people in the photographs](#the-people-in-the-photographs).
 
 ## Architecture
@@ -441,14 +443,34 @@ This app points a camera at members of the public. Until recently the only thing
 it recorded about a person was the seed used to regenerate the wall behind
 them — excellent provenance for the image, none at all for the human in it.
 
-**Consent is captured before the shutter and enforced on the server.** The batch
-endpoint refuses a run with no basis attached, and the basis is a closed set
-(`guest_verbal`, `guest_signed`, `event_notice`, `internal_test`) rather than
-free text, because "consent: yes" in a text field records that somebody typed
-something. It must also name a person, not a checkbox — a record with nobody's
-name on it cannot be followed up when a guest later asks to be deleted. This is
-the brand kit's argument applied to something that matters more: a guarantee the
-client assembles is one a stale client can drop.
+**Consent is captured before the shutter, and recorded rather than enforced.**
+The batch form asks for a basis from a closed set (`guest_verbal`,
+`guest_signed`, `event_notice`, `internal_test`) rather than free text, because
+"consent: yes" in a text field records that somebody typed something. Whatever
+is declared travels into the run's `manifest.json`; a run that declares nothing
+is written down as `not_recorded`, which is a different statement from an empty
+field and reads as one months later.
+
+**It does not block, and that is a deliberate trade — flagged here rather than
+buried in a default.** The gate started out mandatory and is now opt-in
+(`--require-consent`, or `BOOTH_REQUIRE_CONSENT=1`; the strict path is unchanged
+and still tested). Two reasons. The small one is usability: a blocking two-field
+form in front of every test run is friction that gets routed around, and a
+control people route around is worse than one that asks politely. The larger one
+is honesty about what this layer can reach. An app that refuses a batch has done
+nothing about the operator's screenshot, the camera roll on the device that took
+the photograph, the projector throwing the output at a wall, or the SD card in
+somebody's bag — and at a live event those are usually the unhandled ones. If
+they are, a server-side form field is a record of intent, not a boundary, and
+treating it as a boundary lets everyone stop thinking exactly where the real
+exposure starts.
+
+What survives that argument is the part that was always doing the work: the
+record travelling with the images, so that months later "what were these people
+told?" has an answer that isn't somebody's memory. That needs no gate. One case
+is still refused in both modes — a half-filled form, because a basis with
+nobody's name on it looks like a record and cannot be followed up when a guest
+asks to be deleted.
 
 **The original photograph is deleted as soon as a cutout exists.** Nothing
 downstream reads it again — the compositor needs the cutout, not the photograph.
@@ -466,8 +488,9 @@ actually gets handed.
 
 None of this makes the app compliant with anything, and it is not legal advice.
 Consent is a conversation between an operator and a guest that no code can have.
-What the code can do is make its absence blocking rather than silent, and make
-the record travel with the photographs.
+What the code can do is keep the record with the photographs, delete what it
+does not need, and be clear about which of its controls are boundaries and which
+are only paperwork.
 
 ## When something needs a person
 
@@ -659,10 +682,13 @@ stale.
   now because its items are transient by nature and the underlying conditions
   re-raise themselves, but it means it is not an audit log and shouldn't be
   mistaken for one.
-- Consent is recorded per **batch run**, not per person. A run is one operator's
-  declaration covering the photos in it, which fits how a booth actually
-  operates but would not survive a per-subject deletion request without
-  matching people to filenames by hand.
+- Consent is recorded per **batch run**, not per person, and by default is not
+  enforced at all. A run is one operator's declaration covering the photos in
+  it, which fits how a booth actually operates but would not survive a
+  per-subject deletion request without matching people to filenames by hand.
+  Nothing here reaches the exposures that matter most at a live event — the
+  operator's screenshot, the camera roll on the capture device, the SD card —
+  and the manifest is a record, not a control.
 - The illumination estimate is classic CV (per-quadrant luminance, highlight
   color, contrast), not a learned model — a useful heuristic for
   prompt-grounding, not a physically accurate light probe.

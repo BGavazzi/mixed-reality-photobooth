@@ -110,10 +110,13 @@ def main():
     parser.add_argument("--prompt", help="extra direction, added to the approved look")
     parser.add_argument("--controlnet-strength", type=float, default=0.75)
     parser.add_argument("--denoise", type=float, default=0.85)
-    # Required by the server, not defaulted here. A CLI that quietly supplied
+    # Never defaulted here, in either mode. A CLI that quietly supplied
     # "internal_test" for anyone who forgot the flag would turn a deliberate
     # declaration into a formality, which is the failure mode this is meant to
-    # prevent. See consent.py; `GET /api/config` lists the accepted bases.
+    # prevent -- and it would put a claim in the manifest that nobody made. Omit
+    # them and the run is recorded as `not_recorded`, unless the server was
+    # started with --require-consent, which refuses it. See consent.py;
+    # `GET /api/config` lists the accepted bases and whether they are enforced.
     parser.add_argument("--consent", help="consent basis (see /api/config for the list)")
     parser.add_argument("--consent-by", help="who recorded that consent")
     parser.add_argument("--consent-note", default="", help="optional free-text detail")

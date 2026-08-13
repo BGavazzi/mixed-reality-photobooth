@@ -35,10 +35,47 @@ def clean(tmp_path, monkeypatch):
 
 # --- consent -------------------------------------------------------------------
 
-def test_a_run_without_a_consent_basis_is_refused_with_the_options():
+def test_by_default_a_run_that_declares_nothing_is_allowed_and_says_so():
+    """The gate is opt-in (see consent.py). What it must not do when it is off
+    is leave the field blank: "nobody recorded this" and "this manifest predates
+    the field" have to read differently to whoever opens it later."""
+    record = consent.parse("", "")
+
+    assert record.basis == consent.NOT_RECORDED
+    assert record.recorded is False
+    assert record.to_dict()["description"], \
+        "an absent record still needs to explain itself in the manifest"
+
+
+def test_with_enforcement_on_an_empty_declaration_is_refused_with_the_options():
     with pytest.raises(consent.ConsentError) as err:
-        consent.parse("", "Bernardo")
+        consent.parse("", "", required=True)
     assert "guest_verbal" in str(err.value), "the error should name what to pass"
+
+
+def test_a_half_filled_declaration_is_refused_even_with_the_gate_off():
+    """The one case worth refusing in both modes: a basis with nobody's name on
+    it looks like a record and cannot be followed up, and a name with no basis
+    records nothing at all."""
+    with pytest.raises(consent.ConsentError):
+        consent.parse("guest_verbal", "", required=False)
+    with pytest.raises(consent.ConsentError):
+        consent.parse("", "Bernardo", required=False)
+
+
+def test_the_module_default_is_what_the_flag_says():
+    """`required=None` reads consent.REQUIRED at call time, so flipping the
+    flag at startup changes every caller rather than the ones that remembered
+    to pass it."""
+    original = consent.REQUIRED
+    try:
+        consent.REQUIRED = True
+        with pytest.raises(consent.ConsentError):
+            consent.parse("", "")
+        consent.REQUIRED = False
+        assert consent.parse("", "").basis == consent.NOT_RECORDED
+    finally:
+        consent.REQUIRED = original
 
 
 def test_an_invented_basis_is_refused():
@@ -250,11 +287,29 @@ def post_batch(client, **fields):
     return client.post("/api/batch", files=files, data=data)
 
 
-def test_the_api_refuses_a_batch_with_no_consent(client):
+def test_the_api_refuses_a_half_filled_consent_form(client):
     resp = post_batch(client, consent_basis="")
 
     assert resp.status_code == 400
     assert "consent" in resp.json()["detail"].lower()
+    assert batch.RUNS == {}, "nothing should have been written to disk"
+
+
+def test_the_api_accepts_a_batch_with_no_consent_declaration(client):
+    """The default. The run is not blocked, and the manifest says plainly that
+    nothing was declared rather than implying something was."""
+    resp = post_batch(client, consent_basis="", consent_by="")
+
+    assert resp.status_code == 202
+    assert resp.json()["consent"]["basis"] == consent.NOT_RECORDED
+
+
+def test_the_api_refuses_an_empty_declaration_when_enforcement_is_on(client, monkeypatch):
+    monkeypatch.setattr(consent, "REQUIRED", True)
+
+    resp = post_batch(client, consent_basis="", consent_by="")
+
+    assert resp.status_code == 400
     assert batch.RUNS == {}, "nothing should have been written to disk"
 
 
@@ -279,4 +334,8 @@ def test_config_advertises_the_consent_bases_and_retention(client):
     config = client.get("/api/config").json()
 
     assert {o["id"] for o in config["consent_bases"]} == set(consent.BASES)
+    assert consent.NOT_RECORDED not in {o["id"] for o in config["consent_bases"]}, \
+        "the absence of a basis is not a basis an operator can pick"
+    assert config["consent_required"] is consent.REQUIRED, \
+        "whether the form blocks is the server's call, not the page's guess"
     assert config["retention"]["retain_days"] == batch.DEFAULT_RETAIN_DAYS
