@@ -38,9 +38,12 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, W
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+import attention
 import batch
 import brand_kit
+import consent
 import job_queue
+import resilience
 import workflow_graph
 from backends.comfy import ComfyBackend, DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH
 from brand_kit import BrandKitError
@@ -189,12 +192,38 @@ def _warm_up_pipeline_models():
                   f"first real upload may hit this instead")
 
 
+async def retention_loop(interval_seconds: float = 3600):
+    """Expires old batch runs, hourly.
+
+    The startup sweep matters more than the loop: a booth that crashed
+    mid-evening leaves a directory of photographs that nothing in the app
+    remembers, so nothing would ever delete them. An hourly tick then keeps a
+    long-running instance honest without waiting for a restart.
+    """
+    while True:
+        try:
+            await asyncio.to_thread(batch.sweep_expired)
+        except Exception as exc:                    # noqa: BLE001
+            # A failing sweep must not take the server down, but it must be
+            # noticed: silently retaining faces is exactly the failure this
+            # whole feature exists to prevent.
+            print(f"[batch] retention sweep failed: {exc!r}")
+            attention.raise_item(
+                attention.DEPENDENCY_DOWN, "retention sweep is failing",
+                detail=f"{exc!r} -- batch photos may be retained past their expiry")
+        await asyncio.sleep(interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[warmup] loading rotoscope/pose/depth models...")
     await asyncio.to_thread(_warm_up_pipeline_models)
     print("[warmup] done")
+    swept = await asyncio.to_thread(batch.sweep_expired)
+    print(f"[batch] retention: {batch.DEFAULT_RETAIN_DAYS:g} day(s), "
+          f"{len(swept)} expired run(s) removed at startup")
     await GENERATION_QUEUE.start()
+    asyncio.create_task(retention_loop())
     asyncio.create_task(comfy_relay_loop())
     threading.Thread(
         target=spout_sender_loop,
@@ -414,8 +443,19 @@ async def _report_job_error(job: dict, prompt_id: str, message: str):
             run.set_status(item, batch.FAILED, message)
             run.write_manifest()
             print(f"[batch] {run_id} item {item.stem} failed: {message}")
+            # Summary deliberately excludes the item, so fifty photos failing
+            # against one dead ComfyUI merge into one line with a count of
+            # fifty instead of burying the panel.
+            attention.raise_item(
+                attention.BATCH_ITEM_FAILED,
+                f"batch run {run_id}: photo(s) failed to generate",
+                detail=message, run_id=run_id, last_item=item.filename)
         return
     await send_json_to(job["session_id"], {"type": "error", "message": message})
+    attention.raise_item(
+        attention.GENERATION_FAILED,
+        "a guest's generation failed after retries",
+        detail=message, prompt_id=prompt_id, job_kind=job.get("kind"))
 
 
 def _finish_batch_item(job: dict, prompt_id: str, image: Image.Image):
@@ -458,12 +498,19 @@ def _batch_submit(run: batch.BatchRun, item: batch.BatchItem, composed, settings
     result = photoshoot_pipeline.analyze(image)
 
     # Persisted rather than kept in memory: fifty subjects' worth of decoded
-    # images waiting on a serial GPU is how a long batch becomes an OOM, and
-    # these are worth having when a client asks why one frame looks wrong.
+    # images waiting on a serial GPU is how a long batch becomes an OOM.
     result["cutout"].save(run.path_for("cutout", item))
-    result["image"].save(run.path_for("analyzed", item))
+    if batch.KEEP_INTERMEDIATES:
+        result["image"].save(run.path_for("analyzed", item))
 
     run.set_status(item, batch.GENERATING)
+    # The generation is conditioned on the analysed image, but that copy stays
+    # in this worker's memory for the length of the call -- it does not need to
+    # exist on disk, and neither does the original photograph now that a cutout
+    # exists. Deleted here rather than at the end of the run because the window
+    # in which the app holds a stranger's full photograph is the thing being
+    # minimised, and a fifty-photo batch runs for half an hour.
+    run.drop_original(item)
     return backend.queue_background_generation(
         result["image"],
         ImageOps.invert(result["mask"].convert("L")),
@@ -501,6 +548,11 @@ def config():
         "base_negative_prompt": BASE_NEGATIVE_PROMPT,
         "brands": [b.to_dict() for b in BRANDS.values()],
         "queue": GENERATION_QUEUE.stats(),
+        # Served rather than duplicated in the page, so the list an operator
+        # picks from and the list the server accepts cannot drift apart.
+        "consent_bases": consent.options(),
+        "retention": {"retain_days": batch.DEFAULT_RETAIN_DAYS,
+                      "keep_intermediates": batch.KEEP_INTERMEDIATES},
     })
 
 
@@ -512,6 +564,9 @@ async def start_batch(
     prompt: str = Form(""),
     controlnet_strength: float = Form(0.75),
     denoise: float = Form(0.85),
+    consent_basis: str = Form(""),
+    consent_by: str = Form(""),
+    consent_note: str = Form(""),
 ):
     """Starts a batch: N photos, one approved look, one consistent set.
 
@@ -526,6 +581,14 @@ async def start_batch(
             status_code=413,
             detail=f"{len(files)} photos; the limit is {MAX_BATCH_FILES} per run")
 
+    # Checked before a single byte is written. A run that is going to be
+    # rejected for having no consent basis should not first spend thirty
+    # seconds putting fifty photographs of strangers on disk.
+    try:
+        consent_record = consent.parse(consent_basis, consent_by, consent_note)
+    except consent.ConsentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
         composed = _compose_for_request({"brand_id": brand_id, "look_id": look_id, "prompt": prompt})
     except BrandKitError as exc:
@@ -536,7 +599,8 @@ async def start_batch(
             detail="nothing to generate: pick an approved look or supply a scene prompt")
 
     run = batch.create_run([f.filename or f"photo_{i}" for i, f in enumerate(files)],
-                           composed.brand_id, composed.look_id, composed.look_label)
+                           composed.brand_id, composed.look_id, composed.look_label,
+                           consent=consent_record.to_dict())
 
     # Uploads are read and written to disk here, in the request, because the
     # UploadFile objects are only valid for its lifetime -- a queue worker
@@ -631,9 +695,36 @@ def batch_delete(run_id: str):
 
 @app.get("/api/queue")
 def queue_stats():
-    """Live queue depth. Separate from /api/config -- config is read once at
-    page load, this is the bit that changes, and a batch run polls it."""
-    return JSONResponse(GENERATION_QUEUE.stats())
+    """Live queue depth and dependency health. Separate from /api/config --
+    config is read once at page load, this is the bit that changes, and a
+    batch run polls it.
+
+    The breaker's state is here rather than in its own endpoint because "is
+    there a queue?" and "is ComfyUI answering?" are the same question from the
+    operator's side: both explain why nothing is coming out.
+    """
+    stats = GENERATION_QUEUE.stats()
+    breaker = getattr(backend, "breaker", None)
+    if breaker is not None:
+        stats["comfyui"] = breaker.stats()
+    return JSONResponse(stats)
+
+
+@app.get("/api/attention")
+def attention_queue():
+    """What currently needs a person. Polled by the header badge."""
+    return JSONResponse(attention.snapshot())
+
+
+@app.post("/api/attention/{item_id}/resolve")
+def attention_resolve(item_id: int, by: str = Form("operator")):
+    """Marks one item handled. Deliberately one at a time and attributed:
+    resolving is a record of who looked at what, and a "clear all" button is
+    how that record stops existing."""
+    item = attention.resolve(item_id, by=by)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"no open attention item {item_id}")
+    return JSONResponse(item.to_dict())
 
 
 @app.get("/api/brands/{brand_id}/logo")
@@ -729,6 +820,12 @@ async def _on_job_accepted(job: job_queue.GenerationJob, prompt_id: str, seed: i
     """A worker got the job into ComfyUI. Attach provenance and tell the
     browser it is really queued -- not when it was *submitted to us*, which
     is what the client used to be told."""
+    # ComfyUI just answered, so any standing "it is unreachable" alert is
+    # stale. Closing it here rather than waiting for an operator keeps the
+    # panel trustworthy: an alert that outlives its problem is how people
+    # learn to ignore the panel entirely.
+    attention.resolve_kind(attention.DEPENDENCY_DOWN, by="recovered")
+
     entry = JOBS.get(prompt_id)
     if entry is None:
         # The session vanished and cleanup already ran; nothing to attach to.
@@ -749,8 +846,29 @@ async def _on_job_failed(job: job_queue.GenerationJob, exc: Exception):
     there for the life of the process while the browser waits on a `done`
     that can never arrive."""
     JOBS.pop(job.job_id, None)
-    await send_json_to(job.session_id, {
-        "type": "error", "message": f"failed to queue generation: {exc}"})
+
+    # An open breaker is a different sentence to a guest than one bad render:
+    # it means the booth is down, not that their photo was unlucky, and it is
+    # the case where an operator can actually do something.
+    if isinstance(exc, resilience.CircuitOpenError):
+        message = ("the render service is not responding — an operator has been "
+                   "alerted, your photo is safe")
+        attention.raise_item(
+            attention.DEPENDENCY_DOWN, "ComfyUI is not responding",
+            detail=str(exc), breaker=getattr(backend, "breaker", None)
+            and backend.breaker.stats())
+    else:
+        message = f"failed to queue generation: {exc}"
+        attention.raise_item(
+            attention.GENERATION_FAILED, "a generation could not be queued",
+            detail=str(exc), job_kind=job.kind)
+
+    await send_json_to(job.session_id, {"type": "error", "message": message})
+    if job.session_id.startswith("batch:"):
+        # A batch job has no socket to receive that message, so without this
+        # its item would sit in GENERATING until the run was deleted.
+        await _report_job_error({"batch_run_id": job.session_id.split(":", 1)[1],
+                                 "session_id": job.session_id}, job.job_id, message)
 
 
 GENERATION_QUEUE = job_queue.InProcessJobQueue(
@@ -961,7 +1079,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--retain-days", type=float, default=None,
+                        help="how long batch photos survive (0 = keep indefinitely, "
+                             f"default {batch.DEFAULT_RETAIN_DAYS:g})")
+    parser.add_argument("--keep-intermediates", action="store_true",
+                        help="keep the original uploads and analysed copies for "
+                             "debugging; off by default because they are the most "
+                             "sensitive thing this app writes down")
     args = parser.parse_args()
+
+    if args.retain_days is not None:
+        batch.DEFAULT_RETAIN_DAYS = args.retain_days
+    if args.keep_intermediates:
+        batch.KEEP_INTERMEDIATES = True
+        print("[batch] --keep-intermediates: original photographs will be retained")
+
     uvicorn.run(app, host=args.host, port=args.port)
 
 

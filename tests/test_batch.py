@@ -231,7 +231,12 @@ def client(monkeypatch):
 
 def post_batch(client, count=2, **fields):
     files = [("files", (f"photo{i}.png", png_bytes(), "image/png")) for i in range(count)]
-    return client.post("/api/batch", files=files, data={"prompt": "a rooftop", **fields})
+    # Consent is required by the endpoint (see consent.py and
+    # tests/test_privacy.py, which is where its enforcement is tested). Supplied
+    # here so these tests stay about batching.
+    data = {"prompt": "a rooftop", "consent_basis": "internal_test",
+            "consent_by": "test suite", **fields}
+    return client.post("/api/batch", files=files, data=data)
 
 
 def test_a_batch_is_accepted_and_reports_a_run_id(client):
@@ -250,7 +255,9 @@ def test_an_unreadable_file_fails_its_own_item_not_the_run(client):
         ("files", ("good.png", png_bytes(), "image/png")),
         ("files", ("notaphoto.txt", b"this is not an image at all", "image/png")),
     ]
-    resp = client.post("/api/batch", files=files, data={"prompt": "x"})
+    resp = client.post("/api/batch", files=files,
+                       data={"prompt": "x", "consent_basis": "internal_test",
+                             "consent_by": "test suite"})
 
     body = resp.json()
     assert body["counts"]["failed"] == 1

@@ -52,6 +52,9 @@ def start(server: str, photos: list[Path], args) -> dict:
         "prompt": args.prompt or "",
         "controlnet_strength": str(args.controlnet_strength),
         "denoise": str(args.denoise),
+        "consent_basis": args.consent or "",
+        "consent_by": args.consent_by or "",
+        "consent_note": args.consent_note or "",
     }
     resp = requests.post(f"http://{server}/api/batch", files=files, data=data, timeout=300)
     if resp.status_code >= 400:
@@ -107,6 +110,13 @@ def main():
     parser.add_argument("--prompt", help="extra direction, added to the approved look")
     parser.add_argument("--controlnet-strength", type=float, default=0.75)
     parser.add_argument("--denoise", type=float, default=0.85)
+    # Required by the server, not defaulted here. A CLI that quietly supplied
+    # "internal_test" for anyone who forgot the flag would turn a deliberate
+    # declaration into a formality, which is the failure mode this is meant to
+    # prevent. See consent.py; `GET /api/config` lists the accepted bases.
+    parser.add_argument("--consent", help="consent basis (see /api/config for the list)")
+    parser.add_argument("--consent-by", help="who recorded that consent")
+    parser.add_argument("--consent-note", default="", help="optional free-text detail")
     parser.add_argument("-o", "--out", type=Path, help="write the zip here when finished")
     parser.add_argument("--no-wait", action="store_true",
                         help="queue the run and exit, instead of following it")

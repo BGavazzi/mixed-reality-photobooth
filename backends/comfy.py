@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import time
 import urllib.parse
 import urllib.request
@@ -12,6 +13,7 @@ from PIL import Image
 
 from .base import GenerationBackend
 
+import resilience
 import workflow_graph
 from workflow_graph import (
     CONTROLNET,
@@ -46,10 +48,37 @@ PHOTOSHOOT_ROLES = (POSITIVE_PROMPT, NEGATIVE_PROMPT, SUBJECT_IMAGE,
 class ComfyBackend(GenerationBackend):
     """Local Stable Diffusion via a running ComfyUI instance's REST API."""
 
-    def __init__(self, server_address: str = "127.0.0.1:8188", workflow_path: Path = DEFAULT_WORKFLOW_PATH):
+    def __init__(self, server_address: str = "127.0.0.1:8188", workflow_path: Path = DEFAULT_WORKFLOW_PATH,
+                 retry_policy: resilience.RetryPolicy | None = None,
+                 breaker: resilience.CircuitBreaker | None = None):
         self.server_address = server_address
         self.workflow_path = Path(workflow_path)
         self.client_id = str(uuid.uuid4())
+        self.retry_policy = retry_policy or resilience.RetryPolicy(
+            attempts=int(os.environ.get("COMFY_RETRY_ATTEMPTS", "4")),
+            budget_seconds=float(os.environ.get("COMFY_RETRY_BUDGET", "20")),
+        )
+        # One breaker per backend instance, shared across every call type:
+        # /upload/image failing and /prompt failing are the same news about the
+        # same box, and counting them separately would triple the time it takes
+        # to notice ComfyUI is gone.
+        self.breaker = breaker if breaker is not None else resilience.CircuitBreaker(
+            failure_threshold=int(os.environ.get("COMFY_BREAKER_THRESHOLD", "5")),
+            recovery_seconds=float(os.environ.get("COMFY_BREAKER_RECOVERY", "30")),
+        )
+
+    def _log_attempt(self, label: str):
+        def log(attempt: int, exc: BaseException, delay: float | None):
+            verdict = resilience.classify(exc).value
+            tail = f"retrying in {delay:.1f}s" if delay is not None else "giving up"
+            print(f"[comfy] {label} attempt {attempt} failed ({verdict}): {exc!r} -- {tail}")
+        return log
+
+    def _call(self, fn, *, label: str, reconcile=None):
+        return resilience.call(
+            fn, policy=self.retry_policy, breaker=self.breaker,
+            reconcile=reconcile, label=label, on_attempt=self._log_attempt(label),
+        )
 
     def _queue_prompt(self, workflow: dict, client_id: str | None = None,
                        prompt_id: str | None = None) -> str:
@@ -63,25 +92,79 @@ class ComfyBackend(GenerationBackend):
         submitting, closing the race where an `executing` event for a
         same-instant-queued job arrives before the caller's own tracking
         exists.
+
+        It also turns out to be what makes this call safely retryable. Queueing
+        work is the one call here with a side effect, so a read timeout is
+        genuinely ambiguous -- ComfyUI may already be rendering. Because *we*
+        chose the id, we can just go and look (`_prompt_landed`) instead of
+        guessing, which is why a duplicate generation is not one of the
+        outcomes here.
         """
         payload = {"prompt": workflow, "client_id": client_id or self.client_id}
         if prompt_id:
             payload["prompt_id"] = prompt_id
-        resp = requests.post(f"http://{self.server_address}/prompt", json=payload, timeout=10)
-        resp.raise_for_status()
-        return resp.json()["prompt_id"]
+
+        def submit():
+            resp = requests.post(f"http://{self.server_address}/prompt", json=payload, timeout=10)
+            resp.raise_for_status()
+            return resp.json()["prompt_id"]
+
+        return self._call(
+            submit, label="POST /prompt",
+            # Only meaningful when the caller supplied an id; without one there
+            # is nothing to look for, so an ambiguous failure stays ambiguous
+            # and is retried (accepting the small duplicate risk that the
+            # caller opted into by not passing an id).
+            reconcile=(lambda: self._prompt_landed(prompt_id)) if prompt_id else None,
+        )
+
+    def _prompt_landed(self, prompt_id: str) -> str | None:
+        """Did a prompt we may or may not have submitted actually reach the
+        queue? Returns the prompt_id if so, None if not.
+
+        Checks the running/pending queue as well as history, because a job that
+        landed one second ago is in neither history nor finished -- looking only
+        at /history would report "no" for the most likely case and cause exactly
+        the duplicate submission this exists to prevent.
+        """
+        try:
+            if self._get_history(prompt_id).get(prompt_id):
+                return prompt_id
+            resp = requests.get(f"http://{self.server_address}/queue", timeout=5)
+            resp.raise_for_status()
+            queue = resp.json()
+            for bucket in ("queue_running", "queue_pending"):
+                for entry in queue.get(bucket, []):
+                    # Entries are [number, prompt_id, prompt, extra, outputs].
+                    if len(entry) > 1 and entry[1] == prompt_id:
+                        return prompt_id
+        except Exception as exc:              # noqa: BLE001 -- best effort by design
+            print(f"[comfy] could not reconcile prompt_id={prompt_id}: {exc!r}")
+        return None
 
     def _get_history(self, prompt_id: str) -> dict:
-        resp = requests.get(f"http://{self.server_address}/history/{prompt_id}", timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        def fetch():
+            resp = requests.get(f"http://{self.server_address}/history/{prompt_id}", timeout=10)
+            resp.raise_for_status()
+            return resp.json()
+
+        return self._call(fetch, label="GET /history")
 
     def _get_output_bytes(self, filename: str, subfolder: str, folder_type: str) -> bytes:
         params = urllib.parse.urlencode(
             {"filename": filename, "subfolder": subfolder, "type": folder_type}
         )
-        with urllib.request.urlopen(f"http://{self.server_address}/view?{params}") as resp:
-            return resp.read()
+
+        def fetch():
+            # The timeout is not optional: urlopen without one blocks forever
+            # on a half-open socket, which is how a single stalled download
+            # used to be able to occupy a queue worker for the life of the
+            # process.
+            with urllib.request.urlopen(
+                    f"http://{self.server_address}/view?{params}", timeout=30) as resp:
+                return resp.read()
+
+        return self._call(fetch, label="GET /view")
 
     def _iter_outputs(self, prompt_id: str):
         """Yields every output item ComfyUI recorded for a finished prompt.
@@ -125,14 +208,27 @@ class ComfyBackend(GenerationBackend):
         image.save(buf, format="PNG")
         buf.seek(0)
         filename = f"{name_hint}_{uuid.uuid4().hex[:8]}.png"
-        resp = requests.post(
-            f"http://{self.server_address}/upload/image",
-            files={"image": (filename, buf, "image/png")},
-            data={"type": "input", "overwrite": "true"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()["name"]
+
+        def upload():
+            # buf is rewound per attempt: a retry of a partially-consumed
+            # stream uploads a truncated PNG, which ComfyUI accepts and then
+            # fails on much later, inside the graph, as an unrelated-looking
+            # decode error.
+            buf.seek(0)
+            resp = requests.post(
+                f"http://{self.server_address}/upload/image",
+                files={"image": (filename, buf, "image/png")},
+                data={"type": "input", "overwrite": "true"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()["name"]
+
+        # Safe to retry outright, including the ambiguous timeout case: the
+        # filename is unique per call and `overwrite=true`, so a re-upload
+        # replaces its own bytes rather than creating a second file or
+        # disturbing anyone else's.
+        return self._call(upload, label="POST /upload/image")
 
     def queue_image_generation(self, prompt: str, client_id: str | None = None,
                                 prompt_id: str | None = None) -> tuple[str, int]:

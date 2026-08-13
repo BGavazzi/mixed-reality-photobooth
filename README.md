@@ -35,6 +35,9 @@ the original cutout goes back on top.
 - [Brand kits](#brand-kits--making-a-generation-something-a-client-can-sign-off-on)
 - [Batch mode](#batch-mode--many-photos-one-approved-look)
 - [Architecture](#architecture)
+- [When ComfyUI has a bad night](#when-comfyui-has-a-bad-night)
+- [The people in the photographs](#the-people-in-the-photographs)
+- [When something needs a person](#when-something-needs-a-person)
 - [Testing](#testing)
 - [Known limitations](#known-limitations)
 - [Also in this repo: the Resolume VJ bridge](docs/resolume-bridge.md)
@@ -51,6 +54,8 @@ Not "it calls an image API". The parts worth reading:
 | **Brand kits enforced server-side** | The client sends `{brand_id, look_id, free text}` and never a finished prompt, because a locked negative the client assembles is one a stale client can drop. [→](#brand-kits--making-a-generation-something-a-client-can-sign-off-on) |
 | **A locked seed makes a set** | 200 guests used to mean 200 unrelated images. A seed derived from (brand, look) makes them one campaign. [→](#batch-mode--many-photos-one-approved-look) |
 | **A real queue seam** | Bounded worker pool with admission control in front of a serial GPU, behind an interface a Redis/Celery version could satisfy unchanged. [→](#the-queue) |
+| **Failure handling you can reproduce** | Retry that knows which failures are worth retrying and which are *ambiguous*, a circuit breaker, and a fake ComfyUI that fails on a seed so the whole thing is demonstrable. [→](#when-comfyui-has-a-bad-night) |
+| **A privacy posture, not a promise** | Consent recorded before the shutter, the original photograph deleted the moment a cutout exists, and a retention sweep that runs whether or not anyone remembers. [→](#the-people-in-the-photographs) |
 | **Workflow roles resolved from the graph** | No hardcoded node IDs: `workflow_graph.py` walks the wiring to find the sampler, the encoders, the ControlNet. Re-export from ComfyUI and it still works. [→](#workflow-roles-instead-of-magic-node-ids) |
 | **Findings from real photos** | Four failures that a curated 1024×1024 test image never shows. [→](#real-photo-hardening) |
 
@@ -246,8 +251,13 @@ palette, same skyline handling.*
 From the browser ("Choose Photos…"), or from a shell:
 
 ```
-python batch_cli.py photos/ --brand aurora --look coastline -o shoot.zip
+python batch_cli.py photos/ --brand aurora --look coastline -o shoot.zip \
+    --consent guest_verbal --consent-by "your name"
 ```
+
+The consent flags are not optional and the CLI does not default them — a client
+that quietly supplied `internal_test` for anyone who forgot would turn a
+deliberate declaration into a formality.
 
 The CLI is a *client* of `POST /api/batch`, not a second implementation, so
 there is one code path through the queue, the brand kit and the compositor. It
@@ -270,13 +280,13 @@ Design decisions worth knowing:
 - **Results are collected by run, not by websocket session** — a batch has no
   page to push to. That routing choice is the seam batch mode is built on, and
   `tests/test_batch.py` tests it directly.
-- Each run zips with a **`manifest.json`**: every seed, prompt, kit revision and
-  status. It's the artifact a brand-safety reviewer actually gets handed. It's
-  rewritten as the run goes, so an interrupted batch still leaves a usable
-  record.
-- `DELETE /api/batch/{id}` removes a run and its files. Batch output contains
-  photographs of real people, and a booth left running for a week shouldn't
-  quietly accumulate them.
+- Each run zips with a **`manifest.json`**: every seed, prompt, kit revision,
+  status, plus the consent basis and retention window. It's the artifact a
+  brand-safety reviewer actually gets handed. It's rewritten as the run goes, so
+  an interrupted batch still leaves a usable record.
+- A run **requires a consent basis** and expires on a retention clock; the
+  uploaded photographs are deleted as soon as their cutouts exist. See
+  [The people in the photographs](#the-people-in-the-photographs).
 
 ## Architecture
 
@@ -364,6 +374,131 @@ ComfyUI. It matters for three reasons:
 
 `GET /api/queue` reports live depth.
 
+## When ComfyUI has a bad night
+
+ComfyUI is a real dependency with real failure modes: VRAM pressure, model
+reloads, an OOM fallback mid-generation, a dropped upload. Every HTTP call in
+this app had a timeout and not one of them was ever retried, so the entire
+response to any of that was to hand the guest an error.
+
+Three ideas do the work, and the middle one is the interesting one.
+
+**Not every failure deserves a retry.** A 503 means ComfyUI declined the work,
+so trying again is free and usually succeeds. A 400 means the workflow is wrong,
+and four attempts just makes the guest wait four times as long for the same
+answer. Classification is the difference between resilience and a busy loop.
+
+**A retry can be unsafe.** `POST /prompt` queues GPU work. If the request timed
+out on the *read*, ComfyUI may already be rendering — retrying then burns a
+second slot on a serial GPU and produces a duplicate. So failures sort three
+ways, not two: terminal, safe-to-retry, and **ambiguous**. Ambiguous ones are
+*reconciled* rather than guessed: because the app supplies its own `prompt_id`,
+it can go and look in `/history` and `/queue` to find out whether the work
+landed. That is the same client-supplied id that already existed to close a
+race in the relay, earning its keep twice.
+
+**A retry ladder is the wrong answer when the dependency is simply down.** A
+circuit breaker opens after consecutive failures, so the sixth guest is told
+immediately instead of waiting through a full backoff to learn the same thing.
+One probe is allowed through per recovery window; a failed probe restarts the
+clock.
+
+Backoff uses **full jitter** — a uniform draw from `[0, backoff]`, not backoff
+plus a wiggle. A booth fails several sessions at the same instant against the
+same ComfyUI, and equal delays send them back as a synchronised wave.
+
+### Proving it, rather than describing it
+
+`chaos_comfy.py` is a fake ComfyUI that fails on purpose, with the failure rate,
+slow rate and seed all configurable — the design borrowed from a technical
+challenge whose mock service does the same thing, because reproducible failures
+beat real ones. It speaks enough of the protocol (REST plus the websocket event
+stream, including binary preview frames) to drive the whole app with no GPU and
+no models.
+
+```
+python chaos_comfy.py --port 8188 --failure-rate 0.3 --seed 42
+python web_server.py                     # then use the app normally
+```
+
+Measured against it, at a **50% injected failure rate**:
+
+| | generations completed |
+|---|---|
+| Before (no retry) | **0 / 10** |
+| After | **4 / 5** |
+
+It also reproduces one piece of ComfyUI's real behaviour deliberately: a second
+websocket with the same `clientId` silently displaces the first. That is the bug
+described above, and reproducing it in the fake is what turns the fix into a
+tested property instead of a comment.
+
+`GET /api/queue` reports the breaker's live state alongside queue depth.
+
+## The people in the photographs
+
+This app points a camera at members of the public. Until recently the only thing
+it recorded about a person was the seed used to regenerate the wall behind
+them — excellent provenance for the image, none at all for the human in it.
+
+**Consent is captured before the shutter and enforced on the server.** The batch
+endpoint refuses a run with no basis attached, and the basis is a closed set
+(`guest_verbal`, `guest_signed`, `event_notice`, `internal_test`) rather than
+free text, because "consent: yes" in a text field records that somebody typed
+something. It must also name a person, not a checkbox — a record with nobody's
+name on it cannot be followed up when a guest later asks to be deleted. This is
+the brand kit's argument applied to something that matters more: a guarantee the
+client assembles is one a stale client can drop.
+
+**The original photograph is deleted as soon as a cutout exists.** Nothing
+downstream reads it again — the compositor needs the cutout, not the photograph.
+An earlier version of `batch.py` kept the originals and justified it as "worth
+having when a client asks why frame 31 looks wrong": a real convenience bought
+with someone else's biometric data. Debugging now needs `--keep-intermediates`,
+an explicit choice by whoever runs the booth.
+
+**Runs expire.** A retention sweep sets a 7-day default (`--retain-days`), runs
+at startup and hourly, and — importantly — sweeps the *directory* rather than
+just the in-memory registry, because the case that matters is the crashed server
+whose folder of photographs nothing in the app remembers. Consent and retention
+both land in each run's `manifest.json`, which is the artifact a reviewer
+actually gets handed.
+
+None of this makes the app compliant with anything, and it is not legal advice.
+Consent is a conversation between an operator and a guest that no code can have.
+What the code can do is make its absence blocking rather than silent, and make
+the record travel with the photographs.
+
+## When something needs a person
+
+The booth could previously do two things with a problem: retry it, or show an
+error and forget. The third option is the one an operator standing two metres
+away can act on, so there is now a queue for it (`GET /api/attention`, with a
+badge in the header).
+
+<p align="center">
+  <img src="docs/attention.png" alt="the operator attention drawer" width="420">
+</p>
+
+*Captured from a real run with ComfyUI killed mid-batch: note the ×2 counts, and
+that the guest was told "the render service is not responding" rather than shown
+a connection error.*
+
+The mechanism is a dict; the value is in the criteria:
+
+- **Escalate when a human can change the outcome** — ComfyUI unreachable, a photo
+  that failed the whole retry ladder, a subject the segmenter could not find.
+- **Do not escalate when they cannot.** A guest whose upload is not an image is
+  already being told; putting that in front of an operator is noise, and a queue
+  that fills with noise is one nobody reads. This is the same line the brand kit
+  draws between clamping a logo's minimum size and merely warning about clear
+  space.
+- **Deduplicate.** Fifty photos failing against one dead ComfyUI is *one*
+  problem with a count of fifty, not fifty rows burying everything else.
+- **Close alerts when their cause goes away.** The dependency alert resolves
+  itself the moment ComfyUI answers again, because an alert that outlives its
+  problem is how an operator learns to distrust the panel.
+
 ### Workflow roles instead of magic node IDs
 
 Node IDs in an exported ComfyUI workflow are an implementation detail of the
@@ -450,14 +585,23 @@ pip install -r requirements-test.txt
 pytest
 ```
 
-213 tests covering the pure-logic parts of the pipeline (mask blob cleanup,
+291 tests covering the pure-logic parts of the pipeline (mask blob cleanup,
 illumination estimation, resolution capping, the ControlNet-strength heuristic,
 contact shadow geometry, cover-fit), brand-kit loading and enforcement, workflow
-role resolution, the queue's admission control and failure isolation, batch
-bookkeeping and result routing, provenance extraction, and multi-session job
-routing in `web_server.py` — the last driven against a fake backend, so
-cross-session-leak cases can be checked without a GPU in the loop. Runs in CI on
-Python 3.10 and 3.12 (`.github/workflows/tests.yml`).
+role resolution, the queue's admission control and failure isolation, the retry
+ladder and circuit breaker, consent/retention/minimisation, the attention
+queue's escalation criteria, batch bookkeeping and result routing, provenance
+extraction, and multi-session job routing in `web_server.py` — the last driven
+against a fake backend, so cross-session-leak cases can be checked without a GPU
+in the loop. Runs in CI on Python 3.10 and 3.12
+(`.github/workflows/tests.yml`).
+
+Two details worth stealing. The breaker is tested against an **injected clock**,
+so "it reopens after exactly 30 seconds" is a claim the suite makes rather than
+a delay it waits out. And the chaos tests convert the TestClient's `httpx`
+responses back into `requests` ones — without that, `raise_for_status()` raises
+a type the classifier has never heard of, and the suite would cheerfully "prove"
+that a 503 is not retried.
 
 **2. End-to-end verification** — needs the real stack running.
 
@@ -509,7 +653,16 @@ stale.
   `InProcessJobQueue` is an `asyncio.Queue`; restarting the server loses both.
   They're deliberately small and serialisable so the move to Redis or a table is
   cheap, and the `JobQueue` interface is already the seam for it — but that move
-  hasn't been made.
+  hasn't been made. The retention sweep covers the resulting orphans on disk;
+  the in-flight *work* is still lost.
+- The attention queue is in memory too, so a restart clears it. Acceptable for
+  now because its items are transient by nature and the underlying conditions
+  re-raise themselves, but it means it is not an audit log and shouldn't be
+  mistaken for one.
+- Consent is recorded per **batch run**, not per person. A run is one operator's
+  declaration covering the photos in it, which fits how a booth actually
+  operates but would not survive a per-subject deletion request without
+  matching people to filenames by hand.
 - The illumination estimate is classic CV (per-quadrant luminance, highlight
   color, contrast), not a learned model — a useful heuristic for
   prompt-grounding, not a physically accurate light probe.
@@ -522,7 +675,8 @@ stale.
   have this problem, since it conditions on the current composite directly.
 - No authentication. It's a LAN/booth tool as it stands; putting it on a network
   where strangers can reach it would need auth in front of `/api/batch` first,
-  since that endpoint writes files and queues GPU work.
+  since that endpoint writes files and queues GPU work. Consent capture assumes
+  the operator is trusted — it records a declaration, it cannot verify one.
 
 ## Where this goes next
 

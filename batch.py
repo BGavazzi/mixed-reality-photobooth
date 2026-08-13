@@ -10,11 +10,27 @@ pick a kit and an approved look, get back a set that belongs together.
 
 Design notes worth reading before changing this:
 
-**Runs live on disk, not in memory.** Each item's analysis output (cutout,
-mask, depth) is written to the run directory and reloaded when its generation
-finishes. Holding fifty subjects' worth of decoded PIL images while waiting on
-a serial GPU is how a long batch turns into an OOM, and the intermediate files
-are worth having anyway when a client asks why frame 31 looks wrong.
+**Runs live on disk, not in memory.** Each item's cutout is written to the run
+directory and reloaded when its generation finishes. Holding fifty subjects'
+worth of decoded PIL images while waiting on a serial GPU is how a long batch
+turns into an OOM.
+
+**What lands on disk is other people's faces, so as little as possible does,
+for as short a time as possible.** Two rules follow from that, and both are
+enforced here rather than left to an operator's diligence:
+
+*Minimisation.* The original upload is deleted the moment analysis has produced
+a cutout, because nothing downstream ever reads it again -- the compositor
+needs the cutout, not the photograph. An earlier version of this file kept the
+originals and justified it as being "worth having when a client asks why frame
+31 looks wrong". That was a real convenience bought with someone else's
+biometric data, which is the wrong trade to make silently; debugging now needs
+`--keep-intermediates`, an explicit choice by whoever runs the booth.
+
+*Retention.* Runs expire (see `sweep_expired`). A booth left running for a
+season should not still be holding a photograph of everyone who walked past it
+in the spring, and "the operator will remember to delete them" is not a
+retention policy.
 
 **The whole CPU pipeline happens inside the queued job.** `submit` does
 analyze -> upload -> queue-to-ComfyUI, so the queue's worker pool overlaps one
@@ -33,6 +49,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import threading
 import time
@@ -44,6 +61,18 @@ from pathlib import Path
 from PIL import Image
 
 BATCH_ROOT = Path(__file__).parent / "batch_runs"
+
+# How long a finished run's files survive. Seven days is a working week: long
+# enough that an operator who shot on Friday can still fetch the zip on
+# Monday, short enough that a booth is not quietly accumulating a season's
+# worth of strangers' faces. Overridable, because the right number is a
+# business decision -- but the default is a policy, not "forever".
+DEFAULT_RETAIN_DAYS = float(os.environ.get("BATCH_RETAIN_DAYS", "7"))
+
+# Keep the original uploads and the analysed copies. Off by default: the
+# pipeline does not need them past analysis, and they are the most sensitive
+# thing the app ever writes down.
+KEEP_INTERMEDIATES = os.environ.get("BATCH_KEEP_INTERMEDIATES", "").lower() in ("1", "true", "yes")
 
 # Statuses an item moves through. Deliberately explicit rather than a bool:
 # "queued but not yet analyzed" and "analyzed, waiting on the GPU" look the
@@ -98,6 +127,11 @@ class BatchRun:
     look_id: str | None
     look_label: str | None
     items: list[BatchItem]
+    # Who said these photographs could be processed, and on what basis. Not
+    # optional and not free text: see consent.py for why the app refuses to
+    # start a run without it.
+    consent: dict = field(default_factory=dict)
+    retain_days: float = DEFAULT_RETAIN_DAYS
     created_at: float = field(default_factory=time.time)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -105,10 +139,27 @@ class BatchRun:
     def directory(self) -> Path:
         return BATCH_ROOT / self.run_id
 
+    @property
+    def expires_at(self) -> float:
+        return self.created_at + self.retain_days * 86400
+
     def path_for(self, kind: str, item: BatchItem, suffix: str = ".png") -> Path:
         directory = self.directory / kind
         directory.mkdir(parents=True, exist_ok=True)
         return directory / f"{item.stem}{suffix}"
+
+    def drop_original(self, item: BatchItem) -> None:
+        """Deletes the uploaded photograph now that a cutout exists.
+
+        Called from the worker the instant analysis succeeds, not at the end of
+        the run: the window in which the app holds the full original is the
+        thing being minimised, and a fifty-photo batch takes half an hour.
+        """
+        if KEEP_INTERMEDIATES:
+            return
+        for kind, suffix in (("input", ".orig"), ("analyzed", ".png")):
+            path = self.directory / kind / f"{item.stem}{suffix}"
+            path.unlink(missing_ok=True)
 
     def item_by_prompt(self, prompt_id: str) -> BatchItem | None:
         return next((i for i in self.items if i.prompt_id == prompt_id), None)
@@ -136,6 +187,8 @@ class BatchRun:
             "look_id": self.look_id,
             "look_label": self.look_label,
             "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "consent": self.consent,
             "total": len(self.items),
             "counts": self.counts(),
             "finished": self.finished,
@@ -156,6 +209,15 @@ class BatchRun:
             "look_id": self.look_id,
             "look_label": self.look_label,
             "created_at": self.created_at,
+            # The two facts a reviewer asks about first and that no amount of
+            # seed provenance answers: what were these people told, and when
+            # does this stop being kept.
+            "consent": self.consent,
+            "retention": {
+                "retain_days": self.retain_days,
+                "expires_at": self.expires_at,
+                "originals_kept": KEEP_INTERMEDIATES,
+            },
             "items": [
                 {**item.to_dict(), "provenance": item.provenance}
                 for item in self.items
@@ -173,17 +235,68 @@ RUNS: dict[str, BatchRun] = {}
 
 
 def create_run(filenames: list[str], brand_id: str | None,
-               look_id: str | None, look_label: str | None) -> BatchRun:
+               look_id: str | None, look_label: str | None,
+               consent: dict | None = None,
+               retain_days: float | None = None) -> BatchRun:
     run = BatchRun(
         run_id=uuid.uuid4().hex[:12],
         brand_id=brand_id,
         look_id=look_id,
         look_label=look_label,
         items=[BatchItem(index=i + 1, filename=name) for i, name in enumerate(filenames)],
+        consent=consent or {},
+        retain_days=DEFAULT_RETAIN_DAYS if retain_days is None else retain_days,
     )
     RUNS[run.run_id] = run
     run.directory.mkdir(parents=True, exist_ok=True)
     return run
+
+
+def sweep_expired(now: float | None = None, retain_days: float | None = None) -> list[str]:
+    """Deletes runs whose retention window has passed. Returns what it removed.
+
+    Sweeps the *directory*, not just the in-memory registry, because the case
+    that matters most is the one where the process died: a crashed or
+    restarted server would otherwise leave a folder of photographs that
+    nothing in the app remembers and therefore nothing will ever clean up.
+    That is also why it runs at startup and not only on a timer.
+
+    Age comes from the manifest's created_at when there is one and the
+    directory's mtime when there isn't. A run whose manifest never got written
+    is exactly the interrupted case above, and refusing to age it because its
+    paperwork is missing would keep the oldest data the longest.
+    """
+    now = time.time() if now is None else now
+    retain_days = DEFAULT_RETAIN_DAYS if retain_days is None else retain_days
+    if retain_days <= 0:
+        return []          # 0 or negative means "keep indefinitely", set deliberately
+
+    removed = []
+    for run_id, run in list(RUNS.items()):
+        if now >= run.expires_at:
+            delete_run(run_id)
+            removed.append(run_id)
+
+    if not BATCH_ROOT.is_dir():
+        return removed
+    cutoff = now - retain_days * 86400
+    for directory in BATCH_ROOT.iterdir():
+        if not directory.is_dir() or directory.name in RUNS:
+            continue
+        created = directory.stat().st_mtime
+        manifest = directory / "manifest.json"
+        if manifest.exists():
+            try:
+                created = json.loads(manifest.read_text(encoding="utf-8")).get("created_at", created)
+            except (json.JSONDecodeError, OSError):
+                pass       # unreadable paperwork is not a reason to keep the photos
+        if created < cutoff:
+            shutil.rmtree(directory, ignore_errors=True)
+            removed.append(directory.name)
+    if removed:
+        print(f"[batch] retention sweep removed {len(removed)} expired run(s): "
+              f"{', '.join(removed[:5])}{'...' if len(removed) > 5 else ''}")
+    return removed
 
 
 def composite_subject_over(background: Image.Image, cutout_path: Path) -> Image.Image:

@@ -127,10 +127,26 @@
 <header>
   <h1>Mixed-Reality Photo Booth</h1>
   <span>ComfyUI + SDXL ControlNet · rotoscope → pose → depth → relight → regenerate</span>
-  <a id="comfyLink" class="ext" style="margin-left:auto" target="_blank" rel="noopener"
+  <!-- Hidden until there is something to say. A badge that always sits there
+       reading "0 issues" is furniture; one that only appears when a person is
+       needed is a signal. -->
+  <button id="attentionBadge" class="badge" style="margin-left:auto;display:none;cursor:pointer;border:0"
+          title="Things that need an operator — click to review"></button>
+  <a id="comfyLink" class="ext" target="_blank" rel="noopener"
      title="Open the ComfyUI instance this app drives — the queue, node graph and error log live there">Open ComfyUI ↗</a>
   <span id="connStatus" class="badge">connecting…</span>
 </header>
+
+<!-- The attention drawer. Deliberately a list of individually-resolvable rows
+     rather than a toast: a toast that disappears while the operator is holding
+     a camera is the same as no alert at all. -->
+<div id="attentionPanel" style="display:none;position:fixed;top:54px;right:12px;width:400px;max-height:70vh;overflow:auto;z-index:50;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;box-shadow:0 8px 30px rgba(0,0,0,.5)">
+  <div style="display:flex;align-items:center;gap:8px">
+    <strong style="font-size:13px;letter-spacing:.04em;text-transform:uppercase">Needs a person</strong>
+    <button class="secondary small" id="btnAttentionClose" style="margin-left:auto">Close</button>
+  </div>
+  <div id="attentionList"></div>
+</div>
 
 <main>
   <!-- LEFT: upload + pipeline stages -->
@@ -159,7 +175,25 @@
     <div class="panel">
       <h2>Batch</h2>
       <div class="hint" style="margin-top:0">Many photos, one approved look. Uses the brand kit selected on the right -- with a locked seed, the whole set renders as one campaign instead of one image per guest. Runs server-side, so it survives closing this tab.</div>
-      <button class="secondary small" id="btnBatchPick" style="width:100%;margin-top:10px">Choose Photos…</button>
+
+      <!-- The consent gate. The server rejects a batch without this (see
+           consent.py), so the page could omit it entirely and simply show the
+           400 -- but an operator who is about to photograph strangers should
+           be asked before selecting the files, not after. The button stays
+           disabled until both fields are filled: the aim is a deliberate
+           declaration, not a dismissed dialog. -->
+      <div style="margin-top:12px;padding:10px;border:1px solid var(--line);border-radius:6px">
+        <label class="hint" style="margin:0 0 4px;display:block">Consent basis (required)</label>
+        <select id="consentBasis" style="width:100%">
+          <option value="">— pick how consent was obtained —</option>
+        </select>
+        <div class="hint" id="consentDescription" style="margin:6px 0 0"></div>
+        <input type="text" id="consentBy" placeholder="Recorded by (your name)"
+               style="width:100%;margin-top:6px">
+        <div class="hint" id="retentionNote" style="margin:6px 0 0"></div>
+      </div>
+
+      <button class="secondary small" id="btnBatchPick" style="width:100%;margin-top:10px" disabled>Choose Photos…</button>
       <input type="file" id="batchInput" accept="image/*" multiple>
       <div class="hint" id="batchStatus" style="display:none"></div>
       <div class="progress-bar" id="batchBar" style="display:none"><div id="batchFill"></div></div>
@@ -1199,7 +1233,73 @@ async function loadConfig() {
     select.appendChild(opt);
   }
   document.getElementById('brandPanel').style.display = serverConfig.brands.length ? 'block' : 'none';
+  populateConsent(serverConfig);
 }
+
+// --- the operator attention queue -----------------------------------------------
+// Polled rather than pushed over the existing websocket, because the things it
+// reports are exactly the ones that happen when parts of the app are broken --
+// including, in the worst case, whatever was supposed to push the notification.
+
+const SEVERITY_COLOURS = { high: '#ff6b6b', medium: '#f5b942', low: '#8ab4f8' };
+
+async function pollAttention() {
+  let snapshot;
+  try {
+    snapshot = await (await fetch('/api/attention')).json();
+  } catch (e) {
+    return;   // the server being unreachable is its own visible problem
+  }
+
+  const badge = document.getElementById('attentionBadge');
+  badge.style.display = snapshot.open ? 'inline-block' : 'none';
+  if (!snapshot.open) {
+    document.getElementById('attentionPanel').style.display = 'none';
+    return;
+  }
+  badge.textContent = `⚠ ${snapshot.open} needs attention`;
+  badge.style.background = SEVERITY_COLOURS[snapshot.highest_severity] || '#f5b942';
+  badge.style.color = '#111';
+
+  const list = document.getElementById('attentionList');
+  list.innerHTML = '';
+  for (const item of snapshot.items) {
+    const row = document.createElement('div');
+    row.style.cssText = 'margin-top:10px;padding:8px;border-left:3px solid '
+      + (SEVERITY_COLOURS[item.severity] || '#888') + ';background:rgba(255,255,255,.03)';
+    const times = item.count > 1 ? ` ×${item.count}` : '';
+    row.innerHTML = `<div style="font-size:13px">${escapeHtml(item.summary)}${times}</div>`
+      + (item.detail ? `<div class="hint" style="margin:4px 0 0">${escapeHtml(item.detail)}</div>` : '');
+    const button = document.createElement('button');
+    button.className = 'secondary small';
+    button.textContent = 'Mark handled';
+    button.style.marginTop = '6px';
+    button.onclick = async () => {
+      const form = new FormData();
+      form.append('by', 'operator');
+      await fetch(`/api/attention/${item.id}/resolve`, { method: 'POST', body: form });
+      pollAttention();
+    };
+    row.appendChild(button);
+    list.appendChild(row);
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text == null ? '' : String(text);
+  return div.innerHTML;
+}
+
+document.getElementById('attentionBadge').onclick = () => {
+  const panel = document.getElementById('attentionPanel');
+  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+};
+document.getElementById('btnAttentionClose').onclick = () =>
+  document.getElementById('attentionPanel').style.display = 'none';
+
+pollAttention();
+setInterval(pollAttention, 5000);
 
 function activeBrand() { return serverConfig.brands.find(b => b.id === state.brandId) || null; }
 function activeLook() {
@@ -1391,6 +1491,43 @@ function renderBrandViolations() {
 let batchRunId = null;
 let batchPoll = null;
 
+// --- the consent gate ---------------------------------------------------------
+// The options come from /api/config rather than being written here, so the list
+// the operator picks from and the list the server accepts cannot drift apart.
+
+function populateConsent(config) {
+  const select = document.getElementById('consentBasis');
+  for (const basis of config.consent_bases || []) {
+    const option = document.createElement('option');
+    option.value = basis.id;
+    option.textContent = basis.id.replace(/_/g, ' ');
+    option.dataset.description = basis.description;
+    select.appendChild(option);
+  }
+  const retention = config.retention || {};
+  document.getElementById('retentionNote').textContent = retention.retain_days
+    ? `Photos and frames are deleted after ${retention.retain_days} day(s).`
+      + (retention.keep_intermediates
+          ? ' Originals are being kept (--keep-intermediates).'
+          : ' The uploaded photograph itself is deleted as soon as the cutout exists.')
+    : 'Retention is switched off on this server — photos are kept until deleted by hand.';
+  refreshConsentGate();
+}
+
+function refreshConsentGate() {
+  const select = document.getElementById('consentBasis');
+  const by = document.getElementById('consentBy').value.trim();
+  const chosen = select.selectedOptions[0];
+  document.getElementById('consentDescription').textContent =
+    chosen && chosen.dataset.description ? chosen.dataset.description : '';
+  // Both fields, not just the dropdown: a record with nobody's name on it
+  // cannot be followed up when a guest later asks to be deleted.
+  document.getElementById('btnBatchPick').disabled = !(select.value && by);
+}
+
+document.getElementById('consentBasis').onchange = refreshConsentGate;
+document.getElementById('consentBy').oninput = refreshConsentGate;
+
 document.getElementById('btnBatchPick').onclick = () => document.getElementById('batchInput').click();
 
 document.getElementById('batchInput').onchange = async (e) => {
@@ -1405,6 +1542,8 @@ document.getElementById('batchInput').onchange = async (e) => {
   form.append('prompt', document.getElementById('scenePrompt').value.trim());
   form.append('controlnet_strength', document.getElementById('cnStrength').value);
   form.append('denoise', document.getElementById('denoise').value);
+  form.append('consent_basis', document.getElementById('consentBasis').value);
+  form.append('consent_by', document.getElementById('consentBy').value.trim());
 
   setBatchStatus(`uploading ${files.length} photo(s)…`);
   let run;
