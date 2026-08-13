@@ -61,6 +61,8 @@ from pathlib import Path
 from PIL import Image
 
 import config
+import finish
+import surfaces
 
 BATCH_ROOT = Path(__file__).parent / "batch_runs"
 
@@ -146,6 +148,10 @@ class BatchRun:
     # empty declaration blocks the run is consent.REQUIRED, off by default --
     # see consent.py for that argument.
     consent: dict = field(default_factory=dict)
+    # Which declared output surfaces this run also renders (see surfaces.py).
+    # Opt-in and empty by default: writing six reframes of every photo triples
+    # the size of a fifty-photo zip for an operator who only wanted the frames.
+    surface_ids: list = field(default_factory=list)
     retain_days: float = DEFAULT_RETAIN_DAYS
     created_at: float = field(default_factory=time.time)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -233,6 +239,7 @@ class BatchRun:
             # seed provenance answers: what were these people told, and when
             # does this stop being kept.
             "consent": self.consent,
+            "surfaces": [surfaces.get(s).to_dict() for s in self.surface_ids],
             "retention": {
                 "retain_days": self.retain_days,
                 "expires_at": self.expires_at,
@@ -257,6 +264,7 @@ RUNS: dict[str, BatchRun] = {}
 def create_run(filenames: list[str], brand_id: str | None,
                look_id: str | None, look_label: str | None,
                consent: dict | None = None,
+               surface_ids: list | None = None,
                retain_days: float | None = None) -> BatchRun:
     run = BatchRun(
         run_id=uuid.uuid4().hex[:12],
@@ -265,6 +273,7 @@ def create_run(filenames: list[str], brand_id: str | None,
         look_label=look_label,
         items=[BatchItem(index=i + 1, filename=name) for i, name in enumerate(filenames)],
         consent=consent or {},
+        surface_ids=list(surface_ids or []),
         retain_days=DEFAULT_RETAIN_DAYS if retain_days is None else retain_days,
     )
     RUNS[run.run_id] = run
@@ -319,26 +328,66 @@ def sweep_expired(now: float | None = None, retain_days: float | None = None) ->
     return removed
 
 
-def composite_subject_over(background: Image.Image, cutout_path: Path) -> Image.Image:
+def write_surfaces(run: "BatchRun", item: BatchItem, frame: Image.Image,
+                   logo: Image.Image | None = None, logo_rules=None) -> list[str]:
+    """Renders one finished frame for each of the run's declared surfaces.
+
+    `frame` must be the *unbranded* composite. Each surface is a different crop
+    of it, and the mark is placed after the crop, in that surface's own corner
+    -- or not at all, on a live surface, where the guest's body would cover it.
+    Branding first and cropping second put the postcard's logo off the edge of
+    the postcard.
+
+    The cutout is reloaded to locate the subject, because that is what lets a
+    6x4 postcard crop keep a full-length portrait's face in the picture instead
+    of delivering a print of their shoes.
+    """
+    if not run.surface_ids:
+        return []
+    cutout_path = run.path_for("cutout", item)
+    mask = None
+    if cutout_path.exists():
+        mask = Image.open(cutout_path).convert("RGBA").getchannel("A")
+
+    written = []
+    for surface_id in run.surface_ids:
+        surface = surfaces.get(surface_id)
+        reframed = surfaces.reframe(frame, surface, mask=mask)
+        if surface.logo_corner:
+            reframed, _ = finish.brand(reframed, logo, logo_rules, surface.logo_corner,
+                                       min_clear_space_pct=surface.safe_margin_pct)
+        directory = run.directory / "surfaces" / surface.id
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{item.stem}.png"
+        reframed.save(path, dpi=(surface.dpi, surface.dpi) if surface.dpi else None)
+        written.append(surface.id)
+    return written
+
+
+def composite_subject_over(background: Image.Image, cutout_path: Path,
+                            shadow_path: Path | None = None,
+                            logo: Image.Image | None = None,
+                            logo_rules=None,
+                            grade_strength: float = finish.DEFAULT_GRADE_STRENGTH
+                            ) -> tuple[Image.Image, dict]:
     """Puts the untouched subject back on top of its generated environment.
 
     This is the same compositing the browser canvas does, done server-side
-    because a batch has no canvas. It stays pixel-exact on the subject for the
-    same reason the interactive path does: those pixels are a real photograph
-    of a real person and regenerating them is the one thing this tool must
-    never do.
+    because a batch has no canvas -- and until recently it was *not* the same:
+    it was a bare alpha_composite, so the deliverable had no contact shadow and
+    no brand mark while the demo had both. See finish.py.
+
+    It stays pixel-exact on the subject's geometry for the same reason the
+    interactive path does: those pixels are a real photograph of a real person
+    and regenerating them is the one thing this tool must never do. The colour
+    grade is a fractional shift toward the plate's light, not a repaint.
     """
     cutout = Image.open(cutout_path).convert("RGBA")
-    canvas = background.convert("RGBA")
-    if cutout.size != canvas.size:
-        # The generated background comes back at the subject photo's own
-        # resolution (the workflow has no resize node), so a mismatch means
-        # something upstream changed -- resize rather than fail a whole batch
-        # item, but it is worth being loud about in the log.
-        print(f"[batch] size mismatch: background {canvas.size} vs cutout {cutout.size}, resizing")
-        cutout = cutout.resize(canvas.size, Image.LANCZOS)
-    canvas.alpha_composite(cutout)
-    return canvas.convert("RGB")
+    shadow = None
+    if shadow_path is not None and shadow_path.exists():
+        shadow = Image.open(shadow_path).convert("RGBA")
+    return finish.finish_frame(background, cutout, shadow=shadow, logo=logo,
+                               logo_rules=logo_rules, grade_strength=grade_strength)
 
 
 def zip_run(run: BatchRun) -> io.BytesIO:
@@ -355,6 +404,14 @@ def zip_run(run: BatchRun) -> io.BytesIO:
         if output_dir.is_dir():
             for path in sorted(output_dir.iterdir()):
                 archive.write(path, arcname=f"{run.run_id}/{path.name}")
+        # Surface renders keep their own folders, so an operator handing a
+        # client the zip can give the print shop one directory and the social
+        # team another without re-sorting a hundred files by aspect ratio.
+        surfaces_dir = run.directory / "surfaces"
+        if surfaces_dir.is_dir():
+            for surface_dir in sorted(surfaces_dir.iterdir()):
+                for path in sorted(surface_dir.iterdir()):
+                    archive.write(path, arcname=f"{run.run_id}/{surface_dir.name}/{path.name}")
         manifest = run.directory / "manifest.json"
         if manifest.exists():
             archive.write(manifest, arcname=f"{run.run_id}/manifest.json")

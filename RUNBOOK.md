@@ -88,6 +88,38 @@ config.ConfigError: BATCH_RETAIN_DAYS=-1 is below the minimum of 0
 values are refused specifically so that a typo cannot silently switch off the
 deletion of people's photographs.
 
+## The frames look like stickers — subject pasted onto a distant backdrop
+
+**Check** the run's `manifest.json`, per item: `stage_relief`. It is how much
+depth structure exists outside the subject, and it should be roughly 0.2–0.5.
+
+**Do**
+- **`stage_relief` is 0.0** — the stage prior did not run. Either the look
+  declares `"stage": "void"` in its brand kit (which is a valid choice, but not
+  usually the one you want), or the frame is a close-up with no background left
+  to measure. Pick a stage that matches the prompt: `terrace` for a wall with
+  distance beyond it, `room` for an interior, `landscape` for open ground,
+  `studio` for a cyclorama.
+- **`stage_relief` looks right and it still reads flat** — check `finish` in the
+  same record. `graded: false` means the light was never matched (a close-up
+  with no visible plate does this), and `shadow: false` means no contact shadow
+  went down, which is the usual cause of a subject that floats.
+- **The logo is missing from the delivered frames** — `finish.logo` is `null`.
+  The run had no brand kit, or the kit's `logo` file is missing from
+  `brands/<id>/`. The browser draws its own logo layer, so a frame can look
+  branded on screen and arrive unbranded in the zip; the manifest is the thing
+  to trust.
+
+## The LED wall output is the wrong shape
+
+**Check** `GET /api/config` → `live_surface`. The Spout sender takes its
+dimensions from that surface, not from the guest's photo.
+
+**Do** Set `BOOTH_LIVE_SURFACE` (e.g. `ultrawide_backdrop` for a 2×1080p wall)
+and restart. Unknown ids are refused at startup with the valid ones listed.
+Deliverable crops are a separate, per-run choice: `--surfaces
+story_9x16,print_2x6`.
+
 ## Disk is filling up
 
 **Check** `batch_runs/` — one directory per run.

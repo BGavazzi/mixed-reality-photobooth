@@ -34,6 +34,7 @@ the original cutout goes back on top.
 - [Run it](#run-it) · [with Docker](#with-docker)
 - [Brand kits](#brand-kits--making-a-generation-something-a-client-can-sign-off-on)
 - [Batch mode](#batch-mode--many-photos-one-approved-look)
+- [Somewhere to stand](#somewhere-to-stand--stages-finishing-and-surfaces)
 - [Architecture](#architecture)
 - [When ComfyUI has a bad night](#when-comfyui-has-a-bad-night)
 - [The people in the photographs](#the-people-in-the-photographs)
@@ -54,6 +55,7 @@ Not "it calls an image API". The parts worth reading:
 | **A websocket relay, not polling** | One persistent connection to ComfyUI's own websocket, relayed per-session to the right browser tab — progress, executing-node, and binary mid-denoise preview frames. [→](#why-a-websocket-relay-instead-of-just-polling) |
 | **Brand kits enforced server-side** | The client sends `{brand_id, look_id, free text}` and never a finished prompt, because a locked negative the client assembles is one a stale client can drop. [→](#brand-kits--making-a-generation-something-a-client-can-sign-off-on) |
 | **A locked seed makes a set** | 200 guests used to mean 200 unrelated images. A seed derived from (brand, look) makes them one campaign. [→](#batch-mode--many-photos-one-approved-look) |
+| **The background was at infinity** | The depth map said *everything that is not this person is infinitely far away*, so the model could only ever paint a distant backdrop. Synthesising a floor and a wall is the single biggest change to what the output looks like. [→](#somewhere-to-stand--stages-finishing-and-surfaces) |
 | **A real queue seam** | Bounded worker pool with admission control in front of a serial GPU, behind an interface a Redis/Celery version could satisfy unchanged. [→](#the-queue) |
 | **Failure handling you can reproduce** | Retry that knows which failures are worth retrying and which are *ambiguous*, a circuit breaker, and a fake ComfyUI that fails on a seed so the whole thing is demonstrable. [→](#when-comfyui-has-a-bad-night) |
 | **A privacy posture, not a promise** | Consent recorded before the shutter (recorded, not enforced — a deliberate trade, argued below), the original photograph deleted the moment a cutout exists, and a retention sweep that runs whether or not anyone remembers. [→](#the-people-in-the-photographs) |
@@ -291,6 +293,146 @@ Design decisions worth knowing:
   make it blocking) and expires on a retention clock; the uploaded photographs
   are deleted as soon as their cutouts exist. See
   [The people in the photographs](#the-people-in-the-photographs).
+
+## Somewhere to stand — stages, finishing and surfaces
+
+Three problems that all look like "the AI isn't very good", and are all
+actually pipeline bugs.
+
+### The background was at infinity — `stage.py`
+
+The depth map handed to ControlNet was a bright silhouette of the subject on
+pure black. Depth here is inverse (white = near, black = far), so black means
+*infinitely distant*: the model was being told, every single time, that
+everything which is not this person is at infinite range.
+
+That single fact explains most of what was wrong with the output. There is no
+geometry for a wall, a table or a tree to attach to, so the only thing the
+model can legally paint is a far backdrop — haze, sky, a distant skyline. Every
+result was a person standing *in front of* a place rather than *inside* one.
+
+So a plausible stage is synthesised before generating: a ground plane running
+from the bottom edge to a horizon, a backdrop at a *finite* distance, and
+optionally side walls that read as an interior. The horizon is derived from the
+subject rather than fixed — a standing figure tells you where the camera was,
+and a booth photographs children and seated guests too.
+
+The prior is deliberately smooth and low-detail. It is a constraint on *where
+surfaces are*, not an edge map to trace; a high-frequency fake shows through in
+the output. The subject's own measured depth is copied through untouched.
+
+Five stages (`terrace`, `room`, `landscape`, `studio`, `void`), chosen per look
+in the brand kit. `void` is the old behaviour, kept so a look that the prior
+makes worse has a way back that isn't a code change.
+
+Verified by A/B on the real GPU, same seed and prompt: with `void`, the city
+skyline starts at the subject's feet; with `terrace`, there is a parapet, a
+railing, and the city *beyond* it. A spatially explicit prompt can partly
+compensate for the void, which is the honest caveat — the prior makes a good
+result *reliable* rather than merely possible.
+
+Each item's manifest carries a `stage_relief` score, so "the prior fired" is a
+number rather than an impression. The void scores 0.0 by construction; a real
+stage scores 0.2–0.5.
+
+Note the ordering against `suggest_controlnet_strength()`: that still measures
+the *guest's own* depth, before the stage is built. It is asking how much real
+structure the room behind them has. Pointed at the prior instead, it would be
+measuring our own synthetic geometry and would lower the strength on every
+single frame.
+
+### The deliverable wasn't finished — `finish.py`
+
+There were two compositors and only one of them was done. The browser canvas
+draws a contact shadow and places the brand logo. The *batch* path — the one
+that produces the fifty frames a client actually receives — did this:
+
+```python
+canvas.alpha_composite(cutout)
+```
+
+So the deliverable had no logo (the mark existed only as a browser layer), no
+contact shadow (the pipeline computes one and it was discarded), and no
+relationship between how the subject was lit and how the scene was lit. The
+demo was branded and grounded; the product was not.
+
+Three steps now, in the order a retoucher would do them:
+
+1. **Shadow first**, under the subject — it has to go down before them or it
+   draws on top of their shoes. Deterministic, not AI, and the cheapest
+   available fix for "the person is floating".
+2. **Grade the subject toward the plate.** A studio-lit person dropped into a
+   golden-hour terrace reads as a sticker no matter how good the matte is,
+   because the two halves of the picture disagree about the colour of the
+   light. Grey-world, measured subject-against-plate, moved a *fraction* of the
+   way (0.35) with per-channel gain clamped. Deliberately partial: pull the
+   whole way and you have regenerated the guest's skin tone, which is the one
+   thing this tool promises never to do.
+3. **Logo last**, using the same geometry as the browser, so a batch frame and
+   an interactive frame place the mark identically. Aspect comes from the
+   artwork and never from a caller — a stretched logo is the most common brand
+   violation there is, and the way not to commit it is to make it
+   unrepresentable.
+
+What was applied goes into the manifest, so "was the mark on this frame, and
+where" is answerable months later without opening the picture.
+
+### A booth is not one output — `surfaces.py`
+
+The Spout sender — the one that drives a real LED wall through Resolume — was
+hardcoded to **768×768**. A square. That is not the shape of any wall, screen,
+projector or print in existence.
+
+A booth renders onto several surfaces at once: the backdrop the guest is
+standing in front of, the frame they take home, a story crop, a printed strip
+whose aspect is decided by the paper in the machine, a loop on a screen by the
+door. Those are crops of one generation, and letting each consumer crop for
+itself is how a guest ends up centred on the wall and beheaded on the print.
+
+So each surface declares its pixel size, its safe margin, where the mark goes
+and — the field that does the real work — where the *subject* should sit:
+
+| | size | notes |
+|---|---|---|
+| `led_backdrop` | 1920×1080 | live; no logo, the guest's body would cover it |
+| `ultrawide_backdrop` | 3840×1080 | the shape that makes a square sender obviously wrong |
+| `frame_4x5` | 1080×1350 | the delivered frame |
+| `story_9x16` | 1080×1920 | bigger margin: phone UI eats both bands |
+| `print_2x6` | 600×1800 @300dpi | booth strip; margin is bleed, not taste |
+| `print_6x4` | 1800×1200 @300dpi | postcard |
+| `loop_16x9` | 1920×1080 | event screen |
+
+**Cover, never stretch.** A person made 12% wider to fit a wall is a worse
+failure than a person with less headroom, and it is the one nobody notices
+until the photographs are printed.
+
+**The crop is placed, not centred.** The vertical offset puts the subject's
+feet on the surface's anchor. Cover-fit alone often leaves no room to do that —
+a square photo scaled to 9:16 fills the height exactly — so the fit is allowed
+to zoom up to 18% past cover to buy the slack back. Bounded on both sides: the
+window never leaves the picture, and the zoom never grows enough to take
+somebody's head off in order to land their feet on a line.
+
+**When the subject doesn't fit, the head wins.** Found by looking at a real
+postcard: a standing full-length portrait is nearly twice as tall as a 6×4
+landscape crop, and obediently anchoring the feet delivered a print of two
+shoes and two knees with the face gone. It was doing exactly what it was told,
+and what it was told was wrong — an anchor for feet only means something if
+there is a body above them still in frame. Too tall to fit now becomes a
+waist-up portrait, which is the crop a person would have made.
+
+**The mark is placed per surface, after the crop.** The first version branded
+the master and then cropped it, which pushed the logo off the edge of the
+postcard entirely. Frames are now finished unbranded and each output gets its
+own placement, in its own corner — or none at all on a live surface. A
+surface's safe margin *widens* the kit's clear space rather than replacing it,
+so a story's mark clears the phone UI while a kit that demands more room than
+the surface asks for still gets it.
+
+Opt-in per run (`--surfaces story_9x16,print_2x6`), because writing six renders
+of every photo triples the size of a fifty-photo zip for an operator who only
+wanted the frames. The live surface is a server setting
+(`BOOTH_LIVE_SURFACE`), and the Spout sender now takes its dimensions from it.
 
 ## Architecture
 
@@ -717,9 +859,11 @@ pip install -r requirements-test.txt
 pytest
 ```
 
-347 tests covering the pure-logic parts of the pipeline (mask blob cleanup,
+409 tests covering the pure-logic parts of the pipeline (mask blob cleanup,
 illumination estimation, resolution capping, the ControlNet-strength heuristic,
-contact shadow geometry, cover-fit), brand-kit loading and enforcement, workflow
+contact shadow geometry, cover-fit), the stage-depth prior, the frame finisher
+(grade, contact shadow, logo geometry), the output-surface model, brand-kit
+loading and enforcement, workflow
 role resolution, the queue's admission control and failure isolation, the retry
 ladder and circuit breaker, consent/retention/minimisation, the attention
 queue's escalation criteria, the watchdog's two clocks and its recover-before-
@@ -817,6 +961,21 @@ stale.
 - The watchdog can only recover a render that ComfyUI still has in `/history`.
   If ComfyUI is restarted, the history goes with it and those jobs are failed —
   correctly, but the picture is genuinely gone.
+- **The stage prior can suppress distant detail the look asks for.** Observed on
+  the real GPU: Aurora's `rooftop` look prompts for a "city skyline softly out
+  of focus", and with the `terrace` stage the result was a clean wall and an
+  empty pale sky — no city. The backdrop above the horizon is a single constant
+  depth, which is a perfectly good instruction for *a wall* and a poor one for
+  *a skyline behind a wall*. The floor, the wall and the grounded subject are a
+  large net gain and the frames no longer read as stickers, but a look whose
+  value is in the far distance may want `landscape`, or `void` and a spatially
+  explicit prompt. The stage set does not currently model "near parapet, far
+  city", and that is the obvious next stage to add.
+- The subject grade is grey-world colour balance, not relighting. It fixes the
+  case where the plate and the subject disagree about the *colour* of the
+  light. It cannot fix a disagreement about its *direction* — a subject lit
+  flat from the front, dropped into a scene with a hard low sun, still reads
+  wrong, and no amount of channel gain moves a shadow.
 - The illumination estimate is classic CV (per-quadrant luminance, highlight
   color, contrast), not a learned model — a useful heuristic for
   prompt-grounding, not a physically accurate light probe.

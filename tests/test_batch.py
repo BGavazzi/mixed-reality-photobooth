@@ -100,22 +100,27 @@ def test_the_subject_is_composited_back_unchanged(tmp_path):
     path = tmp_path / "cutout.png"
     cutout.save(path)
 
-    result = batch.composite_subject_over(Image.new("RGB", (32, 32), (200, 0, 0)), path)
+    # Grading off: this test is about the subject's *geometry* surviving the
+    # round trip. What a colour grade may and may not do to those pixels is
+    # tests/test_finish.py's question, and asserting both here would mean
+    # neither could be changed without breaking the other.
+    result, applied = batch.composite_subject_over(
+        Image.new("RGB", (32, 32), (200, 0, 0)), path, grade_strength=0)
 
     assert result.getpixel((16, 16)) == (10, 200, 30), "subject pixel was altered"
     assert result.getpixel((0, 0)) == (200, 0, 0), "background should show where the subject isn't"
+    assert applied["logo"] is None, "no brand kit was supplied, so no mark should appear"
 
 
-def test_a_size_mismatch_is_resized_rather_than_failing_the_item(tmp_path, capsys):
+def test_a_size_mismatch_is_resized_rather_than_failing_the_item(tmp_path):
     """The workflow has no resize node so sizes normally match; if that ever
     changes, losing the whole frame would be a worse answer than a resize."""
     path = tmp_path / "cutout.png"
     Image.new("RGBA", (16, 16), (0, 255, 0, 255)).save(path)
 
-    result = batch.composite_subject_over(Image.new("RGB", (64, 64), (0, 0, 0)), path)
+    result, _ = batch.composite_subject_over(Image.new("RGB", (64, 64), (0, 0, 0)), path)
 
     assert result.size == (64, 64)
-    assert "mismatch" in capsys.readouterr().out
 
 
 # --- zipping --------------------------------------------------------------------

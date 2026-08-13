@@ -55,6 +55,7 @@ def start(server: str, photos: list[Path], args) -> dict:
         "consent_basis": args.consent or "",
         "consent_by": args.consent_by or "",
         "consent_note": args.consent_note or "",
+        "surfaces": args.surfaces or "",
     }
     resp = requests.post(f"http://{server}/api/batch", files=files, data=data, timeout=300)
     if resp.status_code >= 400:
@@ -120,6 +121,10 @@ def main():
     parser.add_argument("--consent", help="consent basis (see /api/config for the list)")
     parser.add_argument("--consent-by", help="who recorded that consent")
     parser.add_argument("--consent-note", default="", help="optional free-text detail")
+    parser.add_argument("--surfaces", default="",
+                        help="also render each frame for these declared output surfaces, "
+                             "comma-separated (see /api/config); e.g. "
+                             "story_9x16,print_2x6")
     parser.add_argument("-o", "--out", type=Path, help="write the zip here when finished")
     parser.add_argument("--no-wait", action="store_true",
                         help="queue the run and exit, instead of following it")

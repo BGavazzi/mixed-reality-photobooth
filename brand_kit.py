@@ -36,6 +36,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import stage as stage_module
+
 BRANDS_DIR = Path(__file__).parent / "brands"
 
 # ComfyUI's KSampler takes a 64-bit seed, but staying inside 32 bits keeps the
@@ -68,6 +70,12 @@ class Look:
     id: str
     label: str
     prompt: str
+    # Which stage geometry to build behind the subject (see stage.py). A look
+    # is a *place*, and a place has a shape -- "Rooftop Social" wants a floor
+    # and a parapet, "Studio Seamless" wants a cyclorama. Optional, because a
+    # kit written before stages existed must still load; the default is the
+    # one that flatters the widest range of photos.
+    stage: str = stage_module.DEFAULT_STAGE
 
 
 @dataclass(frozen=True)
@@ -168,10 +176,19 @@ def parse_brand(data: dict, directory: Path) -> BrandKit:
     for raw in data.get("looks", []):
         if not isinstance(raw, dict):
             raise BrandKitError(f"{source}: every entry in 'looks' must be an object")
+        look_stage = raw.get("stage", stage_module.DEFAULT_STAGE)
+        try:
+            stage_module.get(look_stage)
+        except stage_module.StageError as exc:
+            # Named here rather than at generation time: a typo in a hand-edited
+            # brand file should fail when the kit loads, with the file named,
+            # not silently fall back and look like the prior is broken.
+            raise BrandKitError(f"{source}: {exc}") from exc
         look = Look(
             id=_require(raw, "id", source),
             label=_require(raw, "label", source),
             prompt=_require(raw, "prompt", source),
+            stage=look_stage,
         )
         if look.id in seen_ids:
             # Duplicate ids would silently shadow each other in look(), and
@@ -285,6 +302,11 @@ class ComposedPrompt:
     free_text: str = ""
     locked_positive: str = ""
     locked_negative: str = ""
+    # The stage geometry the look asks for (see stage.py). Part of the composed
+    # result rather than looked up later, because it is the same kind of fact
+    # as the locked negative: something the kit decided, that the client does
+    # not get to override.
+    stage: str = stage_module.DEFAULT_STAGE
 
     def to_provenance(self) -> dict:
         """The brand-side fields that get stapled onto every generation record."""
@@ -294,6 +316,7 @@ class ComposedPrompt:
             "brand_version": self.brand_version,
             "look": self.look_label,
             "look_id": self.look_id,
+            "stage": self.stage,
             "negative_prompt": self.negative,
             "operator_text": self.free_text,
         }
@@ -369,4 +392,5 @@ def compose(
         free_text=free_text,
         locked_positive=locked_positive,
         locked_negative=locked_negative,
+        stage=look.stage if look else stage_module.DEFAULT_STAGE,
     )

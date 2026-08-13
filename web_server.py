@@ -44,9 +44,12 @@ import batch
 import brand_kit
 import config
 import consent
+import finish
 import job_queue
 import obs
 import resilience
+import stage
+import surfaces
 import watchdog
 import workflow_graph
 from backends.comfy import ComfyBackend, DEFAULT_PHOTOSHOOT_BG_WORKFLOW_PATH
@@ -175,8 +178,15 @@ print(f"[brands] loaded {len(BRANDS)} brand kit(s): {', '.join(BRANDS) or 'none'
 # app doesn't depend on bridge.py running at all, and never collides with
 # its "ComfyBridge" sender if both happen to be up at once.
 PHOTOBOOTH_SPOUT_NAME = "PhotoBooth"
-PHOTOBOOTH_SPOUT_WIDTH = 768
-PHOTOBOOTH_SPOUT_HEIGHT = 768
+# The live surface is declared, not guessed. This used to be a hardcoded
+# 768x768 -- a square, which is not the shape of any wall, projector or screen
+# that has ever existed, so every frame sent to Resolume was pre-cropped to an
+# aspect nothing downstream wanted. See surfaces.py.
+PHOTOBOOTH_SURFACE = surfaces.get(config.env_str(
+    "BOOTH_LIVE_SURFACE", surfaces.DEFAULT_LIVE_SURFACE,
+    "which declared surface the Spout sender feeds"))
+PHOTOBOOTH_SPOUT_WIDTH = PHOTOBOOTH_SURFACE.width
+PHOTOBOOTH_SPOUT_HEIGHT = PHOTOBOOTH_SURFACE.height
 PHOTOBOOTH_SPOUT_FPS = 15
 
 
@@ -632,10 +642,29 @@ def _finish_batch_item(job: dict, prompt_id: str, image: Image.Image):
     if item is None:
         return
     try:
-        composite = batch.composite_subject_over(image, run.path_for("cutout", item))
+        brand = BRANDS.get(run.brand_id) if run.brand_id else None
+        logo_image = None
+        if brand is not None and brand.logo is not None and brand.logo_path.exists():
+            logo_image = Image.open(brand.logo_path)
+        # Finished unbranded first. Every surface is a different crop of this
+        # frame and each needs the mark placed inside its *own* edges -- a logo
+        # composited before the crop is one the crop can push off the picture,
+        # which is what a 6x4 postcard did to it.
+        composite, applied = batch.composite_subject_over(
+            image, run.path_for("cutout", item), run.path_for("shadow", item))
+        # One generation, framed for every surface the operator asked for. The
+        # subject lands where each surface says they should rather than wherever
+        # a centre crop happens to put them; see surfaces.py.
+        written = batch.write_surfaces(run, item, composite,
+                                       logo=logo_image,
+                                       logo_rules=brand.logo if brand else None)
+        composite, applied["logo"] = finish.brand(
+            composite, logo_image, brand.logo if brand else None)
         composite.save(run.path_for("output", item))
         with run.lock:
-            item.provenance = job["provenance"]
+            item.provenance = {**(job["provenance"] or {}), "finish": applied,
+                               "surfaces": written,
+                               "stage_relief": job.get("stage_relief")}
             item.status = batch.DONE
         run.write_manifest()
         print(f"[batch] {run.run_id} item {item.stem} done "
@@ -662,8 +691,31 @@ def _batch_submit(run: batch.BatchRun, item: batch.BatchItem, composed, settings
     # Persisted rather than kept in memory: fifty subjects' worth of decoded
     # images waiting on a serial GPU is how a long batch becomes an OOM.
     result["cutout"].save(run.path_for("cutout", item))
+    # The contact shadow is kept, because the composite at the end of this
+    # needs it and it is the cheapest fix there is for a subject that floats.
+    # Not a privacy concern the way the original photograph is: it is a black
+    # ellipse, and it identifies nobody.
+    result["shadow"].save(run.path_for("shadow", item))
     if batch.KEEP_INTERMEDIATES:
         result["image"].save(run.path_for("analyzed", item))
+
+    # Geometry for the model to build a room on, instead of the void it used to
+    # be handed. See stage.py -- this is the single largest change to what the
+    # output actually looks like.
+    #
+    # Note the ordering against analyze(): suggest_controlnet_strength() has
+    # already run, on the *measured* depth. That is the right input for it --
+    # it is asking how much real structure the guest's own room has, so that a
+    # busy background gets a gentler strength. Measuring the stage instead
+    # would be measuring our own prior and would lower the strength on every
+    # frame, which is precisely backwards.
+    staged_depth = stage.build_depth(result["depth"], result["mask"], composed.stage)
+    # "the prior fired" as a number rather than an impression, alongside the
+    # stage id that composed.to_provenance() already records. The void scores
+    # ~0 by construction, so a manifest full of zeroes is a visible symptom
+    # rather than something only noticeable in the pictures.
+    JOBS.get(item.prompt_id, {})["stage_relief"] = round(
+        stage.background_relief(staged_depth, result["mask"]), 3)
 
     run.set_status(item, batch.GENERATING)
     # The generation is conditioned on the analysed image, but that copy stays
@@ -676,7 +728,7 @@ def _batch_submit(run: batch.BatchRun, item: batch.BatchItem, composed, settings
     return backend.queue_background_generation(
         result["image"],
         ImageOps.invert(result["mask"].convert("L")),
-        result["depth"].convert("RGB"),
+        staged_depth.convert("RGB"),
         composed.positive,
         settings["controlnet_strength"],
         settings["denoise"],
@@ -770,6 +822,12 @@ def browser_config():
         # Served rather than duplicated in the page, so the list an operator
         # picks from and the list the server accepts cannot drift apart.
         "consent_bases": consent.options(),
+        # Both served rather than duplicated in the page, for the same reason
+        # the consent bases are: the list the operator picks from and the list
+        # the server accepts cannot be allowed to drift apart.
+        "stages": stage.options(),
+        "surfaces": surfaces.options(),
+        "live_surface": PHOTOBOOTH_SURFACE.to_dict(),
         # Off by default. The page uses this to decide whether the consent
         # fields block the file picker or merely offer to record something;
         # both states are the same form, so an operator who wants the record
@@ -791,6 +849,7 @@ async def start_batch(
     consent_basis: str = Form(""),
     consent_by: str = Form(""),
     consent_note: str = Form(""),
+    surfaces_wanted: str = Form("", alias="surfaces"),
 ):
     """Starts a batch: N photos, one approved look, one consistent set.
 
@@ -823,6 +882,11 @@ async def start_batch(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
+        wanted = surfaces.parse_list(surfaces_wanted)
+    except surfaces.SurfaceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
         composed = _compose_for_request({"brand_id": brand_id, "look_id": look_id, "prompt": prompt})
     except BrandKitError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -833,7 +897,8 @@ async def start_batch(
 
     run = batch.create_run([f.filename or f"photo_{i}" for i, f in enumerate(files)],
                            composed.brand_id, composed.look_id, composed.look_label,
-                           consent=consent_record.to_dict())
+                           consent=consent_record.to_dict(),
+                           surface_ids=[s.id for s in wanted])
 
     # Uploads are read and written to disk here, in the request, because the
     # UploadFile objects are only valid for its lifetime -- a queue worker

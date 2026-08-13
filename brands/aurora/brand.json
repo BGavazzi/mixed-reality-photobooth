@@ -3,44 +3,55 @@
   "name": "Aurora Beverages",
   "version": "2026.08-r1",
   "notes": "Fictional demo brand. Cool-toned, clean, daylight-forward. The kit exists to show the mechanism; swap in a real client's guidelines by editing this file only -- no code changes.",
-
   "palette": [
-    { "name": "Aurora Teal", "hex": "#00B5AD" },
-    { "name": "Deep Sea", "hex": "#0B3C49" },
-    { "name": "Citrus Pop", "hex": "#F5B942" },
-    { "name": "Paper", "hex": "#F4F1EA" }
+    {
+      "name": "Aurora Teal",
+      "hex": "#00B5AD"
+    },
+    {
+      "name": "Deep Sea",
+      "hex": "#0B3C49"
+    },
+    {
+      "name": "Citrus Pop",
+      "hex": "#F5B942"
+    },
+    {
+      "name": "Paper",
+      "hex": "#F4F1EA"
+    }
   ],
-
   "prompt": {
     "positive_suffix": "clean modern beverage advertising photography, crisp daylight, teal and warm amber colour grade, shallow depth of field, uncluttered composition, premium editorial finish",
     "negative_suffix": "competing brand logos, brand names, visible text, signage, alcohol, cigarettes, medical imagery, gore, political imagery, religious symbols, weapons, crowded background, cluttered props"
   },
-
   "seed_policy": "locked",
-
   "looks": [
     {
       "id": "rooftop",
       "label": "Rooftop Social",
-      "prompt": "sunlit rooftop terrace, city skyline softly out of focus, pale concrete and pale timber, summer afternoon"
+      "prompt": "sunlit rooftop terrace, city skyline softly out of focus, pale concrete and pale timber, summer afternoon",
+      "stage": "terrace"
     },
     {
       "id": "coastline",
       "label": "Coastal Morning",
-      "prompt": "open coastline at early morning, pale sand, soft sea haze, cool blue horizon"
+      "prompt": "open coastline at early morning, pale sand, soft sea haze, cool blue horizon",
+      "stage": "landscape"
     },
     {
       "id": "studio",
       "label": "Studio Seamless",
-      "prompt": "studio seamless backdrop in pale teal, soft large key light from the left, gentle floor gradient"
+      "prompt": "studio seamless backdrop in pale teal, soft large key light from the left, gentle floor gradient",
+      "stage": "studio"
     },
     {
       "id": "market",
       "label": "Fresh Market",
-      "prompt": "bright open-air produce market, woven baskets, citrus crates, canvas awnings, midday light"
+      "prompt": "bright open-air produce market, woven baskets, citrus crates, canvas awnings, midday light",
+      "stage": "room"
     }
   ],
-
   "logo": {
     "file": "logo.png",
     "min_width_pct": 12,
