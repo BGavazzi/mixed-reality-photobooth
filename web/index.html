@@ -89,6 +89,37 @@
     font-size: 11px; color: var(--warn); margin-top: 10px; line-height: 1.4;
     border-left: 2px solid var(--warn); padding-left: 8px;
   }
+  /* This app is a front-end for a ComfyUI instance, and half of what goes
+     wrong (queue stuck, model not loaded, node error) is only visible in
+     ComfyUI's own UI. Not linking to it meant knowing the port by heart. */
+  header a.ext {
+    color: var(--dim); font-size: 12px; text-decoration: none;
+    border: 1px solid var(--border); border-radius: 5px; padding: 3px 8px;
+  }
+  header a.ext:hover { color: var(--text); border-color: var(--accent); }
+  select {
+    width: 100%; background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 8px; font-size: 13px; font-family: inherit;
+  }
+  .swatches { display: flex; gap: 4px; margin-top: 8px; }
+  .swatch { flex: 1; height: 20px; border-radius: 3px; border: 1px solid rgba(255,255,255,.12); }
+  /* The composed-prompt preview. Its whole job is to make the difference
+     between "what the kit mandates" and "what I typed" visible at a glance --
+     a preview that showed only the final joined string would hide exactly the
+     guarantee the brand kit exists to provide. */
+  .prompt-part { font-size: 11px; line-height: 1.45; margin: 6px 0; padding-left: 8px; border-left: 2px solid var(--border); }
+  .prompt-part .tag { display: block; font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); margin-bottom: 2px; }
+  .prompt-part.locked { border-left-color: var(--accent2); color: var(--text); }
+  .prompt-part.free { border-left-color: var(--accent); color: var(--text); }
+  .prompt-part.blocked { border-left-color: var(--bad); color: var(--dim); }
+  .brand-violation {
+    font-size: 11px; color: var(--warn); line-height: 1.4; margin-top: 8px;
+    border-left: 2px solid var(--warn); padding-left: 8px;
+  }
+  .lock-pill {
+    display: inline-block; font-size: 9.5px; padding: 1px 6px; border-radius: 9px;
+    background: rgba(216,139,255,.15); color: var(--accent2); margin-left: 6px;
+  }
 </style>
 </head>
 <body>
@@ -96,8 +127,26 @@
 <header>
   <h1>Mixed-Reality Photo Booth</h1>
   <span>ComfyUI + SDXL ControlNet · rotoscope → pose → depth → relight → regenerate</span>
-  <span id="connStatus" style="margin-left:auto" class="badge">connecting…</span>
+  <!-- Hidden until there is something to say. A badge that always sits there
+       reading "0 issues" is furniture; one that only appears when a person is
+       needed is a signal. -->
+  <button id="attentionBadge" class="badge" style="margin-left:auto;display:none;cursor:pointer;border:0"
+          title="Things that need an operator — click to review"></button>
+  <a id="comfyLink" class="ext" target="_blank" rel="noopener"
+     title="Open the ComfyUI instance this app drives — the queue, node graph and error log live there">Open ComfyUI ↗</a>
+  <span id="connStatus" class="badge">connecting…</span>
 </header>
+
+<!-- The attention drawer. Deliberately a list of individually-resolvable rows
+     rather than a toast: a toast that disappears while the operator is holding
+     a camera is the same as no alert at all. -->
+<div id="attentionPanel" style="display:none;position:fixed;top:54px;right:12px;width:400px;max-height:70vh;overflow:auto;z-index:50;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;box-shadow:0 8px 30px rgba(0,0,0,.5)">
+  <div style="display:flex;align-items:center;gap:8px">
+    <strong style="font-size:13px;letter-spacing:.04em;text-transform:uppercase">Needs a person</strong>
+    <button class="secondary small" id="btnAttentionClose" style="margin-left:auto">Close</button>
+  </div>
+  <div id="attentionList"></div>
+</div>
 
 <main>
   <!-- LEFT: upload + pipeline stages -->
@@ -124,6 +173,34 @@
     </div>
 
     <div class="panel">
+      <h2>Batch</h2>
+      <div class="hint" style="margin-top:0">Many photos, one approved look. Uses the brand kit selected on the right -- with a locked seed, the whole set renders as one campaign instead of one image per guest. Runs server-side, so it survives closing this tab.</div>
+
+      <!-- The consent record. Optional by default (see consent.py): whatever
+           is declared here is written into the run's manifest and travels with
+           the images, but an empty form does not block the picker. The server
+           is the authority on that -- `consent_required` in /api/config -- so
+           a booth started with --require-consent gets the blocking version of
+           this same form without a second code path. -->
+      <div style="margin-top:12px;padding:10px;border:1px solid var(--line);border-radius:6px">
+        <label class="hint" style="margin:0 0 4px;display:block" id="consentLabel">Consent basis</label>
+        <select id="consentBasis" style="width:100%">
+          <option value="">— not recorded —</option>
+        </select>
+        <div class="hint" id="consentDescription" style="margin:6px 0 0"></div>
+        <input type="text" id="consentBy" placeholder="Recorded by (your name)"
+               style="width:100%;margin-top:6px">
+        <div class="hint" id="retentionNote" style="margin:6px 0 0"></div>
+      </div>
+
+      <button class="secondary small" id="btnBatchPick" style="width:100%;margin-top:10px" disabled>Choose Photos…</button>
+      <input type="file" id="batchInput" accept="image/*" multiple>
+      <div class="hint" id="batchStatus" style="display:none"></div>
+      <div class="progress-bar" id="batchBar" style="display:none"><div id="batchFill"></div></div>
+      <button class="secondary small" id="btnBatchDownload" style="width:100%;margin-top:8px;display:none">Download Frames (.zip)</button>
+    </div>
+
+    <div class="panel">
       <h2>Project</h2>
       <button class="secondary small" id="btnExportJson" style="width:100%;margin-bottom:6px" disabled>Export Project (.json)</button>
       <button class="secondary small" id="btnImportJson" style="width:100%">Import Project (.json)</button>
@@ -146,10 +223,28 @@
 
   <!-- RIGHT: scene prompt + layers + export -->
   <div class="col">
+    <div class="panel" id="brandPanel">
+      <h2>Brand Kit</h2>
+      <div class="hint" style="margin-top:0">Pick a client and one of their approved looks. The prompt is then composed, not typed -- the kit's styling and its blocklist are added server-side on every generation, so they can't be edited away from here.</div>
+      <label class="field">Client</label>
+      <select id="brandSelect"><option value="">No brand (free prompt)</option></select>
+      <div id="brandBody" style="display:none">
+        <div class="swatches" id="brandSwatches"></div>
+        <label class="field">Approved look <span class="lock-pill" id="seedPill">locked seed</span></label>
+        <select id="lookSelect"></select>
+        <div class="hint" id="brandNotes"></div>
+        <button class="secondary small" id="btnPlaceLogo" style="width:100%;margin-top:10px">Place Brand Logo</button>
+        <button class="secondary small" id="btnSafeArea" style="width:100%;margin-top:6px">Clear-space guide: OFF</button>
+        <div class="hint">The logo is composited, never generated -- SDXL cannot draw a legible mark, so the model is told to avoid text entirely and the real artwork goes on top as its own layer. Its aspect ratio is fixed to the file and its minimum size is enforced by the scale slider.</div>
+        <div class="brand-violation" id="brandViolations" style="display:none"></div>
+      </div>
+    </div>
+
     <div class="panel">
       <h2>3. Generate Background</h2>
-      <label class="field">Scene prompt (respects, or overrides, the detected lighting)</label>
+      <label class="field" id="scenePromptLabel">Scene prompt (respects, or overrides, the detected lighting)</label>
       <textarea id="scenePrompt" rows="3" placeholder="e.g. sunlit rooftop terrace at golden hour, city skyline"></textarea>
+      <div id="composedPreview" style="display:none"></div>
       <button class="secondary small" id="btnVoicePrompt" style="width:100%;margin-top:6px">🎤 Speak Scene (hands-free direction)</button>
       <label class="field">ControlNet depth strength <span class="val" id="cnVal">0.75</span></label>
       <input type="range" id="cnStrength" min="0" max="1.5" step="0.05" value="0.75">
@@ -227,7 +322,17 @@ const state = {
   drawingRect: null, // {x0,y0,x1,y1} in canvas space, while drawing a region
   provenanceLog: [], // every generation's metadata this session, for the disclosure card + export audit trail
   photoWidth: null, photoHeight: null, // the analyzed photo's real pixel size, for the canvas-fit offer
+  brandId: '', lookId: '', // the active brand kit + approved look; '' means the unbranded free-prompt path
+  showSafeArea: false, // clear-space guide for logo placement; an editing aid, never exported
+  // True while the scene prompt still holds the descriptor analyze() filled in
+  // and the operator hasn't touched it. Selecting a brand clears an untouched
+  // autofill but never clears something a person typed -- see onBrandChange.
+  scenePromptIsAutofill: false,
 };
+// Served by /api/config. Brand kits are server-side configuration (they can
+// mandate a negative prompt the client is not allowed to drop), so the browser
+// is told about them rather than owning them.
+let serverConfig = { comfy_address: null, brands: [], base_negative_prompt: '' };
 // Decoded-image cache keyed by source URL. Layer sources are stable data
 // URLs, so caching them is what keeps redraw() from re-decoding several
 // megabytes of PNG on every pointermove during a layer drag.
@@ -263,6 +368,22 @@ function loadImg(src, { cache = true } = {}) {
 function findLayer(id) { return state.layers.find(l => l.id === id); }
 function activeLayer() { return state.activeLayerId ? findLayer(state.activeLayerId) : null; }
 
+// One rule, one place. These four buttons all mean "there is a composite to
+// act on", and the condition was previously re-derived at three separate call
+// sites -- so deleting the last layer left every one of them enabled, offering
+// to export, record and project an empty canvas.
+function updateExportButtons() {
+  const hasComposite = state.layers.some(l => l.visible && l.src);
+  for (const id of ['btnExportPng', 'btnExportLiving', 'btnSendSpout']) {
+    const btn = document.getElementById(id);
+    btn.disabled = !hasComposite;
+    btn.title = hasComposite ? '' : 'Nothing to export yet — the canvas is empty.';
+  }
+  // Export Project is deliberately looser: a project worth saving is one with
+  // an analyzed subject, even if every layer is currently hidden.
+  document.getElementById('btnExportJson').disabled = !state.cutout && state.layers.length === 0;
+}
+
 const canvas = document.getElementById('compositeCanvas');
 const ctx = canvas.getContext('2d');
 
@@ -293,6 +414,7 @@ function paintLayers(layers, images, cameraOffsetPx) {
     const im = images[i];
     if (!im) continue;  // failed to decode; skip it rather than abort the whole paint
     ctx.globalAlpha = layer.opacity;
+    if (layer.kind === 'logo') { paintLogo(layer, im, cameraOffsetPx); continue; }
     // Cover-fit to the image's own aspect ratio instead of stretching it to
     // the canvas's fixed square shape -- naive canvas.width x canvas.height
     // sizing silently warped subject body proportions on any non-square
@@ -319,6 +441,8 @@ function paintLayers(layers, images, cameraOffsetPx) {
   }
   ctx.globalAlpha = 1;
 
+  if (state.showSafeArea) paintSafeArea();
+
   if (state.drawingRect) {
     const r = state.drawingRect;
     ctx.save();
@@ -330,12 +454,73 @@ function paintLayers(layers, images, cameraOffsetPx) {
   }
 }
 
+// --- logo placement ------------------------------------------------------------
+// A logo is not a photo, so it is not drawn like one. Every other layer is
+// cover-fit -- scaled up until it fills the canvas and cropped -- which for a
+// mark means cropping it and, worse, letting a non-square canvas stretch it.
+// The single most common brand-guideline violation in the wild is a distorted
+// logo, so the geometry here derives height from the artwork's own aspect and
+// gives the operator no control that could break it.
+
+const LOGO_ANCHORS = {
+  'bottom-right': [1, 1], 'bottom-left': [0, 1], 'top-right': [1, 0], 'top-left': [0, 0],
+};
+
+function logoGeometry(layer, im) {
+  // clear_space_pct is measured against the short side so the margin looks
+  // even on a portrait canvas; using width for both would put a much bigger
+  // gap at top and bottom of a tall frame than at its sides.
+  const margin = Math.min(canvas.width, canvas.height) * (layer.clearSpacePct / 100);
+  const w = canvas.width * (layer.widthPct / 100) * layer.scale;
+  const h = w * (im.height / im.width);   // aspect comes from the file, never from the user
+  const [ax, ay] = LOGO_ANCHORS[layer.corner] || LOGO_ANCHORS['bottom-right'];
+  const boxW = canvas.width - 2 * margin - w;
+  const boxH = canvas.height - 2 * margin - h;
+  return { x: margin + ax * boxW + layer.x, y: margin + ay * boxH + layer.y, w, h, margin };
+}
+
+function paintLogo(layer, im, cameraOffsetPx) {
+  const g = logoGeometry(layer, im);
+  // parallax 0 by default: a logo is an overlay on the frame, not an object
+  // inside the scene, so it should not drift during the living-photo sweep.
+  const shift = cameraOffsetPx * (layer.parallax || 0);
+  const angle = (layer.rotation || 0) * Math.PI / 180;
+  if (angle) {
+    ctx.save();
+    ctx.translate(g.x + g.w / 2 + shift, g.y + g.h / 2);
+    ctx.rotate(angle);
+    ctx.drawImage(im, -g.w / 2, -g.h / 2, g.w, g.h);
+    ctx.restore();
+  } else {
+    ctx.drawImage(im, g.x + shift, g.y, g.w, g.h);
+  }
+}
+
+function paintSafeArea() {
+  const layer = state.layers.find(l => l.kind === 'logo');
+  if (!layer) return;
+  const margin = Math.min(canvas.width, canvas.height) * (layer.clearSpacePct / 100);
+  ctx.save();
+  ctx.strokeStyle = 'rgba(216,139,255,.55)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.strokeRect(margin, margin, canvas.width - 2 * margin, canvas.height - 2 * margin);
+  ctx.restore();
+}
+
 async function getCompositeDataUrl() {
+  // The safe-area guide is an editing aid, not artwork. Without suppressing
+  // it here it would be baked into the exported PNG, the .webm, and the live
+  // Spout feed going to an LED wall -- the three places it must never appear.
+  const guideWasOn = state.showSafeArea;
+  state.showSafeArea = false;
   await redraw();
   const flat = document.createElement('canvas');
   flat.width = canvas.width; flat.height = canvas.height;
   const fctx = flat.getContext('2d');
   fctx.drawImage(canvas, 0, 0);
+  state.showSafeArea = guideWasOn;
+  if (guideWasOn) redraw();  // put the operator's guide back on screen
   return flat.toDataURL('image/png');
 }
 
@@ -480,14 +665,9 @@ async function handleGenerationDone(msg) {
   }
 
   pendingGeneration = null;
-  if (msg.kind !== 'image' && state.layers.length > 0) {
-    // sandbox-test images don't touch the project canvas, so they
-    // shouldn't flip on export/Spout buttons that describe its state
-    document.getElementById('btnExportPng').disabled = false;
-    document.getElementById('btnExportJson').disabled = false;
-    document.getElementById('btnExportLiving').disabled = false;
-    document.getElementById('btnSendSpout').disabled = false;
-  }
+  // sandbox-test images don't touch the project canvas, so they shouldn't
+  // flip on export/Spout buttons that describe its state
+  if (msg.kind !== 'image') updateExportButtons();
   if (msg.provenance) {
     state.provenanceLog.push(msg.provenance);
     renderProvenanceCard(msg.provenance);
@@ -502,10 +682,21 @@ function renderProvenanceCard(p) {
   const when = new Date(p.generated_at).toLocaleString();
   const lines = [
     `type: ${p.kind}`,
+  ];
+  // Brand first when there is one: it's the field a brand-safety reviewer
+  // opens this card to check, and burying it under the sampler settings made
+  // the record technically complete and practically useless to them.
+  if (p.brand) {
+    lines.push(`brand: ${p.brand} (kit ${p.brand_version})`);
+    if (p.look) lines.push(`approved look: ${p.look}`);
+    if (p.operator_text) lines.push(`operator added: "${p.operator_text}"`);
+  }
+  lines.push(
     `prompt: "${p.prompt}"`,
     `seed: ${p.seed}`,
     `checkpoint: ${p.checkpoint}`,
-  ];
+  );
+  if (p.negative_prompt) lines.push(`excluded: "${p.negative_prompt}"`);
   if (p.controlnet) lines.push(`controlnet: ${p.controlnet} (strength ${p.controlnet_strength})`);
   if (p.denoise != null) lines.push(`denoise: ${p.denoise}`);
   lines.push(`generated: ${when}`);
@@ -516,8 +707,15 @@ function renderProvenanceCard(p) {
 function disclosureText(p) {
   const when = new Date(p.generated_at).toLocaleString();
   let text = `This image's ${p.kind === 'background' ? 'background environment' : p.kind === 'region' ? 'added object' : 'content'} was generated using AI ` +
-    `(Stable Diffusion XL${p.controlnet ? ' with ControlNet depth guidance' : ''}) on ${when}.\n` +
-    `Model: ${p.checkpoint}\nSeed: ${p.seed}\nPrompt: "${p.prompt}"`;
+    `(Stable Diffusion XL${p.controlnet ? ' with ControlNet depth guidance' : ''}) on ${when}.\n`;
+  if (p.brand) {
+    text += `Brand kit: ${p.brand} (${p.brand_version})` + (p.look ? `, approved look "${p.look}"` : '') + '\n';
+  }
+  text += `Model: ${p.checkpoint}\nSeed: ${p.seed}\nPrompt: "${p.prompt}"`;
+  // The exclusion list belongs in the disclosure, not just the debug card: it
+  // is the part that documents what was actively prevented, which is what a
+  // brand-safety sign-off is asking about.
+  if (p.negative_prompt) text += `\nExcluded by the kit: "${p.negative_prompt}"`;
   if (p.controlnet) text += `\nControlNet: ${p.controlnet} (strength ${p.controlnet_strength}, denoise ${p.denoise})`;
   return text;
 }
@@ -591,6 +789,13 @@ async function handleFile(file) {
   // under the subject, over the environment) -- it's deterministic (from
   // pose foot keypoints, not AI), so it's on and correctly grounded no
   // matter how the generated background turns out.
+  // Analyzing rebuilds the layer stack from scratch, which used to throw away
+  // a logo that had already been placed -- silently, since it just vanished
+  // from a panel the operator wasn't looking at. Nothing else survives an
+  // analyze and nothing else should: every other layer is derived from the
+  // photo being replaced. The logo is the one layer that belongs to the
+  // *brand*, not to the photo, so it is carried across and put back on top.
+  const keptLogo = state.layers.find(l => l.kind === 'logo');
   state.layers = [
     { id: 'background', name: 'Background', kind: 'background', src: state.original, visible: true, opacity: 1, x: 0, y: 0, scale: 1, rotation: 0, parallax: 0 },
     { id: 'depth', name: 'Depth (debug)', kind: 'debug', src: state.depth, visible: false, opacity: 0.8, x: 0, y: 0, scale: 1, rotation: 0, parallax: 0 },
@@ -598,6 +803,7 @@ async function handleFile(file) {
     { id: 'shadow', name: 'Contact Shadow', kind: 'shadow', src: state.shadow, visible: true, opacity: 1, x: 0, y: 0, scale: 1, rotation: 0, parallax: 0.1 },
     { id: 'subject', name: 'Subject', kind: 'subject', src: state.cutout, visible: true, opacity: 1, x: 0, y: 0, scale: 1, rotation: 0, parallax: 1 },
   ];
+  if (keptLogo) state.layers.push(keptLogo);
   state.activeLayerId = 'subject';
   syncScaleSlider();
 
@@ -613,8 +819,15 @@ async function handleFile(file) {
   document.getElementById('stagesPanel').style.display = 'block';
   state.photoWidth = data.width; state.photoHeight = data.height;
   updateCanvasFitOffer();
-  document.getElementById('scenePrompt').value =
-    `${data.illumination.descriptor}, editorial photography backdrop, high detail`;
+  // The autofill is a starting scene prompt, which is only meaningful on the
+  // unbranded path. With a kit active this box is *additional* direction on
+  // top of an approved look that already specifies its own scene and finish,
+  // so pre-filling it would quietly push generic stock-photo language into
+  // every branded frame.
+  document.getElementById('scenePrompt').value = activeBrand()
+    ? '' : `${data.illumination.descriptor}, editorial photography backdrop, high detail`;
+  state.scenePromptIsAutofill = !activeBrand();
+  renderComposedPreview();
   if (data.suggested_controlnet_strength != null) {
     // Defaults lower automatically when the original background has real
     // depth structure to fight against (furniture, walls at an angle) --
@@ -685,6 +898,10 @@ document.getElementById('btnFitCanvas').onclick = () => {
 // message rather than a silent no-op on unsupported browsers.
 
 const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+// One copy of the label. It was written out twice -- once in the HTML, once in
+// the onend handler that restores it -- so the button silently reverted to a
+// stale wording after the first use whenever only one of them was edited.
+const VOICE_BTN_LABEL = '🎤 Speak Scene (hands-free direction)';
 let voiceRecognition = null;
 let voiceListening = false;
 
@@ -698,6 +915,11 @@ function initVoiceRecognition() {
     const transcript = event.results[0][0].transcript;
     const box = document.getElementById('scenePrompt');
     box.value = box.value.trim() ? `${box.value.trim()}, ${transcript}` : transcript;
+    // Dictated text is operator text like any other -- but setting .value from
+    // script fires no 'input' event, so the flag has to be cleared by hand or a
+    // later brand selection would wipe what was just dictated.
+    state.scenePromptIsAutofill = false;
+    renderComposedPreview();
   };
   rec.onerror = (event) => {
     document.getElementById('footerStatus').textContent = `voice input error: ${event.error}`;
@@ -705,7 +927,7 @@ function initVoiceRecognition() {
   rec.onend = () => {
     voiceListening = false;
     const btn = document.getElementById('btnVoicePrompt');
-    btn.textContent = '🎤 Speak Scene (hands-free direction)';
+    btn.textContent = VOICE_BTN_LABEL;
     btn.classList.remove('active-toggle');
   };
   return rec;
@@ -720,12 +942,21 @@ document.getElementById('btnVoicePrompt').onclick = () => {
   const btn = document.getElementById('btnVoicePrompt');
   if (voiceListening) {
     voiceRecognition.stop();
-  } else {
-    voiceListening = true;
-    btn.textContent = '🎤 Listening...';
-    btn.classList.add('active-toggle');
-    voiceRecognition.start();
+    return;
   }
+  // start() throws synchronously if the mic is blocked or a previous session
+  // hasn't torn down yet. Flipping the label first and starting second left
+  // the button stuck reading "Listening..." forever in exactly that case,
+  // with no recogniser running and no onend to put it back.
+  try {
+    voiceRecognition.start();
+  } catch (err) {
+    document.getElementById('footerStatus').textContent = `voice input could not start: ${err.message}`;
+    return;
+  }
+  voiceListening = true;
+  btn.textContent = '🎤 Listening...';
+  btn.classList.add('active-toggle');
 };
 
 document.getElementById('cnStrength').oninput = (e) => document.getElementById('cnVal').textContent = e.target.value;
@@ -757,7 +988,13 @@ function queueBackgroundGeneration(prompt) {
     subject: state.original.split(',')[1],
     mask: state.mask.split(',')[1],
     depth: state.depth.split(',')[1],
+    // `prompt` is the operator's free text only. With a brand kit active the
+    // server prepends the approved look and appends the kit's mandated
+    // styling; sending a pre-joined string from here would put the client in
+    // charge of a guarantee it is not allowed to make.
     prompt, controlnet_strength, denoise,
+    brand_id: state.brandId || null,
+    look_id: state.lookId || null,
   }));
 }
 
@@ -797,6 +1034,8 @@ document.getElementById('btnRelight').onclick = () => {
 
   const prompt = base ? `${base}, ${preset.phrase}` : preset.phrase;
   document.getElementById('scenePrompt').value = prompt;
+  state.scenePromptIsAutofill = false;  // same reason as the voice handler
+  renderComposedPreview();
   queueBackgroundGeneration(prompt);
 };
 
@@ -820,7 +1059,10 @@ function renderLayerPanel() {
 
     const vis = document.createElement('input');
     vis.type = 'checkbox'; vis.checked = layer.visible;
-    vis.onchange = (e) => { layer.visible = e.target.checked; redraw(); };
+    vis.onchange = (e) => {
+      layer.visible = e.target.checked;
+      updateExportButtons(); renderBrandViolations(); redraw();
+    };
 
     const name = document.createElement('span');
     name.className = 'name'; name.textContent = layer.name;
@@ -829,7 +1071,7 @@ function renderLayerPanel() {
     const op = document.createElement('input');
     op.type = 'range'; op.min = 0; op.max = 1; op.step = 0.05; op.value = layer.opacity;
     op.title = 'opacity';
-    op.oninput = (e) => { layer.opacity = parseFloat(e.target.value); redraw(); };
+    op.oninput = (e) => { layer.opacity = parseFloat(e.target.value); renderBrandViolations(); redraw(); };
 
     const pz = document.createElement('input');
     pz.type = 'range'; pz.min = 0; pz.max = 1; pz.step = 0.05; pz.value = layer.parallax ?? 0;
@@ -846,9 +1088,12 @@ function renderLayerPanel() {
 
     row.append(vis, name, op, pz, reorder);
 
-    if (layer.kind === 'object' || layer.kind === 'image') {
+    if (layer.kind === 'object' || layer.kind === 'image' || layer.kind === 'logo') {
       const del = document.createElement('button');
       del.className = 'small'; del.textContent = '×'; del.style.width = 'auto';
+      del.title = layer.kind === 'logo'
+        ? 'Remove the brand logo (the Brand Kit panel will flag the frame as non-compliant)'
+        : 'Delete this layer';
       del.onclick = (e) => { e.stopPropagation(); deleteLayer(layer.id); };
       row.appendChild(del);
     }
@@ -856,6 +1101,8 @@ function renderLayerPanel() {
     row.onclick = () => selectLayer(layer.id);
     list.appendChild(row);
   }
+  updateExportButtons();
+  renderBrandViolations();
 }
 
 function syncScaleSlider() {
@@ -866,8 +1113,21 @@ function syncScaleSlider() {
   // without first clicking the row, and that stale value jumps onto the
   // new layer instead of applying from its real current value.
   const layer = activeLayer();
-  document.getElementById('layerScale').value = layer ? layer.scale : 1;
-  document.getElementById('scaleVal').textContent = (layer ? layer.scale : 1).toFixed(2);
+  const scaleInput = document.getElementById('layerScale');
+  // A logo's minimum size is a brand rule, not a preference, and it is one of
+  // the few that can be enforced without judgement -- so the slider simply
+  // cannot travel below it rather than letting the operator go there and then
+  // scolding them for it. Position, which does need judgement, stays free and
+  // is flagged as a warning instead.
+  const minScale = (layer && layer.kind === 'logo' && layer.widthPct)
+    ? layer.minWidthPct / layer.widthPct : 0.3;
+  scaleInput.min = minScale.toFixed(3);
+  scaleInput.title = (layer && layer.kind === 'logo')
+    ? `The brand kit requires this mark to be at least ${layer.minWidthPct}% of frame width.`
+    : '';
+  const scale = layer ? Math.max(layer.scale, minScale) : 1;
+  scaleInput.value = scale;
+  document.getElementById('scaleVal').textContent = scale.toFixed(2);
   const rotation = layer ? (layer.rotation || 0) : 0;
   document.getElementById('layerRotation').value = rotation;
   document.getElementById('rotVal').textContent = rotation + '°';
@@ -898,7 +1158,8 @@ document.getElementById('layerScale').oninput = (e) => {
   const layer = activeLayer();
   if (!layer) return;
   layer.scale = parseFloat(e.target.value);
-  document.getElementById('scaleVal').textContent = e.target.value;
+  document.getElementById('scaleVal').textContent = layer.scale.toFixed(2);
+  renderBrandViolations();  // a bigger logo can push past the clear-space margin
   redraw();
 };
 
@@ -924,24 +1185,512 @@ document.getElementById('layerFileInput').onchange = (e) => {
   reader.readAsDataURL(file);
 };
 
+// --- brand kits -----------------------------------------------------------------
+// The operator picks a client and one of that client's approved looks; the
+// prompt is composed from those instead of typed. Note what is NOT here: the
+// finished prompt string. The browser sends {brand_id, look_id, free text} and
+// the server does the joining (brand_kit.compose), so a stale or modified page
+// cannot drop the kit's mandated negative prompt. Everything below is
+// presentation of a decision that is enforced elsewhere.
+
+function comfyUrlFor(address) {
+  if (!address) return null;
+  const [host, port] = address.split(':');
+  // COMFY_ADDRESS is written from the *server's* point of view, and ComfyUI is
+  // routinely on a GPU box elsewhere on the LAN. If the server calls it
+  // loopback, "localhost" means that server -- not this browser -- so linking
+  // to it verbatim would send the operator to their own machine. Reusing the
+  // host this page was already reached on is the one address known to work
+  // from here.
+  const loopback = ['127.0.0.1', 'localhost', '::1', '0.0.0.0'].includes(host);
+  const useHost = (loopback && !['127.0.0.1', 'localhost', '::1'].includes(location.hostname))
+    ? location.hostname : host;
+  return `http://${useHost}:${port || 8188}`;
+}
+
+async function loadConfig() {
+  try {
+    const resp = await fetch('/api/config');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    serverConfig = await resp.json();
+  } catch (e) {
+    // Non-fatal by design: without brand kits the app is exactly the free-prompt
+    // tool it was before, which is a working product, not a broken one.
+    logEvent(`could not load server config (${e.message}) — brand kits unavailable`, 'ev-error');
+    return;
+  }
+
+  const link = document.getElementById('comfyLink');
+  const url = comfyUrlFor(serverConfig.comfy_address);
+  if (url) { link.href = url; link.title = `Open ComfyUI (${serverConfig.comfy_address}) — queue, node graph and error log`; }
+  else link.style.display = 'none';
+
+  const select = document.getElementById('brandSelect');
+  for (const brand of serverConfig.brands) {
+    const opt = document.createElement('option');
+    opt.value = brand.id;
+    opt.textContent = brand.name;
+    select.appendChild(opt);
+  }
+  document.getElementById('brandPanel').style.display = serverConfig.brands.length ? 'block' : 'none';
+  populateConsent(serverConfig);
+}
+
+// --- the operator attention queue -----------------------------------------------
+// Polled rather than pushed over the existing websocket, because the things it
+// reports are exactly the ones that happen when parts of the app are broken --
+// including, in the worst case, whatever was supposed to push the notification.
+
+const SEVERITY_COLOURS = { high: '#ff6b6b', medium: '#f5b942', low: '#8ab4f8' };
+
+async function pollAttention() {
+  let snapshot;
+  try {
+    snapshot = await (await fetch('/api/attention')).json();
+  } catch (e) {
+    return;   // the server being unreachable is its own visible problem
+  }
+
+  const badge = document.getElementById('attentionBadge');
+  badge.style.display = snapshot.open ? 'inline-block' : 'none';
+  if (!snapshot.open) {
+    document.getElementById('attentionPanel').style.display = 'none';
+    return;
+  }
+  badge.textContent = `⚠ ${snapshot.open} needs attention`;
+  badge.style.background = SEVERITY_COLOURS[snapshot.highest_severity] || '#f5b942';
+  badge.style.color = '#111';
+
+  const list = document.getElementById('attentionList');
+  list.innerHTML = '';
+  for (const item of snapshot.items) {
+    const row = document.createElement('div');
+    row.style.cssText = 'margin-top:10px;padding:8px;border-left:3px solid '
+      + (SEVERITY_COLOURS[item.severity] || '#888') + ';background:rgba(255,255,255,.03)';
+    const times = item.count > 1 ? ` ×${item.count}` : '';
+    row.innerHTML = `<div style="font-size:13px">${escapeHtml(item.summary)}${times}</div>`
+      + (item.detail ? `<div class="hint" style="margin:4px 0 0">${escapeHtml(item.detail)}</div>` : '');
+    const button = document.createElement('button');
+    button.className = 'secondary small';
+    button.textContent = 'Mark handled';
+    button.style.marginTop = '6px';
+    button.onclick = async () => {
+      const form = new FormData();
+      form.append('by', 'operator');
+      await fetch(`/api/attention/${item.id}/resolve`, { method: 'POST', body: form });
+      pollAttention();
+    };
+    row.appendChild(button);
+    list.appendChild(row);
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text == null ? '' : String(text);
+  return div.innerHTML;
+}
+
+document.getElementById('attentionBadge').onclick = () => {
+  const panel = document.getElementById('attentionPanel');
+  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+};
+document.getElementById('btnAttentionClose').onclick = () =>
+  document.getElementById('attentionPanel').style.display = 'none';
+
+pollAttention();
+setInterval(pollAttention, 5000);
+
+function activeBrand() { return serverConfig.brands.find(b => b.id === state.brandId) || null; }
+function activeLook() {
+  const brand = activeBrand();
+  return brand ? brand.looks.find(l => l.id === state.lookId) || null : null;
+}
+
+function renderBrandPanel() {
+  const brand = activeBrand();
+  document.getElementById('brandBody').style.display = brand ? 'block' : 'none';
+  document.getElementById('btnPlaceLogo').style.display = brand && brand.logo ? 'block' : 'none';
+  if (!brand) { renderComposedPreview(); renderBrandViolations(); return; }
+
+  const swatches = document.getElementById('brandSwatches');
+  swatches.innerHTML = '';
+  for (const colour of brand.palette) {
+    const el = document.createElement('div');
+    el.className = 'swatch';
+    el.style.background = colour.hex;
+    el.title = `${colour.name} ${colour.hex}`;
+    swatches.appendChild(el);
+  }
+
+  const lookSelect = document.getElementById('lookSelect');
+  lookSelect.innerHTML = '';
+  for (const look of brand.looks) {
+    const opt = document.createElement('option');
+    opt.value = look.id;
+    opt.textContent = look.label;
+    lookSelect.appendChild(opt);
+  }
+  if (!brand.looks.some(l => l.id === state.lookId)) state.lookId = brand.looks[0]?.id || '';
+  lookSelect.value = state.lookId;
+
+  const pill = document.getElementById('seedPill');
+  pill.style.display = brand.seed_policy === 'locked' ? 'inline-block' : 'none';
+  pill.title = 'This look uses a seed derived from the brand and look id, so the same look '
+    + 'renders consistently across an entire event instead of a different image per guest.';
+  document.getElementById('brandNotes').textContent =
+    `${brand.name} · kit ${brand.version}` + (brand.notes ? ` — ${brand.notes}` : '');
+
+  renderComposedPreview();
+  renderBrandViolations();
+}
+
+function renderComposedPreview() {
+  const box = document.getElementById('composedPreview');
+  const label = document.getElementById('scenePromptLabel');
+  const brand = activeBrand();
+  if (!brand) {
+    box.style.display = 'none';
+    label.textContent = 'Scene prompt (respects, or overrides, the detected lighting)';
+    return;
+  }
+
+  const look = activeLook();
+  const free = document.getElementById('scenePrompt').value.trim();
+  label.textContent = 'Additional direction (optional — added to the approved look, never replaces it)';
+  box.style.display = 'block';
+  box.innerHTML = '';
+
+  // Shown as separate labelled parts rather than one joined string, on
+  // purpose: the joining is the server's job, and reproducing it here would
+  // be a second implementation free to drift from the one that actually runs.
+  // These are the inputs to that decision, which cannot drift.
+  const parts = [
+    ['locked', `Approved look — ${brand.name}`, look ? look.prompt : '(none selected)'],
+    ['free', 'Your direction', free || '(nothing added)'],
+    ['locked', 'Always applied by the kit', brand.positive_suffix || '(none)'],
+    ['blocked', 'Never generated (added server-side)', brand.negative_suffix || '(none)'],
+  ];
+  for (const [cls, tag, text] of parts) {
+    const el = document.createElement('div');
+    el.className = `prompt-part ${cls}`;
+    el.innerHTML = `<span class="tag"></span>`;
+    el.querySelector('.tag').textContent = tag;
+    el.appendChild(document.createTextNode(text));
+    box.appendChild(el);
+  }
+}
+
+document.getElementById('brandSelect').onchange = (e) => {
+  state.brandId = e.target.value;
+  state.lookId = '';
+  // Analyze pre-fills the scene prompt with a generic starting phrase. Once a
+  // kit is selected that box means "additional direction", and the leftover
+  // autofill would be recorded on the disclosure card as something the
+  // operator asked for -- it was already fighting the kit's own styling
+  // ("editorial photography backdrop" vs "premium editorial finish"). Only an
+  // *untouched* autofill is cleared; anything typed by a person is theirs.
+  if (state.brandId && state.scenePromptIsAutofill) {
+    document.getElementById('scenePrompt').value = '';
+    state.scenePromptIsAutofill = false;
+  }
+  renderBrandPanel();
+};
+document.getElementById('lookSelect').onchange = (e) => {
+  state.lookId = e.target.value;
+  renderComposedPreview();
+};
+document.getElementById('scenePrompt').addEventListener('input', () => {
+  state.scenePromptIsAutofill = false;  // a person has now touched it
+  renderComposedPreview();
+});
+
+// --- brand logo as a first-class layer -------------------------------------------
+
+function placeLogo() {
+  const brand = activeBrand();
+  if (!brand || !brand.logo) return;
+  const rules = brand.logo;
+  const existing = state.layers.find(l => l.kind === 'logo');
+  if (existing) { selectLayer(existing.id); return; }
+
+  state.layers.push({
+    id: 'logo', name: `${brand.name} logo`, kind: 'logo', src: rules.url,
+    visible: true, opacity: 1, x: 0, y: 0, rotation: 0,
+    // Starts comfortably above the minimum rather than at it, so the first
+    // nudge of the scale slider doesn't immediately trip a violation warning.
+    scale: 1, widthPct: rules.min_width_pct * 1.4,
+    minWidthPct: rules.min_width_pct, clearSpacePct: rules.clear_space_pct,
+    corner: rules.default_corner, lockedAspect: rules.locked_aspect,
+    brandId: brand.id, brandVersion: brand.version,
+    parallax: 0,  // an overlay on the frame, not an object in the scene
+  });
+  state.activeLayerId = 'logo';
+  state.showSafeArea = true;
+  setToggleButton('btnSafeArea', true, SAFE_AREA_BTN_LABEL);
+  syncScaleSlider();
+  renderLayerPanel();
+  renderBrandViolations();
+  redraw();
+}
+
+document.getElementById('btnPlaceLogo').onclick = placeLogo;
+
+const SAFE_AREA_BTN_LABEL = 'Clear-space guide';
+document.getElementById('btnSafeArea').onclick = () => {
+  state.showSafeArea = !state.showSafeArea;
+  setToggleButton('btnSafeArea', state.showSafeArea, SAFE_AREA_BTN_LABEL);
+  redraw();
+};
+
+function logoViolations() {
+  // The checkable subset of a brand book. Real guidelines run to dozens of
+  // pages; these are the three rules a booth operator actually breaks --
+  // shrinking the mark below legibility, pushing it into the frame edge, and
+  // (prevented outright by logoGeometry) stretching it.
+  const layer = state.layers.find(l => l.kind === 'logo');
+  const brand = activeBrand();
+  const problems = [];
+  if (brand && brand.logo && !layer) {
+    problems.push(`${brand.name}'s kit expects its logo on the frame — click "Place Brand Logo".`);
+    return problems;
+  }
+  if (!layer) return problems;
+
+  if (!layer.visible) problems.push('The logo layer is hidden.');
+  if (layer.opacity < 0.9) problems.push(`Logo opacity is ${Math.round(layer.opacity * 100)}% — the mark should be fully opaque.`);
+
+  const effectiveWidthPct = layer.widthPct * layer.scale;
+  if (effectiveWidthPct < layer.minWidthPct - 0.01) {
+    problems.push(`Logo is ${effectiveWidthPct.toFixed(1)}% of frame width; the kit requires at least ${layer.minWidthPct}%.`);
+  }
+
+  const im = imgCache.get(layer.src);
+  if (im) {
+    const g = logoGeometry(layer, im);
+    if (g.x < g.margin - 0.5 || g.y < g.margin - 0.5
+        || g.x + g.w > canvas.width - g.margin + 0.5 || g.y + g.h > canvas.height - g.margin + 0.5) {
+      problems.push(`Logo breaks the ${layer.clearSpacePct}% clear-space margin (dashed guide on the canvas).`);
+    }
+  }
+  return problems;
+}
+
+function renderBrandViolations() {
+  const box = document.getElementById('brandViolations');
+  const problems = logoViolations();
+  box.style.display = problems.length ? 'block' : 'none';
+  box.textContent = problems.join(' ');
+}
+
+// --- batch mode -------------------------------------------------------------------
+// Everything here is a thin client over /api/batch. The run lives on the
+// server, which is what lets it outlive this tab -- so the UI polls a run id
+// rather than holding any state of its own beyond that id.
+
+let batchRunId = null;
+let batchPoll = null;
+
+// --- the consent record -------------------------------------------------------
+// The options come from /api/config rather than being written here, so the list
+// the operator picks from and the list the server accepts cannot drift apart.
+// So does `consent_required`: whether this blocks is the server's decision, and
+// a page that guessed would either lock out a test run or let a strict booth
+// upload fifty photos before showing the 400.
+
+let consentRequired = false;
+
+function populateConsent(config) {
+  const select = document.getElementById('consentBasis');
+  for (const basis of config.consent_bases || []) {
+    const option = document.createElement('option');
+    option.value = basis.id;
+    option.textContent = basis.id.replace(/_/g, ' ');
+    option.dataset.description = basis.description;
+    select.appendChild(option);
+  }
+  consentRequired = !!config.consent_required;
+  select.options[0].textContent = consentRequired
+    ? '— pick how consent was obtained —'
+    : '— not recorded —';
+  document.getElementById('consentLabel').textContent = consentRequired
+    ? 'Consent basis (required)'
+    : 'Consent basis (optional — recorded in the manifest)';
+  const retention = config.retention || {};
+  document.getElementById('retentionNote').textContent = retention.retain_days
+    ? `Photos and frames are deleted after ${retention.retain_days} day(s).`
+      + (retention.keep_intermediates
+          ? ' Originals are being kept (--keep-intermediates).'
+          : ' The uploaded photograph itself is deleted as soon as the cutout exists.')
+    : 'Retention is switched off on this server — photos are kept until deleted by hand.';
+  refreshConsentGate();
+}
+
+function refreshConsentGate() {
+  const select = document.getElementById('consentBasis');
+  const by = document.getElementById('consentBy').value.trim();
+  const chosen = select.selectedOptions[0];
+  const complete = !!(select.value && by);
+  const empty = !select.value && !by;
+
+  let description = chosen && chosen.dataset.description ? chosen.dataset.description : '';
+  // Half-filled is refused in both modes, because a basis with nobody's name on
+  // it reads as a record and cannot be followed up when a guest later asks to
+  // be deleted. Said here rather than left to the server's 400, so the operator
+  // finds out before selecting fifty files.
+  if (!complete && !empty) {
+    description = select.value
+      ? 'Name who recorded this, or clear the basis to run without a record.'
+      : 'Pick a basis, or clear the name to run without a record.';
+  }
+  document.getElementById('consentDescription').textContent = description;
+
+  document.getElementById('btnBatchPick').disabled =
+    consentRequired ? !complete : !(complete || empty);
+}
+
+document.getElementById('consentBasis').onchange = refreshConsentGate;
+document.getElementById('consentBy').oninput = refreshConsentGate;
+
+document.getElementById('btnBatchPick').onclick = () => document.getElementById('batchInput').click();
+
+document.getElementById('batchInput').onchange = async (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';  // so picking the same folder twice fires change again
+  if (!files.length) return;
+
+  const form = new FormData();
+  for (const file of files) form.append('files', file);
+  form.append('brand_id', state.brandId || '');
+  form.append('look_id', state.lookId || '');
+  form.append('prompt', document.getElementById('scenePrompt').value.trim());
+  form.append('controlnet_strength', document.getElementById('cnStrength').value);
+  form.append('denoise', document.getElementById('denoise').value);
+  form.append('consent_basis', document.getElementById('consentBasis').value);
+  form.append('consent_by', document.getElementById('consentBy').value.trim());
+
+  setBatchStatus(`uploading ${files.length} photo(s)…`);
+  let run;
+  try {
+    const resp = await fetch('/api/batch', { method: 'POST', body: form });
+    run = await resp.json();
+    if (!resp.ok) throw new Error(run.detail || `HTTP ${resp.status}`);
+  } catch (err) {
+    setBatchStatus(`batch rejected: ${err.message}`);
+    return;
+  }
+
+  batchRunId = run.run_id;
+  logEvent(`batch ${run.run_id}: queued ${run.queued} of ${run.total} photo(s)`);
+  document.getElementById('batchBar').style.display = 'block';
+  pollBatch();
+  // A whole batch is ~35s per photo, so a slow poll is plenty and keeps this
+  // from being the thing competing with the generation for the event loop.
+  batchPoll = setInterval(pollBatch, 3000);
+};
+
+function setBatchStatus(text) {
+  const el = document.getElementById('batchStatus');
+  el.style.display = 'block';
+  el.textContent = text;
+}
+
+async function pollBatch() {
+  if (!batchRunId) return;
+  let status;
+  try {
+    const resp = await fetch(`/api/batch/${batchRunId}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    status = await resp.json();
+  } catch (err) {
+    // Transient: the server may be busy compositing. Keep polling rather than
+    // abandoning a run that is still perfectly alive.
+    return;
+  }
+
+  const c = status.counts;
+  const finishedCount = c.done + c.failed;
+  document.getElementById('batchFill').style.width = `${Math.round(100 * finishedCount / status.total)}%`;
+  setBatchStatus(
+    `${c.done}/${status.total} done`
+    + (c.generating ? ` · ${c.generating} generating` : '')
+    + (c.analyzing ? ` · ${c.analyzing} analyzing` : '')
+    + (c.pending ? ` · ${c.pending} queued` : '')
+    + (c.failed ? ` · ${c.failed} failed` : '')
+    + (status.look_label ? `\n${status.look_label}` : ''));
+
+  // Offered as soon as anything has finished, not only at the end: an
+  // operator who has to leave should be able to take what is ready.
+  document.getElementById('btnBatchDownload').style.display = c.done ? 'block' : 'none';
+
+  if (status.finished) {
+    clearInterval(batchPoll);
+    batchPoll = null;
+    logEvent(`batch ${batchRunId} finished: ${c.done} frame(s), ${c.failed} failed`,
+             c.failed ? 'ev-error' : 'ev-done');
+    for (const item of status.items.filter(i => i.status === 'failed')) {
+      logEvent(`  ${item.filename}: ${item.error}`, 'ev-error');
+    }
+  }
+}
+
+document.getElementById('btnBatchDownload').onclick = () => {
+  if (batchRunId) window.location.href = `/api/batch/${batchRunId}/download`;
+};
+
 // --- drag to reposition selected layer -----------------------------------------
 
-let moveMode = false;
-document.getElementById('btnMove').onclick = () => {
-  moveMode = !moveMode;
-  if (moveMode) drawMode = false, updateDrawBtn();
-  document.getElementById('btnMove').textContent = 'Drag to reposition selected layer: ' + (moveMode ? 'ON' : 'OFF');
-  document.getElementById('btnMove').classList.toggle('active-toggle', moveMode);
-  canvas.classList.toggle('moving', moveMode);
-};
+// Canvas mode is one value, not two independent booleans. It used to be
+// `moveMode` and `drawMode` toggled from separate handlers that each tried to
+// switch the other off -- and one of them only half did it: turning Draw on
+// while Move was on cleared moveMode and the grab cursor but never touched the
+// Move button, which sat there lit purple and reading "ON" for a mode that was
+// no longer active. Modelling it as a single value makes that state
+// unrepresentable rather than merely fixed.
+let canvasMode = null;  // null | 'move' | 'draw'
+
+function setToggleButton(id, on, label) {
+  const btn = document.getElementById(id);
+  btn.textContent = `${label}: ${on ? 'ON' : 'OFF'}`;
+  btn.classList.toggle('active-toggle', on);
+}
+
+const MOVE_BTN_LABEL = 'Drag to reposition selected layer';
+
+function setCanvasMode(mode) {
+  canvasMode = mode;
+  setToggleButton('btnMove', mode === 'move', MOVE_BTN_LABEL);
+  setToggleButton('btnAddObject', mode === 'draw', DRAW_BTN_LABEL);
+  canvas.classList.toggle('moving', mode === 'move');
+  canvas.classList.toggle('drawing', mode === 'draw');
+  if (mode !== 'draw' && state.drawingRect) { state.drawingRect = null; redraw(); }
+}
+
+document.getElementById('btnMove').onclick = () => setCanvasMode(canvasMode === 'move' ? null : 'move');
+
+// Esc leaves whichever mode is active. Both modes change what a click on the
+// canvas does, and the only way out was to find and re-click the button that
+// turned it on -- with a half-drawn region on screen, that is not obvious.
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || !canvasMode) return;
+  setCanvasMode(null);
+  document.getElementById('footerStatus').textContent = 'cancelled — canvas back to normal';
+});
 let dragging = false, dragStart = null;
 canvas.addEventListener('pointerdown', (e) => {
-  if (moveMode) {
+  if (canvasMode === 'move') {
     const layer = activeLayer();
-    if (!layer) return;
+    if (!layer) {
+      // Silently doing nothing here read as a dead canvas. The mode is on,
+      // the cursor is a grab hand, and nothing moves -- because no layer is
+      // selected, which is not visible from the canvas.
+      document.getElementById('footerStatus').textContent =
+        'select a layer in the Layers panel first — drag moves the selected layer';
+      return;
+    }
     dragging = true;
     dragStart = { clientX: e.clientX, clientY: e.clientY, ox: layer.x, oy: layer.y };
-  } else if (drawMode) {
+  } else if (canvasMode === 'draw') {
     const rect = canvas.getBoundingClientRect();
     const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
     const x = (e.clientX - rect.left) * sx, y = (e.clientY - rect.top) * sy;
@@ -966,8 +1715,8 @@ window.addEventListener('pointermove', (e) => {
   }
 });
 window.addEventListener('pointerup', async () => {
-  dragging = false;
-  if (drawMode && state.drawingRect) {
+  if (dragging) { dragging = false; renderBrandViolations(); }  // a dragged logo may have left its clear-space margin
+  if (canvasMode === 'draw' && state.drawingRect) {
     const r = state.drawingRect;
     state.drawingRect = null;
     const w = Math.abs(r.x1 - r.x0), h = Math.abs(r.y1 - r.y0);
@@ -987,20 +1736,10 @@ window.addEventListener('pointerup', async () => {
 
 // --- region draw tool (add object) ----------------------------------------------
 
-let drawMode = false;
 // Leads with the verb. It used to read "+ Add Object (draw region)", which
 // buries the one word someone scanning for this feature is looking for.
 const DRAW_BTN_LABEL = '✏️ Draw a Region → Add Object';
-function updateDrawBtn() {
-  document.getElementById('btnAddObject').textContent = DRAW_BTN_LABEL + ': ' + (drawMode ? 'ON' : 'OFF');
-  document.getElementById('btnAddObject').classList.toggle('active-toggle', drawMode);
-  canvas.classList.toggle('drawing', drawMode);
-}
-document.getElementById('btnAddObject').onclick = () => {
-  drawMode = !drawMode;
-  if (drawMode) moveMode = false, canvas.classList.remove('moving');
-  updateDrawBtn();
-};
+document.getElementById('btnAddObject').onclick = () => setCanvasMode(canvasMode === 'draw' ? null : 'draw');
 
 async function startRegionEdit(x, y, w, h) {
   const label = window.prompt('What goes in this region? (e.g. "a large potted plant")', '');
@@ -1024,6 +1763,11 @@ async function startRegionEdit(x, y, w, h) {
     mask: regionMaskUrl.split(',')[1],
     depth: state.depth.split(',')[1],
     prompt: label.trim(),
+    // The brand's blocklist follows the operator's free text here too -- this
+    // is the one input in the app typed live at a booth, so it is the one that
+    // most needs it. The kit's positive styling is deliberately not applied;
+    // see handle_edit_region's docstring in web_server.py.
+    brand_id: state.brandId || null,
     // Deliberately not reusing the background-gen ControlNet slider — that
     // strength is tuned for staying anchored to existing geometry, which
     // fights inserting a new object where the depth map is currently flat.
@@ -1132,35 +1876,56 @@ document.getElementById('btnExportPng').onclick = async () => {
 // where the Spout sender never started, claiming success for an output no
 // receiver could possibly see.
 const SPOUT_BTN_LABEL = 'Send to Spout (live projection)';
+const SPOUT_REPLY_TIMEOUT_MS = 10000;
+let spoutTimeout = null;
+
 document.getElementById('btnSendSpout').onclick = async () => {
   const btn = document.getElementById('btnSendSpout');
   btn.disabled = true;
   btn.textContent = 'Sending…';
   const url = await getCompositeDataUrl();
   ws.send(JSON.stringify({ action: 'send_to_spout', image: url.split(',')[1] }));
+  // The button waits for the server to confirm, which is the right design --
+  // but it waited forever. A reply that never comes (socket dropped between
+  // send and ack, server wedged) left the one control for the live LED-wall
+  // output disabled with no way back short of reloading the page, which
+  // throws away the session.
+  clearTimeout(spoutTimeout);
+  spoutTimeout = setTimeout(() => {
+    logEvent('no reply from the Spout send after 10s — the composite may not have been published', 'ev-error');
+    resolveSpoutSend(false, 'No reply — try again');
+  }, SPOUT_REPLY_TIMEOUT_MS);
 };
 
-function resolveSpoutSend(ok) {
+function resolveSpoutSend(ok, failLabel = 'Spout send failed — see log') {
   const btn = document.getElementById('btnSendSpout');
   if (btn.textContent !== 'Sending…') return;  // not waiting on a send
+  clearTimeout(spoutTimeout);
   btn.disabled = false;
-  btn.textContent = ok ? 'Sent to Spout ✓' : 'Spout send failed — see log';
-  setTimeout(() => { btn.textContent = SPOUT_BTN_LABEL; }, 2500);
+  btn.textContent = ok ? 'Sent to Spout ✓' : failLabel;
+  setTimeout(() => { btn.textContent = SPOUT_BTN_LABEL; updateExportButtons(); }, 2500);
 }
+
+// Restored from a constant, not from whatever the button happened to say.
+// Reading the label back at click time meant a second click landing inside
+// the 1.5s confirmation window captured "Copied ✓" as the original and
+// restored *that* -- permanently, until reload.
+const COPY_BTN_LABEL = 'Copy Disclosure Text';
+let copyTimeout = null;
 
 document.getElementById('btnCopyDisclosure').onclick = async () => {
   const btn = document.getElementById('btnCopyDisclosure');
   if (!state.provenanceLog.length) return;
-  const latest = state.provenanceLog[state.provenanceLog.length - 1];
-  const text = disclosureText(latest);
+  const text = disclosureText(state.provenanceLog[state.provenanceLog.length - 1]);
   try {
     await navigator.clipboard.writeText(text);
-    const originalText = btn.textContent;
     btn.textContent = 'Copied ✓';
-    setTimeout(() => { btn.textContent = originalText; }, 1500);
   } catch (e) {
     alert(text); // clipboard API blocked (e.g. non-HTTPS context) -- show it directly instead
+    return;
   }
+  clearTimeout(copyTimeout);
+  copyTimeout = setTimeout(() => { btn.textContent = COPY_BTN_LABEL; }, 1500);
 };
 
 function modelNamesFromProvenance() {
@@ -1180,7 +1945,12 @@ function modelNamesFromProvenance() {
 
 document.getElementById('btnExportJson').onclick = () => {
   const project = {
-    version: 3, savedAt: new Date().toISOString(),
+    version: 4, savedAt: new Date().toISOString(),
+    // Which kit and look produced this composite. Saved as ids, not as the
+    // resolved prompt text: reopening the project a month later should pick up
+    // the *current* revision of the client's kit, since that is the version
+    // any new generation would have to comply with anyway.
+    brandId: state.brandId, lookId: state.lookId,
     original: state.original, cutout: state.cutout, mask: state.mask,
     pose: state.pose, depth: state.depth, shadow: state.shadow,
     illumination: state.illumination, layers: state.layers, activeLayerId: state.activeLayerId,
@@ -1224,7 +1994,18 @@ document.getElementById('importInput').onchange = async () => {
     lastDenoise: project.params?.denoise ?? 0.85,
     provenanceLog: project.provenanceLog || [], // older (v1/v2) project files just won't have an audit trail
     photoWidth: project.photoWidth || null, photoHeight: project.photoHeight || null,
+    brandId: project.brandId || '', lookId: project.lookId || '',
   });
+  // A project can name a kit this server doesn't have (shared from another
+  // machine, or the kit was withdrawn). Falling back to no brand is right --
+  // but silently would mean the operator carries on believing a brand's rules
+  // are being applied when nothing is applying them.
+  if (state.brandId && !serverConfig.brands.some(b => b.id === state.brandId)) {
+    logEvent(`this project was made with brand kit "${state.brandId}", which is not installed here `
+      + `— continuing with no brand, so its styling and blocklist are NOT being applied`, 'ev-error');
+    state.brandId = ''; state.lookId = '';
+  }
+  document.getElementById('brandSelect').value = state.brandId;
   nextLayerId = state.layers.length + 1;
   // Older (pre-canvas-fit) project files won't have these -- square is the
   // long-standing default, so falling back to it here is not a behavior
@@ -1250,13 +2031,10 @@ document.getElementById('importInput').onchange = async () => {
       `<div class="illum-line"><b>${state.illumination.descriptor}</b></div>`;
     document.getElementById('stagesPanel').style.display = 'block';
   }
-  document.getElementById('btnExportPng').disabled = state.layers.length === 0;
-  document.getElementById('btnExportJson').disabled = false;
-  document.getElementById('btnExportLiving').disabled = state.layers.length === 0;
-  document.getElementById('btnSendSpout').disabled = state.layers.length === 0;
   document.getElementById('footerStatus').textContent = 'project imported';
   setBusy(false);
-  renderLayerPanel();
+  renderBrandPanel();
+  renderLayerPanel();  // also refreshes the export buttons and brand warnings
   redraw();
 };
 
@@ -1276,7 +2054,10 @@ window.addEventListener('beforeunload', (e) => {
 });
 
 connectWs();
+loadConfig().then(renderBrandPanel);
+setCanvasMode(null);  // paints both mode buttons from one source of truth
 setBusy(false);  // paints the "upload a photo first" reason onto the disabled controls
+updateExportButtons();
 redraw();
 </script>
 </body>

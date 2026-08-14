@@ -1,25 +1,452 @@
-# mixed-reality-photobooth
+# Mixed-Reality Photo Booth
 
 [![tests](https://github.com/BGavazzi/mixed-reality-photobooth/actions/workflows/tests.yml/badge.svg)](https://github.com/BGavazzi/mixed-reality-photobooth/actions/workflows/tests.yml)
 
-Two demos in one repo, both built around orchestrating ComfyUI's real APIs
-(REST + its own progress/preview websocket) rather than just calling a
-`/generate` endpoint and waiting:
+A browser app that photographs a person and replaces the world around them,
+without ever regenerating the person.
 
-1. **Mixed-Reality Photo Booth** (primary) — a browser app that takes a
-   real photo of a person, extracts everything needed to regenerate the
-   environment around them (rotoscope, pose, depth, lighting), generates a
-   new depth-conditioned background or adds objects into it, and
-   composites the untouched original subject back on top. Live denoising
-   preview streams into the browser as it generates.
-2. **Resolume live VJ bridge** (original build, still included) — a
-   Resolume-to-generative-AI bridge that turns clip triggers or Resolume's
-   own live composition state into image/video generations, streamed back
-   as a Spout source.
+It extracts what's needed to rebuild the environment (rotoscope, pose, depth,
+lighting direction), generates a new depth-conditioned background in ComfyUI,
+and composites the untouched original subject back on top. The denoising
+preview streams into the browser as it renders.
+
+![the photo booth, mid-session](docs/photo-booth.png)
+
+<p align="center">
+  <img src="docs/demo.gif" alt="upload, analyze, pick a brand kit, generate" width="760">
+</p>
+
+The whole point is in that image: the subject's actual pixels are never
+re-generated. Only the region *around* them is, conditioned on their real
+pose and depth so the new environment stays geometrically consistent — then
+the original cutout goes back on top.
+
+| | |
+|---|---|
+| ![result](docs/result.png) | ![brand kit panel](docs/brand-kit.png) |
+| The deliverable: real subject, generated rooftop, brand logo composited (never generated). | The operator picks a client and an approved look. The prompt is composed server-side, not typed. |
 
 ---
 
-## 1. Mixed-Reality Photo Booth
+## Contents
+
+- [What's interesting in here](#whats-interesting-in-here)
+- [Run it](#run-it) · [with Docker](#with-docker)
+- [Brand kits](#brand-kits--making-a-generation-something-a-client-can-sign-off-on)
+- [Batch mode](#batch-mode--many-photos-one-approved-look)
+- [Somewhere to stand](#somewhere-to-stand--stages-finishing-and-surfaces)
+- [Architecture](#architecture)
+- [When ComfyUI has a bad night](#when-comfyui-has-a-bad-night)
+- [The people in the photographs](#the-people-in-the-photographs)
+- [When something needs a person](#when-something-needs-a-person)
+- [Running it as a service](#running-it-as-a-service) · [runbook](RUNBOOK.md)
+- [Testing](#testing)
+- [Known limitations](#known-limitations)
+- [Also in this repo: the Resolume VJ bridge](docs/resolume-bridge.md)
+
+---
+
+## What's interesting in here
+
+Not "it calls an image API". The parts worth reading:
+
+| | |
+|---|---|
+| **A websocket relay, not polling** | One persistent connection to ComfyUI's own websocket, relayed per-session to the right browser tab — progress, executing-node, and binary mid-denoise preview frames. [→](#why-a-websocket-relay-instead-of-just-polling) |
+| **Brand kits enforced server-side** | The client sends `{brand_id, look_id, free text}` and never a finished prompt, because a locked negative the client assembles is one a stale client can drop. [→](#brand-kits--making-a-generation-something-a-client-can-sign-off-on) |
+| **A locked seed makes a set** | 200 guests used to mean 200 unrelated images. A seed derived from (brand, look) makes them one campaign. [→](#batch-mode--many-photos-one-approved-look) |
+| **The background was at infinity** | The depth map said *everything that is not this person is infinitely far away*, so the model could only ever paint a distant backdrop. Synthesising a floor and a wall is the single biggest change to what the output looks like. [→](#somewhere-to-stand--stages-finishing-and-surfaces) |
+| **A real queue seam** | Bounded worker pool with admission control in front of a serial GPU, behind an interface a Redis/Celery version could satisfy unchanged. [→](#the-queue) |
+| **Failure handling you can reproduce** | Retry that knows which failures are worth retrying and which are *ambiguous*, a circuit breaker, and a fake ComfyUI that fails on a seed so the whole thing is demonstrable. [→](#when-comfyui-has-a-bad-night) |
+| **A privacy posture, not a promise** | Consent recorded before the shutter (recorded, not enforced — a deliberate trade, argued below), the original photograph deleted the moment a cutout exists, and a retention sweep that runs whether or not anyone remembers. [→](#the-people-in-the-photographs) |
+| **Built to be operated** | A watchdog for the failure that sends no event, a shutdown that drains instead of cancelling, split liveness/readiness, one correlation id per photo, and a soak harness that produced real numbers. [→](#running-it-as-a-service) |
+| **Workflow roles resolved from the graph** | No hardcoded node IDs: `workflow_graph.py` walks the wiring to find the sampler, the encoders, the ControlNet. Re-export from ComfyUI and it still works. [→](#workflow-roles-instead-of-magic-node-ids) |
+| **Findings from real photos** | Four failures that a curated 1024×1024 test image never shows. [→](#real-photo-hardening) |
+
+## Run it
+
+**One command.** It creates `.venv`, installs what's needed, and finishes by
+telling you what (if anything) is still missing:
+
+```
+powershell -ExecutionPolicy Bypass -File install.ps1     # Windows
+./install.sh                                             # macOS / Linux
+```
+
+Then:
+
+```
+powershell -ExecutionPolicy Bypass -File start_demo.ps1
+```
+
+which starts ComfyUI (with `--preview-method auto`), waits for it, checks the
+checkpoint and ControlNet the workflow names are actually installed (via
+ComfyUI's `/object_info`, so a missing model is reported at startup instead of
+~40s into the first generation), starts `web_server.py`, and opens the browser.
+`stop_demo.ps1` shuts both down.
+
+Or manually, against a ComfyUI you're already running:
+
+```
+python web_server.py     # http://127.0.0.1:8000
+```
+
+<details>
+<summary>Installing by hand, and what each requirements file is for</summary>
+
+```
+python -m venv .venv
+.venv\Scripts\activate          # source .venv/bin/activate on macOS/Linux
+pip install -r requirements.txt
+python doctor.py
+```
+
+| file | what it's for |
+|---|---|
+| `requirements.txt` | the photo booth — all you need for the primary demo |
+| `requirements-resolume.txt` | the OSC bridge + Spout output (Windows for Spout) |
+| `requirements-backends.txt` | hosted Runway / Kling backends |
+| `requirements-test.txt` | the offline test suite |
+
+Expect roughly **2GB and a few minutes** on a cold cache: `controlnet_aux` pulls
+in torch, torchvision, timm, scipy and scikit-image.
+
+Requirements are split so nobody installs a Windows-only package to try the
+browser app.
+
+</details>
+
+<details>
+<summary>Something not working? Run the doctor</summary>
+
+```
+python doctor.py              # photo booth
+python doctor.py --all        # every optional piece too
+```
+
+It checks the Python version, every package (naming what breaks without each
+one), which OpenCV build you ended up with, whether ComfyUI is reachable,
+whether the models the workflow names are actually on disk, whether every
+workflow's node roles still resolve, and whether the installed brand kits are
+valid — printing the exact command to fix each problem. It imports nothing
+outside the standard library, so it runs on a bare interpreter *before* anything
+is installed, and exits non-zero only for things that would genuinely stop the
+app.
+
+</details>
+
+### Models
+
+ComfyUI needs two files (the app checks for both at startup and `doctor.py`
+reports them):
+
+- Checkpoint: [`RealVisXL_V5.0_fp16.safetensors`](https://huggingface.co/SG161222/RealVisXL_V5.0) in `models/checkpoints/`
+- ControlNet: [`diffusers_xl_depth_full.safetensors`](https://huggingface.co/lllyasviel/sd_control_collection) in `models/controlnet/`
+
+The rotoscope/pose/depth models (`birefnet-portrait`, OpenPose, MiDaS) download
+themselves on first use via `rembg`/`controlnet_aux` — the first photo you
+analyze will be slower than the rest.
+
+### With Docker
+
+```
+docker compose up photobooth                  # app only, against a ComfyUI you already run
+docker compose --profile gpu up               # app + a GPU ComfyUI container
+```
+
+The image contains the app and its CV pipeline, and **deliberately not
+ComfyUI**: they have different hardware needs and wildly different image sizes,
+and coupling them would mean rebuilding multiple gigabytes to change a line of
+Python. `COMFY_ADDRESS` points the container at ComfyUI wherever it lives —
+another container, another host on the LAN, a GPU box entirely.
+
+Two things worth knowing if you edit the Dockerfile:
+
+- It installs **CPU torch explicitly** before the requirements. On Linux, pip's
+  default `torch` is the CUDA build: ~6GB of nvidia wheels for a container that
+  never touches a GPU. That one line is the difference between a 9.4GB image and
+  a 2.9GB one.
+- Model weights live on a volume (`U2NET_HOME`, `TORCH_HOME`, `HF_HOME`), so a
+  rebuilt container doesn't re-download them.
+
+The healthcheck's `start_period` is 180s because the app is genuinely not
+answering until the model warmup finishes — a short interval would just flap
+during startup and mark a healthy container unhealthy.
+
+## Brand kits — making a generation something a client can sign off on
+
+A free-text prompt box is fine for a personal tool and unusable for branded
+work. Three things were wrong with it, and a brand kit fixes each:
+
+| Problem | Before | Now |
+|---|---|---|
+| Nothing was repeatable | `seed = uuid4()` on every call — 200 guests, 200 unrelated images | `seed_policy: locked` derives a stable seed from (brand, look) |
+| Nothing was enforced | The negative prompt was welded into the workflow JSON, unreviewable and unreachable from the API | The kit's blocklist is appended server-side to every generation |
+| Nothing was recorded | Provenance named the model and seed, not the client or the approved look | Brand, kit revision, approved look, operator's addition and the exclusion list all land in the disclosure |
+
+A kit is a directory under `brands/` holding a `brand.json` and its logo
+artwork. The operator picks a client and one of that client's **approved
+looks**; the prompt is then composed, not typed:
+
+```
+approved look   ->  "seamless white studio backdrop"        (from the kit)
+operator adds   ->  "with a red chair"                      (free text, optional)
+kit styling     ->  "clean editorial finish"                (always appended)
+kit blocklist   ->  "competitor logos, alcohol, ..."        (always excluded)
+```
+
+Free text can only ever be *added* to what the kit mandates. The approved look
+leads because SDXL weights leading tokens most heavily, so an operator's
+addition colours the scene instead of displacing it.
+
+**Composition happens on the server** (`brand_kit.compose`, called from
+`web_server.py`), not in the browser. The page sends `{brand_id, look_id, free
+text}` and never a finished prompt — a locked negative that the client assembles
+is a locked negative a modified or stale client can drop, which would make the
+guarantee decorative. `tests/test_brand_enforcement.py` asserts this directly,
+including that a request trying to pass its own `negative_prompt` or `seed` is
+ignored.
+
+Every generation records what produced it:
+
+<p align="center"><img src="docs/provenance.png" alt="provenance card" width="300"></p>
+
+The region-draw tool inherits the kit's **blocklist but not its styling**:
+"never generate a competitor's logo" is a rule about every pixel, while "rugged
+outdoor photography, film grain" describes a scene and reads as noise when
+what's being generated is one prop inside an existing one. The region label is
+also the only prompt in the app typed live at a booth, so it is the one the
+blocklist most needs to reach.
+
+### The logo is composited, never generated
+
+SDXL cannot draw a legible mark — this is why `text, watermark` sits in the
+workflow's negative prompt in the first place. So the model is told to keep text
+out of the frame, and the real artwork goes on top as its own layer. Unlike
+every other layer it is **contain**-fit rather than cover-fit, with its height
+derived from the file's own aspect ratio, so the single most common
+brand-guideline violation in the wild — a stretched logo — is not expressible in
+the UI. Two more rules from the kit are enforced live:
+
+- `min_width_pct` — the scale slider's floor moves so the mark cannot be shrunk
+  below legibility.
+- `clear_space_pct` — a dashed guide on the canvas, and a warning if the logo is
+  dragged outside it. A warning rather than a clamp, because position is a
+  judgement call in a way that minimum size is not. The guide is an editing aid
+  and is suppressed from the exported PNG, the .webm and the live Spout feed.
+
+Two fictional demo kits ship with the repo (`brands/aurora`, `brands/northwind`)
+with generated placeholder artwork — see `brands/_make_demo_logos.py`. Adding a
+real client is a file drop, not a code change. Running with no `brands/`
+directory at all is supported and gives you exactly the free-prompt tool that
+existed before.
+
+## Batch mode — many photos, one approved look
+
+The interactive app is one photo at a time, which is the wrong shape for what
+it's actually for: a shoot produces dozens of frames and a client expects them
+to look like one campaign.
+
+![two frames from one batch run](docs/batch-consistency.png)
+
+*Two different subjects, one batch, one locked seed — same treatment, same
+palette, same skyline handling.*
+
+From the browser ("Choose Photos…"), or from a shell:
+
+```
+python batch_cli.py photos/ --brand aurora --look coastline -o shoot.zip \
+    --consent guest_verbal --consent-by "your name"
+```
+
+The consent flags are optional (see below) but never defaulted — a client that
+quietly supplied `internal_test` for anyone who forgot would put a claim in the
+manifest that nobody made. Omit them and the run is recorded as `not_recorded`;
+supply half of them and it is refused.
+
+The CLI is a *client* of `POST /api/batch`, not a second implementation, so
+there is one code path through the queue, the brand kit and the compositor. It
+exists because a batch is the one operation here that genuinely doesn't want a
+browser: it runs for half an hour, it outlives the page, and it starts from a
+directory of files that already exist on disk.
+
+Design decisions worth knowing:
+
+- **Runs live on disk, not in memory.** Each photo's cutout/mask/depth is
+  written to the run directory and reloaded when its generation finishes.
+  Holding fifty subjects' worth of decoded images while waiting on a serial GPU
+  is how a long batch becomes an OOM — and the intermediates are worth having
+  when a client asks why frame 31 looks wrong.
+- **The CPU pipeline runs inside the queued job**, so the worker pool overlaps
+  one photo's ~20s rotoscope with another photo's GPU time.
+- **A bad file fails its own item, not the run.** One unreadable file among
+  fifty is a normal event, and it's rejected at upload rather than twenty
+  minutes in.
+- **Results are collected by run, not by websocket session** — a batch has no
+  page to push to. That routing choice is the seam batch mode is built on, and
+  `tests/test_batch.py` tests it directly.
+- Each run zips with a **`manifest.json`**: every seed, prompt, kit revision,
+  status, plus the consent basis and retention window. It's the artifact a
+  brand-safety reviewer actually gets handed. It's rewritten as the run goes, so
+  an interrupted batch still leaves a usable record.
+- A run **records a consent basis** (optional by default, `--require-consent` to
+  make it blocking) and expires on a retention clock; the uploaded photographs
+  are deleted as soon as their cutouts exist. See
+  [The people in the photographs](#the-people-in-the-photographs).
+
+## Somewhere to stand — stages, finishing and surfaces
+
+Three problems that all look like "the AI isn't very good", and are all
+actually pipeline bugs.
+
+### The background was at infinity — `stage.py`
+
+The depth map handed to ControlNet was a bright silhouette of the subject on
+pure black. Depth here is inverse (white = near, black = far), so black means
+*infinitely distant*: the model was being told, every single time, that
+everything which is not this person is at infinite range.
+
+That single fact explains most of what was wrong with the output. There is no
+geometry for a wall, a table or a tree to attach to, so the only thing the
+model can legally paint is a far backdrop — haze, sky, a distant skyline. Every
+result was a person standing *in front of* a place rather than *inside* one.
+
+So a plausible stage is synthesised before generating: a ground plane running
+from the bottom edge to a horizon, a backdrop at a *finite* distance, and
+optionally side walls that read as an interior. The horizon is derived from the
+subject rather than fixed — a standing figure tells you where the camera was,
+and a booth photographs children and seated guests too.
+
+**A wall has a height, and there is distance above it.** This part was found by
+looking at output rather than at tests. The first version made everything above
+the horizon a single flat plane — which is a complete description of *a wall*,
+and a useless one for anything *behind* a wall. Aurora's rooftop look prompts
+for a "city skyline softly out of focus" and got a clean parapet and an empty
+pale sky, because nothing in the depth map said there was anywhere for a city
+to be. The wall now stops, and above its top edge there is real distance. That
+step is an occluding edge, and a model will paint something behind an occluding
+edge: the same seed, the same prompt and the same photograph now come back with
+the skyline behind the parapet. An interior gets no sky band, because a room's
+back wall runs to the top of the frame.
+
+The prior is deliberately smooth and low-detail. It is a constraint on *where
+surfaces are*, not an edge map to trace; a high-frequency fake shows through in
+the output. The subject's own measured depth is copied through untouched.
+
+Five stages (`terrace`, `room`, `landscape`, `studio`, `void`), chosen per look
+in the brand kit. `void` is the old behaviour, kept so a look that the prior
+makes worse has a way back that isn't a code change.
+
+Verified by A/B on the real GPU, same seed and prompt: with `void`, the city
+skyline starts at the subject's feet; with `terrace`, there is a parapet, a
+railing, and the city *beyond* it. A spatially explicit prompt can partly
+compensate for the void, which is the honest caveat — the prior makes a good
+result *reliable* rather than merely possible.
+
+Each item's manifest carries a `stage_relief` score, so "the prior fired" is a
+number rather than an impression. The void scores 0.0 by construction; a real
+stage scores 0.2–0.6.
+
+Note the ordering against `suggest_controlnet_strength()`: that still measures
+the *guest's own* depth, before the stage is built. It is asking how much real
+structure the room behind them has. Pointed at the prior instead, it would be
+measuring our own synthetic geometry and would lower the strength on every
+single frame.
+
+### The deliverable wasn't finished — `finish.py`
+
+There were two compositors and only one of them was done. The browser canvas
+draws a contact shadow and places the brand logo. The *batch* path — the one
+that produces the fifty frames a client actually receives — did this:
+
+```python
+canvas.alpha_composite(cutout)
+```
+
+So the deliverable had no logo (the mark existed only as a browser layer), no
+contact shadow (the pipeline computes one and it was discarded), and no
+relationship between how the subject was lit and how the scene was lit. The
+demo was branded and grounded; the product was not.
+
+Three steps now, in the order a retoucher would do them:
+
+1. **Shadow first**, under the subject — it has to go down before them or it
+   draws on top of their shoes. Deterministic, not AI, and the cheapest
+   available fix for "the person is floating".
+2. **Grade the subject toward the plate.** A studio-lit person dropped into a
+   golden-hour terrace reads as a sticker no matter how good the matte is,
+   because the two halves of the picture disagree about the colour of the
+   light. Grey-world, measured subject-against-plate, moved a *fraction* of the
+   way (0.35) with per-channel gain clamped. Deliberately partial: pull the
+   whole way and you have regenerated the guest's skin tone, which is the one
+   thing this tool promises never to do.
+3. **Logo last**, using the same geometry as the browser, so a batch frame and
+   an interactive frame place the mark identically. Aspect comes from the
+   artwork and never from a caller — a stretched logo is the most common brand
+   violation there is, and the way not to commit it is to make it
+   unrepresentable.
+
+What was applied goes into the manifest, so "was the mark on this frame, and
+where" is answerable months later without opening the picture.
+
+### A booth is not one output — `surfaces.py`
+
+The Spout sender — the one that drives a real LED wall through Resolume — was
+hardcoded to **768×768**. A square. That is not the shape of any wall, screen,
+projector or print in existence.
+
+A booth renders onto several surfaces at once: the backdrop the guest is
+standing in front of, the frame they take home, a story crop, a printed strip
+whose aspect is decided by the paper in the machine, a loop on a screen by the
+door. Those are crops of one generation, and letting each consumer crop for
+itself is how a guest ends up centred on the wall and beheaded on the print.
+
+So each surface declares its pixel size, its safe margin, where the mark goes
+and — the field that does the real work — where the *subject* should sit:
+
+| | size | notes |
+|---|---|---|
+| `led_backdrop` | 1920×1080 | live; no logo, the guest's body would cover it |
+| `ultrawide_backdrop` | 3840×1080 | the shape that makes a square sender obviously wrong |
+| `frame_4x5` | 1080×1350 | the delivered frame |
+| `story_9x16` | 1080×1920 | bigger margin: phone UI eats both bands |
+| `print_2x6` | 600×1800 @300dpi | booth strip; margin is bleed, not taste |
+| `print_6x4` | 1800×1200 @300dpi | postcard |
+| `loop_16x9` | 1920×1080 | event screen |
+
+**Cover, never stretch.** A person made 12% wider to fit a wall is a worse
+failure than a person with less headroom, and it is the one nobody notices
+until the photographs are printed.
+
+**The crop is placed, not centred.** The vertical offset puts the subject's
+feet on the surface's anchor. Cover-fit alone often leaves no room to do that —
+a square photo scaled to 9:16 fills the height exactly — so the fit is allowed
+to zoom up to 18% past cover to buy the slack back. Bounded on both sides: the
+window never leaves the picture, and the zoom never grows enough to take
+somebody's head off in order to land their feet on a line.
+
+**When the subject doesn't fit, the head wins.** Found by looking at a real
+postcard: a standing full-length portrait is nearly twice as tall as a 6×4
+landscape crop, and obediently anchoring the feet delivered a print of two
+shoes and two knees with the face gone. It was doing exactly what it was told,
+and what it was told was wrong — an anchor for feet only means something if
+there is a body above them still in frame. Too tall to fit now becomes a
+waist-up portrait, which is the crop a person would have made.
+
+**The mark is placed per surface, after the crop.** The first version branded
+the master and then cropped it, which pushed the logo off the edge of the
+postcard entirely. Frames are now finished unbranded and each output gets its
+own placement, in its own corner — or none at all on a live surface. A
+surface's safe margin *widens* the kit's clear space rather than replacing it,
+so a story's mark clears the phone UI while a kit that demands more room than
+the surface asks for still gets it.
+
+Opt-in per run (`--surfaces story_9x16,print_2x6`), because writing six renders
+of every photo triples the size of a fifty-photo zip for an operator who only
+wanted the frames. The live surface is a server setting
+(`BOOTH_LIVE_SURFACE`), and the Spout sender now takes its dimensions from it.
+
+## Architecture
 
 ```
 Browser (web/index.html)
@@ -38,12 +465,18 @@ POST /api/analyze  -----------------------------------------------+
   |    suggest_controlnet_strength() -> lower default if the      |
   |         background has real depth structure to fight against |
   v                                                                |
-Browser: layer stack (background / subject / pose / depth, <------+
+Browser: layer stack (background / subject / logo / pose / depth, <+
           each independently visible/opaque/movable/scalable/
           rotatable; canvas can fit the photo's own aspect ratio
           instead of always cropping to a fixed square)
   |
-  |  scene prompt + "Generate Background"
+  |  brand kit + optional free text -> "Generate Background"
+  v
+brand_kit.compose()  -> the prompt the client is not allowed to assemble
+  |
+  v
+job_queue.py  -> bounded worker pool, admission control
+  |
   v
 WS /ws  ==(relays ComfyUI's own websocket)==>  ComfyUI
   |         - progress (step N/M)                  |
@@ -59,259 +492,430 @@ Flatten & export PNG, or export a project .json (all layers +
 generation params) to resume/tweak later
 ```
 
-The core idea: the subject's actual pixels are never re-generated. Only
-the region *around* them is, conditioned on their real pose/depth so the
-new environment stays geometrically consistent, then composited back
-with the original cutout on top.
-
 ### Why a websocket relay instead of just polling
 
-ComfyUI already exposes a websocket with real-time `progress`,
-`executing`, and (with `--preview-method auto`) binary JPEG preview
-frames of the image mid-denoise. `web_server.py` keeps one persistent
-websocket connection to ComfyUI and relays those events straight to
-whichever browser tab is active — the browser shows the image actually
-forming, not a spinner. The binary preview frame format is
-undocumented-but-stable: `struct.pack(">I", event_type) + struct.pack(">I", image_type) + image_bytes`;
+ComfyUI already exposes a websocket with real-time `progress`, `executing`, and
+(with `--preview-method auto`) binary JPEG preview frames of the image
+mid-denoise. `web_server.py` keeps one persistent connection to ComfyUI and
+relays those events to whichever browser session owns that `prompt_id` — the
+browser shows the image actually forming, not a spinner. The binary preview
+frame format is undocumented-but-stable:
+`struct.pack(">I", event_type) + struct.pack(">I", image_type) + image_bytes`;
 verified against ComfyUI's own `server.py` (`encode_bytes`/`send_image`).
 
-### Setup
+One sharp edge found the hard way: ComfyUI keys websocket clients by `clientId`
+and keeps only the newest socket per id. Two instances of this app sharing a
+constant id meant the second silently stole the first's events — the older
+instance's generations still ran to completion, it just never heard about them
+and sat on "queued…" forever. `COMFY_CLIENT_ID` is therefore unique per process
+by default. This is not exotic: it happens the moment you run the Docker image
+alongside a native `python web_server.py`, which is exactly how you'd compare
+the two.
 
-**One command.** It creates `.venv`, installs what's needed, and finishes by
-telling you what (if anything) is still missing:
+### The queue
+
+`job_queue.py` puts a bounded worker pool between the request handlers and
+ComfyUI. It matters for three reasons:
+
+- **Admission control.** Past a queue depth, submission is *refused* rather than
+  accepted and quietly starved. At ~35s per generation a depth of 64 is already
+  a 35-minute wait; anything beyond that is a promise the app can't keep. Batch
+  mode surfaces this per-photo — the frames that didn't make it are marked
+  failed with the reason, and the rest of the run proceeds.
+- **The blocking submit runs off the event loop.** A submission uploads several
+  PNGs; doing that inline would stall the ComfyUI relay and every other
+  session's progress events with it.
+- **It's an interface, not a class.** `JobQueue` is abstract, and a
+  Redis/Celery-backed implementation would satisfy it unchanged. Nothing above
+  it knows which one it has — which is also what lets the tests drive it with
+  plain functions and no server.
+
+`GET /api/queue` reports live depth.
+
+## When ComfyUI has a bad night
+
+ComfyUI is a real dependency with real failure modes: VRAM pressure, model
+reloads, an OOM fallback mid-generation, a dropped upload. Every HTTP call in
+this app had a timeout and not one of them was ever retried, so the entire
+response to any of that was to hand the guest an error.
+
+Three ideas do the work, and the middle one is the interesting one.
+
+**Not every failure deserves a retry.** A 503 means ComfyUI declined the work,
+so trying again is free and usually succeeds. A 400 means the workflow is wrong,
+and four attempts just makes the guest wait four times as long for the same
+answer. Classification is the difference between resilience and a busy loop.
+
+**A retry can be unsafe.** `POST /prompt` queues GPU work. If the request timed
+out on the *read*, ComfyUI may already be rendering — retrying then burns a
+second slot on a serial GPU and produces a duplicate. So failures sort three
+ways, not two: terminal, safe-to-retry, and **ambiguous**. Ambiguous ones are
+*reconciled* rather than guessed: because the app supplies its own `prompt_id`,
+it can go and look in `/history` and `/queue` to find out whether the work
+landed. That is the same client-supplied id that already existed to close a
+race in the relay, earning its keep twice.
+
+**A retry ladder is the wrong answer when the dependency is simply down.** A
+circuit breaker opens after consecutive failures, so the sixth guest is told
+immediately instead of waiting through a full backoff to learn the same thing.
+One probe is allowed through per recovery window; a failed probe restarts the
+clock.
+
+Backoff uses **full jitter** — a uniform draw from `[0, backoff]`, not backoff
+plus a wiggle. A booth fails several sessions at the same instant against the
+same ComfyUI, and equal delays send them back as a synchronised wave.
+
+### Proving it, rather than describing it
+
+`chaos_comfy.py` is a fake ComfyUI that fails on purpose, with the failure rate,
+slow rate and seed all configurable — the design borrowed from a technical
+challenge whose mock service does the same thing, because reproducible failures
+beat real ones. It speaks enough of the protocol (REST plus the websocket event
+stream, including binary preview frames) to drive the whole app with no GPU and
+no models.
 
 ```
-powershell -ExecutionPolicy Bypass -File install.ps1     # Windows
-./install.sh                                             # macOS / Linux
+python chaos_comfy.py --port 8188 --failure-rate 0.3 --seed 42
+python web_server.py                     # then use the app normally
 ```
 
-Add `-Resolume` / `--resolume` if you also want the OSC + Spout bridge,
-or `-All` / `--all` for everything. Safe to re-run — pip skips what's
-already satisfied, so an interrupted install resumes.
+Measured against it, at a **50% injected failure rate**:
 
-Expect roughly **2GB and a few minutes** on a cold cache: `controlnet_aux`
-pulls in torch, torchvision, timm, scipy and scikit-image.
-
-<details>
-<summary>Prefer to do it by hand?</summary>
-
-```
-python -m venv .venv
-.venv\Scripts\activate          # source .venv/bin/activate on macOS/Linux
-pip install -r requirements.txt
-python doctor.py
-```
-
-Requirements are split so nobody installs a Windows-only package to try the
-browser app:
-
-| file | what it's for |
+| | generations completed |
 |---|---|
-| `requirements.txt` | the photo booth — all you need for the primary demo |
-| `requirements-resolume.txt` | the OSC bridge + Spout output (Windows for Spout) |
-| `requirements-backends.txt` | hosted Runway / Kling backends |
-| `requirements-test.txt` | the offline test suite |
+| Before (no retry) | **0 / 10** |
+| After | **4 / 5** |
 
-</details>
+It also reproduces one piece of ComfyUI's real behaviour deliberately: a second
+websocket with the same `clientId` silently displaces the first. That is the bug
+described above, and reproducing it in the fake is what turns the fix into a
+tested property instead of a comment.
 
-#### Something not working? Run the doctor
+`GET /api/queue` reports the breaker's live state alongside queue depth.
+
+## The people in the photographs
+
+This app points a camera at members of the public. Until recently the only thing
+it recorded about a person was the seed used to regenerate the wall behind
+them — excellent provenance for the image, none at all for the human in it.
+
+**Consent is captured before the shutter, and recorded rather than enforced.**
+The batch form asks for a basis from a closed set (`guest_verbal`,
+`guest_signed`, `event_notice`, `internal_test`) rather than free text, because
+"consent: yes" in a text field records that somebody typed something. Whatever
+is declared travels into the run's `manifest.json`; a run that declares nothing
+is written down as `not_recorded`, which is a different statement from an empty
+field and reads as one months later.
+
+**It does not block, and that is a deliberate trade — flagged here rather than
+buried in a default.** The gate started out mandatory and is now opt-in
+(`--require-consent`, or `BOOTH_REQUIRE_CONSENT=1`; the strict path is unchanged
+and still tested). Two reasons. The small one is usability: a blocking two-field
+form in front of every test run is friction that gets routed around, and a
+control people route around is worse than one that asks politely. The larger one
+is honesty about what this layer can reach. An app that refuses a batch has done
+nothing about the operator's screenshot, the camera roll on the device that took
+the photograph, the projector throwing the output at a wall, or the SD card in
+somebody's bag — and at a live event those are usually the unhandled ones. If
+they are, a server-side form field is a record of intent, not a boundary, and
+treating it as a boundary lets everyone stop thinking exactly where the real
+exposure starts.
+
+What survives that argument is the part that was always doing the work: the
+record travelling with the images, so that months later "what were these people
+told?" has an answer that isn't somebody's memory. That needs no gate. One case
+is still refused in both modes — a half-filled form, because a basis with
+nobody's name on it looks like a record and cannot be followed up when a guest
+asks to be deleted.
+
+**The original photograph is deleted as soon as a cutout exists.** Nothing
+downstream reads it again — the compositor needs the cutout, not the photograph.
+An earlier version of `batch.py` kept the originals and justified it as "worth
+having when a client asks why frame 31 looks wrong": a real convenience bought
+with someone else's biometric data. Debugging now needs `--keep-intermediates`,
+an explicit choice by whoever runs the booth.
+
+**Runs expire.** A retention sweep sets a 7-day default (`--retain-days`), runs
+at startup and hourly, and — importantly — sweeps the *directory* rather than
+just the in-memory registry, because the case that matters is the crashed server
+whose folder of photographs nothing in the app remembers. Consent and retention
+both land in each run's `manifest.json`, which is the artifact a reviewer
+actually gets handed.
+
+None of this makes the app compliant with anything, and it is not legal advice.
+Consent is a conversation between an operator and a guest that no code can have.
+What the code can do is keep the record with the photographs, delete what it
+does not need, and be clear about which of its controls are boundaries and which
+are only paperwork.
+
+## When something needs a person
+
+The booth could previously do two things with a problem: retry it, or show an
+error and forget. The third option is the one an operator standing two metres
+away can act on, so there is now a queue for it (`GET /api/attention`, with a
+badge in the header).
+
+<p align="center">
+  <img src="docs/attention.png" alt="the operator attention drawer" width="420">
+</p>
+
+*Captured from a real run with ComfyUI killed mid-batch: note the ×2 counts, and
+that the guest was told "the render service is not responding" rather than shown
+a connection error.*
+
+The mechanism is a dict; the value is in the criteria:
+
+- **Escalate when a human can change the outcome** — ComfyUI unreachable, a photo
+  that failed the whole retry ladder, a subject the segmenter could not find.
+- **Do not escalate when they cannot.** A guest whose upload is not an image is
+  already being told; putting that in front of an operator is noise, and a queue
+  that fills with noise is one nobody reads. This is the same line the brand kit
+  draws between clamping a logo's minimum size and merely warning about clear
+  space.
+- **Deduplicate.** Fifty photos failing against one dead ComfyUI is *one*
+  problem with a count of fifty, not fifty rows burying everything else.
+- **Close alerts when their cause goes away.** The dependency alert resolves
+  itself the moment ComfyUI answers again, because an alert that outlives its
+  problem is how an operator learns to distrust the panel.
+
+## Running it as a service
+
+Everything above is about the app working. This section is about the app being
+*operated* — the things that only matter once it is a process somebody else has
+to keep alive.
+
+### The failure that does not announce itself
+
+Every other failure here arrives as an event: an exception, an `execution_error`,
+a dropped socket. The one that doesn't is a job ComfyUI accepts and then never
+mentions again — the render OOMed, or the websocket reconnected during the one
+second carrying the `executed` event, or two processes shared a `clientId` and
+the events went to the other one. *That last one happened in this repo*, and the
+symptom was a browser on "queued…" forever while the GPU had long since finished
+the picture. Nothing noticed, because not receiving a message is not an event.
+
+So `watchdog.py` works on a timer, with two clocks:
+
+- **A total budget** per job (`JOB_MAX_SECONDS`, default 1800). A backstop, not
+  an SLA.
+- **A stall detector** (`JOB_STALL_SECONDS`, default 300) that reads the
+  *global* event stream, not the job's own. A photo sitting in ComfyUI's queue
+  behind forty others emits nothing for a long time and is perfectly healthy —
+  progress on somebody else's photo is evidence about yours. Only when the whole
+  relay goes silent are in-flight jobs suspect.
+
+And it **asks before declaring death**. An overdue job is most likely a *missed
+event*, so the sweep checks `/history` first and recovers the finished render
+through the same delivery path a normal completion uses. Failing a photo that
+actually succeeded would be worse than the bug being fixed, and it is the bug
+the naive version of a timeout ships with.
+
+### Shutdown drains, it doesn't cancel
+
+The old shutdown was `await GENERATION_QUEUE.stop()`, which cancels the workers:
+`docker stop` mid-batch lost a guest's photo and told nobody. `drain()` had been
+sitting on the queue interface the whole time with no caller.
+
+The boundary is deliberately *"queued work reaches ComfyUI"*, not *"every render
+finishes"* — once ComfyUI has the prompt it renders regardless of this process,
+and waiting for renders would mean a half-hour shutdown, which is how you teach
+someone to use `kill -9`. Bounded by `SHUTDOWN_DRAIN_SECONDS` (default 30), and
+past the deadline the stragglers are **failed loudly** rather than dropped.
+
+Measured on a live 12-photo batch: 2 photos reached ComfyUI during the drain, 8
+were failed at the deadline with a message, process gone at 30.8s.
+
+### Health, split in two
+
+- **`/healthz`** — is the process alive. Checks nothing else, on purpose: a
+  liveness probe that consults a dependency is a restart loop waiting for that
+  dependency to have a bad minute, and restarting *this* process while ComfyUI
+  is down destroys the queue and the attention list to fix nothing.
+- **`/readyz`** — should this instance be given work. Models warm, not draining,
+  breaker closed, queue not full. Every "no" comes with a reason, because a probe
+  that fails without saying why turns into somebody reading source at 2am.
+
+### One id, one photo, one grep
+
+`obs.py` puts the `prompt_id` — which this app generates itself and ComfyUI
+echoes back — into a context variable, so `grep 'job=a1b2c3d4'` returns that
+photo's admission, retry ladder, relay and compositor lines together. The
+context survives the hop into `asyncio.to_thread`, which is what lets the retry
+code log attributably without ever hearing about jobs. `BOOTH_LOG_FORMAT=json`
+for one object per line.
+
+### Settings that cannot be wrong quietly
+
+`config.py` declares every knob, validates it, and prints the effective values
+at boot with `*` on the overridden ones. This is not tidiness. `BATCH_RETAIN_DAYS=-1`
+— a plausible way to type "unset" — used to validate fine and silently mean
+*keep strangers' photographs forever*, because the sweep reads a non-positive
+window as "retention off". It is now refused, and switching retention off has to
+be spelled `0`.
+
+### Measured, not argued
+
+`soak.py` drives the real HTTP API against `chaos_comfy.py`, no GPU required.
+Two runs of 40 photos against the same process, two workers, fake renders at
+0.3s so the numbers are this app's behaviour rather than somebody's sampler:
+
+| measure | value |
+| --- | --- |
+| finished / failed | 40 / 0 |
+| seconds per photo | 12.7s (all of it this app's CPU analysis) |
+| RSS, first 40 photos | 9409 MB → 14692 MB (**+5283 MB**) |
+| RSS, next 40 on the same process | 14692 MB → 14797 MB (**+105 MB**) |
+| at saturation (150 submitted) | 66 accepted, 84 refused per-item with a reason |
+| readiness at saturation | 503, `the queue is full (64 waiting)` |
+
+The two memory rows are the point, and neither is legible alone. The first run
+looks like a 130 MB-per-photo leak; the second shows it is a plateau — model and
+allocator caches filling once, not growth per photo. **Budget ~16 GB of RAM**,
+and do not go looking for a leak that isn't there.
+
+Saturation behaves as designed: admission control refuses the excess *per item*
+with the reason written into the run manifest, rather than accepting work the
+machine cannot do, and readiness goes red so nothing else routes to it.
 
 ```
-python doctor.py              # photo booth
-python doctor.py --all        # every optional piece too
+python chaos_comfy.py --port 8189 --render-seconds 0.3 --failure-rate 0
+COMFY_ADDRESS=127.0.0.1:8189 python web_server.py --port 8011
+python soak.py --server 127.0.0.1:8011 --photos 40      # pip install psutil for the RSS rows
 ```
 
-It checks the Python version, every package (naming what breaks without each
-one), which OpenCV build you ended up with, whether ComfyUI is reachable, and
-whether the models the workflow names are actually on disk — printing the
-exact command to fix each problem. It imports nothing outside the standard
-library, so it runs on a bare interpreter *before* anything is installed,
-and exits non-zero only for things that would genuinely stop the app.
+See **[RUNBOOK.md](RUNBOOK.md)** for symptom → check → do.
 
-#### Models
+### Workflow roles instead of magic node IDs
 
-ComfyUI needs two files (the app checks for both at startup and `doctor.py`
-reports them):
+Node IDs in an exported ComfyUI workflow are an implementation detail of the
+export, but code that reaches into the JSON has to name *something*. This used
+to be a wall of constants (`PHOTOSHOOT_POSITIVE_PROMPT_NODE = "7"`), and a
+workflow re-exported from the ComfyUI UI could silently renumber them.
 
-- Checkpoint: [`RealVisXL_V5.0_fp16.safetensors`](https://huggingface.co/SG161222/RealVisXL_V5.0) in `models/checkpoints/`
-- ControlNet: [`diffusers_xl_depth_full.safetensors`](https://huggingface.co/lllyasviel/sd_control_collection) in `models/controlnet/`
+`workflow_graph.py` resolves roles from the graph's own wiring instead: find the
+sampler by class, then walk *backwards* through its inputs — including
+pass-through conditioning nodes like `ControlNetApplyAdvanced` and
+`LTXVConditioning` — to find which text encoder is the positive one and which is
+the negative. Same for the checkpoint loader, the ControlNet, the image inputs.
 
-The rotoscope/pose/depth models (`birefnet-portrait`, OpenPose, MiDaS)
-download themselves on first use via `rembg`/`controlnet_aux` — the first
-photo you analyze will be slower than the rest.
+Two details that make it worth doing rather than "clever":
 
-#### A note on OpenCV
+- Different samplers name the same field differently (`KSampler.seed` vs
+  `SamplerCustom.noise_seed`). The registry knows which, so callers just say
+  `set_seed()`.
+- A UI-format workflow (saved with *Save* rather than *Save (API format)*) is a
+  dict too, so it doesn't fail a naive type check — it fails later, deep in an
+  attribute error. It's now detected explicitly and rejected with the sentence
+  that tells you what to do about it.
 
-This project used to require `pip install --force-reinstall opencv-python`
-after every install, because `controlnet_aux` depends on
-`opencv-python-headless` and both builds provide the same importable `cv2` —
-whichever lands last on disk wins.
+## Real-photo hardening
 
-That step is gone from the main path. The photo booth only uses OpenCV for
-array work (connected components, colour conversion), which the headless
-build does perfectly, so `requirements.txt` now asks for headless
-*deliberately* and the two never fight. Exactly one optional file needs a
-real window — `spout_viewer.py`, via `cv2.imshow` — and the installer handles
-that itself when you ask for the Resolume extras.
+Everything above was originally validated against one curated 1024x1024 test
+image. Running real (non-square, full-resolution) photos through it with a
+specific target shot in mind — not just checking that requests succeed —
+surfaced four issues that don't show up on a clean square test photo:
 
-### Run
-
-```
-powershell -ExecutionPolicy Bypass -File start_demo.ps1
-```
-
-Starts ComfyUI (with `--preview-method auto`), waits for it to be ready,
-checks that the checkpoint and ControlNet the workflow names are actually
-installed (via ComfyUI's `/object_info`, so a missing model is reported at
-startup instead of ~40s into the first generation), starts `web_server.py`,
-waits for that, opens the browser. Run `stop_demo.ps1` to shut both down.
-
-Paths are derived from the script's own location; ComfyUI is assumed to be a
-sibling directory of this repo, overridable with `COMFYUI_DIR`:
-
-```
-$env:COMFYUI_DIR = "C:\path\to\ComfyUI"; .\start_demo.ps1
-```
-
-(If you double-click the script rather than running it from an already-open
-PowerShell window and the services don't seem to stay up, open PowerShell
-yourself and run it directly — that path is the one that's fully verified
-end-to-end.)
-
-Or manually:
-```
-python web_server.py     # http://127.0.0.1:8000, needs ComfyUI already running
-```
-
-### The region-draw "add object" tool
-
-Draws a box on the canvas, asks what belongs there, and inpaints just
-that masked region — added as its own layer, everything else untouched.
-Two things that matter for this to actually work, found empirically:
-
-- **ControlNet depth strength defaults near-zero for object insertion**
-  (vs. 0.75 for background regen). The depth map reflects the scene
-  *before* the new object exists, so conditioning on it fights the model
-  trying to introduce geometry that isn't there — at background-regen
-  strength the object just didn't appear at all.
-- **Minimum region size matters.** SDXL can't render a recognizable
-  object into a small masked patch — a tiny corner box just blends into
-  the surrounding background. ~30% of the canvas per side is the point
-  where this reliably stopped failing in testing; the UI enforces that
-  as a minimum.
-
-### Real-photo hardening
-
-Everything above was originally validated against one curated 1024x1024
-test image. Running real (non-square, full-resolution) photos through it
-with a specific target shot in mind — not just checking that requests
-succeed — surfaced four issues that don't show up on a clean square test
-photo:
-
-- **No resize node in `photoshoot_bg_api.json`** means SDXL's `VAEEncode`
-  runs at the uploaded photo's *native* resolution. A realistic 22MP
-  camera photo drove ComfyUI into a VAE out-of-memory fallback
-  (`retrying with tiled VAE encoding`) and dropped sampling from
-  ~1.2s/step to ~41s/step — on track for ~20 minutes with zero error
-  shown to the user. `cap_resolution()` downscales to 1536px max before
-  any model sees the image; generation resolution otherwise still tracks
-  the photo's own aspect ratio, just capped.
+- **No resize node in `photoshoot_bg_api.json`** means SDXL's `VAEEncode` runs
+  at the uploaded photo's *native* resolution. A realistic 22MP camera photo
+  drove ComfyUI into a VAE out-of-memory fallback (`retrying with tiled VAE
+  encoding`) and dropped sampling from ~1.2s/step to ~41s/step — on track for
+  ~20 minutes with zero error shown to the user. `cap_resolution()` downscales
+  to 1536px max before any model sees the image; generation resolution otherwise
+  still tracks the photo's own aspect ratio, just capped.
 - **The canvas was a fixed 768x768 square**, so any non-square photo got
-  stretched (not cropped — `drawImage` with an explicit target size
-  distorts) to fill it, visibly warping body proportions. The canvas now
-  cover-fits each layer to its real aspect ratio, and the UI offers to
-  resize the canvas itself to the photo's own proportions so nothing gets
-  cropped at all (opt-in — square stays the default).
+  stretched (not cropped — `drawImage` with an explicit target size distorts) to
+  fill it, visibly warping body proportions. The canvas now cover-fits each
+  layer to its real aspect ratio, and the UI offers to resize the canvas itself
+  to the photo's own proportions so nothing gets cropped at all (opt-in — square
+  stays the default).
 - **rembg occasionally classifies a small disconnected patch of a busy
-  background as subject** — a real floating artifact (e.g. a chair-leg
-  sliver), not a body part, since alpha thresholding has no notion of
-  connectivity. Fixed with a connected-component pass that drops blobs
-  below an area-ratio threshold relative to the main subject blob, rather
-  than naively keeping only the single largest one (which would also
-  discard legitimately-disconnected parts like a held object or jewelry).
-- **ControlNet depth strength (0.75 default) can over-anchor to the
-  original scene's geometry** when the background already has real
-  structure — a "cozy reading nook" prompt over a room with a chair in it
-  barely changed the room, because the depth map still encoded that
-  chair's exact geometry. `suggest_controlnet_strength()` measures depth
-  variance in the background region and suggests a lower value (0.45)
-  only when there's real structure to fight against; a plain backdrop
-  still defaults to 0.75, where the higher strength actually helps.
+  background as subject** — a real floating artifact (e.g. a chair-leg sliver),
+  not a body part, since alpha thresholding has no notion of connectivity. Fixed
+  with a connected-component pass that drops blobs below an area-ratio threshold
+  relative to the main subject blob, rather than naively keeping only the single
+  largest one (which would also discard legitimately-disconnected parts like a
+  held object or jewelry).
+- **ControlNet depth strength (0.75 default) can over-anchor to the original
+  scene's geometry** when the background already has real structure — a "cozy
+  reading nook" prompt over a room with a chair in it barely changed the room,
+  because the depth map still encoded that chair's exact geometry.
+  `suggest_controlnet_strength()` measures depth variance in the background
+  region and suggests a lower value (0.45) only when there's real structure to
+  fight against; a plain backdrop still defaults to 0.75, where the higher
+  strength actually helps.
 
-### Known limitations
+## The region-draw "add object" tool
 
-- Rotoscope (`birefnet-portrait`) runs CPU-only, ~20s/photo — this
-  machine's `onnxruntime-gpu` wants CUDA 13 libraries that aren't
-  published as pip wheels yet (checked: `nvidia-cublas-cu13` on PyPI is
-  a version-`0.0.1` placeholder).
-- Multiple browser sessions can connect and queue concurrently — each `/ws`
-  connection gets its own session id, and ComfyUI's events route back by
-  `prompt_id → session` rather than to a single global "whoever connected
-  last." ComfyUI itself still renders one graph at a time (a real GPU
-  constraint), so concurrent sessions queue through its own `/prompt` queue;
-  what the routing guarantees is that each session gets *its own* result.
-  The CPU analysis stages serialize behind a lock for the same reason —
-  the cached PyTorch model instances aren't safe for concurrent forward
-  passes (reproduced: two simultaneous `/api/analyze` calls crashed inside
-  MiDaS).
-- The illumination estimate is classic CV (per-quadrant luminance,
-  highlight color, contrast), not a learned model — a useful heuristic
-  for prompt-grounding, not a physically accurate light probe.
-- Generate Background / Relight always condition on the *original*
-  uploaded photo's mask/depth, not the current live composite — so an
-  object added via the region-draw tool stays in place (drawn on top)
-  but isn't re-conditioned if you regenerate the background afterward,
-  and can end up visually mismatched with the new scene. The UI surfaces
-  an explicit warning when this would happen rather than silently
-  producing a mismatched result; region-edit itself doesn't have this
-  problem, since it conditions on the current composite directly.
-- Node IDs in the ComfyUI workflow JSON files are hardcoded per exported
-  template (e.g. `PHOTOSHOOT_POSITIVE_PROMPT_NODE = "7"`) — a workflow
-  re-exported from the ComfyUI UI could silently shift those IDs and
-  break the app. A production version would want a small schema mapping
-  semantic node roles to IDs per workflow version. Partially mitigated:
-  `tests/test_provenance.py` asserts every hardcoded ID still resolves to a
-  node with the expected input, so a renumbered workflow fails in CI rather
-  than at generation time — and the two model *names* in the provenance
-  record are already read by `class_type` instead of by ID.
+Draws a box on the canvas, asks what belongs there, and inpaints just that
+masked region — added as its own layer, everything else untouched. Two things
+that matter for this to actually work, found empirically:
 
-### Testing
+- **ControlNet depth strength defaults near-zero for object insertion** (vs.
+  0.75 for background regen). The depth map reflects the scene *before* the new
+  object exists, so conditioning on it fights the model trying to introduce
+  geometry that isn't there — at background-regen strength the object just
+  didn't appear at all.
+- **Minimum region size matters.** SDXL can't render a recognizable object into
+  a small masked patch — a tiny corner box just blends into the surrounding
+  background. ~30% of the canvas per side is the point where this reliably
+  stopped failing in testing; the UI enforces that as a minimum.
+
+## Testing
 
 Two complementary layers.
 
-**1. Offline unit tests** — no ComfyUI, no GPU, no photos, ~1 second:
+**1. Offline unit tests** — no ComfyUI, no GPU, no photos, a couple of seconds:
 
 ```
 pip install -r requirements-test.txt
 pytest
 ```
 
-Covers the pure-logic parts of the pipeline (mask blob cleanup, illumination
-estimation, resolution capping, the ControlNet-strength heuristic, contact
-shadow geometry, cover-fit), the provenance extraction, and the multi-session
-job routing in `web_server.py` — the last driven against a fake backend, so
-the cross-session-leak cases can be checked without a GPU in the loop. Runs
-in CI on Python 3.10 and 3.12 (`.github/workflows/tests.yml`).
+411 tests covering the pure-logic parts of the pipeline (mask blob cleanup,
+illumination estimation, resolution capping, the ControlNet-strength heuristic,
+contact shadow geometry, cover-fit), the stage-depth prior, the frame finisher
+(grade, contact shadow, logo geometry), the output-surface model, brand-kit
+loading and enforcement, workflow
+role resolution, the queue's admission control and failure isolation, the retry
+ladder and circuit breaker, consent/retention/minimisation, the attention
+queue's escalation criteria, the watchdog's two clocks and its recover-before-
+failing rule, settings validation, the shutdown drain, the health probes, batch
+bookkeeping and result routing, provenance extraction, and multi-session job
+routing in `web_server.py` — the last driven against a fake backend, so
+cross-session-leak cases can be checked without a GPU in the loop. Runs in CI on
+Python 3.10 and 3.12 (`.github/workflows/tests.yml`).
+
+Three details worth stealing. The breaker is tested against an **injected
+clock**, so "it reopens after exactly 30 seconds" is a claim the suite makes
+rather than a delay it waits out. The chaos tests convert the TestClient's
+`httpx` responses back into `requests` ones — without that, `raise_for_status()`
+raises a type the classifier has never heard of, and the suite would cheerfully
+"prove" that a 503 is not retried.
+
+And the drain test deliberately uses a **slow** submit. The first version used
+an instant one, so every job finished before the drain was even reached and the
+test passed whether or not the drain did anything — it would have gone green
+against the exact bug it was written to catch. Removing the drain now fails
+three tests; that was checked by removing it.
 
 **2. End-to-end verification** — needs the real stack running.
 
 `verify_web_ui.py` drives a real Chromium via Playwright through the full
-click-through path (upload → analyze → generate background → region-draw
-object → relight → voice button → living-photo export → disclosure copy
-→ PNG/JSON export → Spout send), since the canvas/layer JS in
-`web/index.html` previously had no coverage beyond a Python websocket
-test client:
+click-through path (upload → analyze → generate background → region-draw object
+→ relight → voice button → living-photo export → disclosure copy → PNG/JSON
+export → Spout send), since the canvas/layer JS in `web/index.html` has no
+coverage from the Python suite:
 
 ```
 pip install playwright && playwright install chromium
 python verify_web_ui.py --image path\to\any\subject\photo.jpg
 ```
 
-Needs ComfyUI and `web_server.py` already running. Screenshots and any
-exported downloads land in `verify_out/<timestamp>/` (gitignored).
+Needs ComfyUI and `web_server.py` already running. Screenshots and any exported
+downloads land in `verify_out/<timestamp>/` (gitignored).
 
-Three narrower scripts sit alongside it, same requirements, each taking its
-own photos on the command line:
+Three narrower scripts sit alongside it, same requirements, each taking its own
+photos on the command line:
 
 ```
 python verify_multi_session.py    --image-a one.jpg --image-b two.jpg
@@ -326,207 +930,96 @@ They're named `verify_*` rather than `test_*` precisely because they *aren't*
 collectable tests — they parse argv, drive live servers, and need photos the
 repo doesn't ship. `pytest` means `tests/` only.
 
----
+The screenshots and GIF above are captured the same way, by
+`docs/capture_screenshots.py`, so they can be regenerated rather than going
+stale.
 
-## 2. Resolume live VJ bridge
+## Known limitations
 
-The original build this repo started as: a Resolume-to-generative-AI
-bridge in both directions.
-
-- **Trigger -> generate**: a Resolume clip trigger (or a manual/test
-  call) fires a still-image or video generation and streams the result
-  back live as a Spout source.
-- **Resolume -> prompt**: pull whatever's currently live in Resolume
-  (active clip names, active effects, and the clip's actual thumbnail
-  image) and turn it into a text prompt, so you can regenerate/reinterpret
-  what the VJ actually built instead of typing a prompt by hand.
-
-Generation is backend-agnostic — swap between local Stable Diffusion
-(ComfyUI), Runway, or Kling with one flag. Video generation (ComfyUI/LTXV)
-is also available alongside stills.
-
-```
-                    +-------------------------------+
-Resolume clip  ---> |  bridge.py                     |
-  trigger (OSC)     |   - clip -> prompts.json       |
-                     |   - OR resync -> Resolume      |---> backend.generate_image(prompt)
-Resolume state <---- |     REST API -> name+effects   |         or
-  (REST API +        |     + thumbnail pixel stats    |     backend.generate_video(prompt)
-   thumbnail)        |     -> prompt                  |         |
-                     +-------------------------------+          v
-                                    |                     ComfyUI / Runway / Kling
-                                    v                            |
-                          Spout sender "ComfyBridge" <-----------+
-                                    |                    (video loops frame-by-frame)
-                                    v
-                    Resolume Sources > Spout > ComfyBridge (live layer)
-                       or  python spout_viewer.py  (no Resolume needed)
-```
-
-### Prerequisites
-
-```
-powershell -ExecutionPolicy Bypass -File install.ps1 -Resolume
-python doctor.py --resolume
-```
-
-This is the one path that needs the extra packages (`python-osc`, `SpoutGL`,
-`PyOpenGL`) and the GUI OpenCV build for `spout_viewer.py`'s window — the
-installer handles both, and `doctor.py --resolume` reports which OpenCV build
-you actually ended up with.
-
-- Windows for the **Spout output specifically** — the OSC trigger path and
-  generation work fine on macOS/Linux, and the requirement markers skip the
-  Spout packages there rather than failing the install. `spout_sender_loop()`
-  reports the missing module and returns instead of dying in a background
-  thread, so the app stays honest about publishing nothing.
-- A generation backend, at least one of:
-  - [ComfyUI](https://github.com/comfyanonymous/ComfyUI) running locally
-    with a checkpoint installed (default `127.0.0.1:8188`) — needed for
-    video generation specifically, Runway/Kling are stills-only here
-  - Runway API access (`RUNWAYML_API_SECRET` env var) — https://docs.dev.runwayml.com
-  - Kling AI API access (`KLING_ACCESS_KEY` / `KLING_SECRET_KEY` env vars) — https://kling.ai/document-api
-- Resolume Arena or Avenue (optional — everything works against
-  `send_trigger.py` and `spout_viewer.py` without it)
-- Python 3.10+ (SpoutGL ships prebuilt wheels for common CPython versions)
-
-### Setup
-
-If you're using the ComfyUI backend:
-- Stills: edit `workflows/txt2img_api.json`, set `"ckpt_name"` (node `4`)
-  to a checkpoint you have installed.
-- Video: uses `workflows/text_to_video_api.json` (LTXV 2B). Needs
-  `ltx-video-2b-v0.9.1.safetensors` in `models/checkpoints/` and
-  `t5xxl_fp8_e4m3fn.safetensors` in `models/text_encoders/` —
-  [LTXV checkpoint](https://huggingface.co/Lightricks/LTX-Video/blob/main/ltx-video-2b-v0.9.1.safetensors),
-  [T5 text encoder](https://huggingface.co/comfyanonymous/flux_text_encoders/blob/main/t5xxl_fp8_e4m3fn.safetensors).
-  Runs comfortably on 8GB VRAM; ~1-4 seconds of 768x512 video per
-  generation, roughly a minute to render.
-
-Edit `prompts.json` to map Resolume clip slots (`L<layer>C<clip>`) to
-prompts for the clip-trigger path. `_default` covers any untracked clip.
-The resync path doesn't need this file — it builds its prompt from
-Resolume's live state instead.
-
-### Run
-
-```
-python bridge.py --backend comfy              # local Stable Diffusion / LTXV via ComfyUI
-python bridge.py --backend runway
-python bridge.py --backend kling
-```
-
-This starts an OSC listener (`:9000` by default) and a Spout sender named
-`ComfyBridge`.
-
-**See it without Resolume:**
-
-```
-python spout_viewer.py
-```
-
-opens a window showing whatever the bridge is currently sending. Or use
-the typing-box GUI instead of raw OSC calls:
-
-```
-python gui.py
-```
-
-**In Resolume** (once you're ready):
-1. **Preferences > OSC** — enable OSC output, host `127.0.0.1`, port
-   `9000` (must match `bridge.py`'s `--osc-port`). Resolume broadcasts
-   OSC for every clip connect/disconnect automatically once this is on.
-2. **Preferences > Webserver** — enable it (default port `8080`) if you
-   want the resync path to read live composition state.
-3. Add a layer, **Sources > Spout > ComfyBridge**.
-4. Trigger any clip to fire a generation from `prompts.json`.
-
-### Testing without Resolume open
-
-```
-python send_trigger.py --clip 1 1        # simulate a clip trigger
-python send_trigger.py --prompt "a cat made of stained glass"
-python send_trigger.py --video "a cat made of stained glass, slow pan"  # ComfyUI backend only
-python send_trigger.py --resync           # pull live state from Resolume's REST API
-```
-
-`--resync` needs Resolume actually running (with the webserver enabled),
-since it reads real composition state; the other three work with just
-`bridge.py` and a backend running.
-
-### How resync builds a prompt
-
-`resolume_state.py` calls Resolume's REST API (`GET /api/v1/composition`),
-walks the visible layers, and for each one's active (connected) clip pulls
-from two sources:
-
-- **Name + effects**: the clip's name as a prompt fragment, plus a short
-  descriptor for each non-bypassed effect on that clip or its layer
-  (`kaleidoscope` → "kaleidoscopic, symmetrical fractal patterns", etc. —
-  see `EFFECT_DESCRIPTORS`). Only as good as how the VJ named things.
-- **The clip's actual thumbnail** (`GET .../clips/{n}/thumbnail`, forcing
-  a fresh capture first via `POST .../thumbnail/update`): resized to
-  48x48 and read directly for dominant hue, saturation, brightness,
-  contrast, and edge density, converted to adjectives (`describe_image()`
-  in `resolume_state.py`). This is what makes the prompt reproducible —
-  the same visual content always produces the same descriptors,
-  regardless of what the clip happens to be named.
-
-Fragments are joined, de-duplicated, and a fixed style suffix is
-appended.
-
-### How video generation works
-
-`--backend comfy` gets a `generate_video()` in addition to
-`generate_image()`. It queues `workflows/text_to_video_api.json` (LTXV
-text-to-video: `CLIPLoader` → `CLIPTextEncode` → `LTXVConditioning` →
-`EmptyLTXVLatentVideo` → `LTXVScheduler` → `SamplerCustom` → `VAEDecode` →
-`CreateVideo` → `SaveVideo`), polls `/history` the same way stills do
-(ComfyUI's `SaveVideo` reports its output under the same `"images"` key
-as `SaveImage`, just flagged `"animated": true`), downloads the resulting
-mp4, and hands it to `VideoLoopPlayer` — a background thread that decodes
-frames with OpenCV and feeds them into the same `FrameBuffer` the Spout
-sender reads from, looping until the next generation replaces it.
-Triggered via OSC `/comfybridge/generate_video` (arg0: prompt text).
-
-### Known limitations (this is a demo, not production)
-
-- Polls REST endpoints on a timer instead of using websocket/streaming
-  APIs — simpler, slightly higher latency. (The photo booth app above
-  does use ComfyUI's websocket — see part 1.)
-- One generation in flight at a time; triggers that arrive while busy are
-  dropped rather than queued.
-- Fixed output canvas (`SPOUT_WIDTH`/`SPOUT_HEIGHT` in `bridge.py`,
-  default 512x512) — anything a backend returns (image or video frame)
-  gets fit to it. `SpoutFrameBuffer.set_image()` (shared by both apps via
-  `spout_output.py`) cover-fits and crops to the sender's aspect ratio
-  rather than stretching, so non-square sources no longer get squashed —
-  they get cropped to fill instead, same as any normal video source.
-- `EFFECT_DESCRIPTORS` in `resolume_state.py` is a small hand-picked
-  table, not a mapping of Resolume's full effect library. The thumbnail
-  descriptors are deterministic pixel stats, not learned image
-  understanding — coarse but consistent.
-- Video generation is ComfyUI/LTXV-only; Runway and Kling backends here
-  only implement stills, though their APIs support video too.
-- No retry/backoff on backend errors, no auth on the bridge's own OSC
-  listener, single-machine only.
+- Rotoscope (`birefnet-portrait`) runs CPU-only, ~20s/photo — this machine's
+  `onnxruntime-gpu` wants CUDA 13 libraries that aren't published as pip wheels
+  yet (checked: `nvidia-cublas-cu13` on PyPI is a version-`0.0.1` placeholder).
+- ComfyUI renders one graph at a time (a real GPU constraint), so the worker
+  pool's parallelism is in the CPU analysis and upload stages, not in sampling.
+  The CPU analysis stages themselves serialize behind a lock: the cached PyTorch
+  model instances aren't safe for concurrent forward passes (reproduced: two
+  simultaneous `/api/analyze` calls crashed inside MiDaS).
+- Batch runs and the queue are **in-process**. `batch.RUNS` is a dict and
+  `InProcessJobQueue` is an `asyncio.Queue`; restarting the server loses both.
+  They're deliberately small and serialisable so the move to Redis or a table is
+  cheap, and the `JobQueue` interface is already the seam for it — but that move
+  hasn't been made. The retention sweep covers the resulting orphans on disk,
+  and shutdown now drains rather than cancels — but a *crash* still loses
+  in-flight work, and no amount of graceful shutdown helps with a crash.
+- The attention queue is in memory too, so a restart clears it. Acceptable for
+  now because its items are transient by nature and the underlying conditions
+  re-raise themselves, but it means it is not an audit log and shouldn't be
+  mistaken for one.
+- Consent is recorded per **batch run**, not per person, and by default is not
+  enforced at all. A run is one operator's declaration covering the photos in
+  it, which fits how a booth actually operates but would not survive a
+  per-subject deletion request without matching people to filenames by hand.
+  Nothing here reaches the exposures that matter most at a live event — the
+  operator's screenshot, the camera roll on the capture device, the SD card —
+  and the manifest is a record, not a control.
+- **Budget ~16 GB of RAM.** Measured, not guessed: 9.4 GB once the CPU models
+  are warm, rising to a ~15 GB plateau under load (see the soak table). It is a
+  plateau and not a leak — the second 40 photos added 105 MB — but the first
+  number is what the box has to have.
+- The soak numbers come from a *fake* ComfyUI, so they measure this app's
+  overhead and admission behaviour and say nothing about GPU throughput. That is
+  deliberate, but it means "12.7s per photo" is a CPU-analysis figure and a real
+  run is dominated by the sampler instead.
+- The watchdog can only recover a render that ComfyUI still has in `/history`.
+  If ComfyUI is restarted, the history goes with it and those jobs are failed —
+  correctly, but the picture is genuinely gone.
+- The stage set is five hand-tuned presets, not a scene description language. A
+  look that wants something the presets don't model — a doorway, a table in
+  the foreground, a low camera — has no way to ask for it beyond the prompt.
+- The subject grade is grey-world colour balance, not relighting. It fixes the
+  case where the plate and the subject disagree about the *colour* of the
+  light. It cannot fix a disagreement about its *direction* — a subject lit
+  flat from the front, dropped into a scene with a hard low sun, still reads
+  wrong, and no amount of channel gain moves a shadow.
+- The illumination estimate is classic CV (per-quadrant luminance, highlight
+  color, contrast), not a learned model — a useful heuristic for
+  prompt-grounding, not a physically accurate light probe.
+- Generate Background / Relight always condition on the *original* uploaded
+  photo's mask/depth, not the current live composite — so an object added via
+  the region-draw tool stays in place (drawn on top) but isn't re-conditioned if
+  you regenerate the background afterward, and can end up visually mismatched
+  with the new scene. The UI surfaces an explicit warning when this would happen
+  rather than silently producing a mismatched result; region-edit itself doesn't
+  have this problem, since it conditions on the current composite directly.
+- No authentication. It's a LAN/booth tool as it stands; putting it on a network
+  where strangers can reach it would need auth in front of `/api/batch` first,
+  since that endpoint writes files and queues GPU work. Consent capture assumes
+  the operator is trusted — it records a declaration, it cannot verify one.
 
 ## Where this goes next
 
-- Runway/Kling `generate_video()` implementations (their APIs already
-  support image-to-video/text-to-video).
-- Feed effect *parameter values* (not just names) into the resync prompt
-  — e.g. a Colorize hue value as an actual color descriptor.
-- Photo booth: multi-region batch edits in one generation pass instead of
-  one masked region at a time; GPU-accelerated rotoscope once CUDA 13
-  onnxruntime wheels are published; re-conditioning Generate
-  Background/Relight on the *current* composite instead of always the
-  original upload (see Known limitations above).
+- Move `batch.RUNS` and the queue out of process (Redis), which is the one
+  change that would make this horizontally scalable rather than a single box.
+- Multi-region batch edits in one generation pass instead of one masked region
+  at a time.
+- GPU-accelerated rotoscope once CUDA 13 onnxruntime wheels are published —
+  ~20s/photo of CPU is the single biggest number in a batch run.
+- Re-condition Generate Background/Relight on the *current* composite instead of
+  always the original upload (see Known limitations).
 - Per-layer Spout output — right now the photo booth sends one flattened
   composite; for an actual on-set mixed-reality setup, each layer group
-  (background, subject, added objects) as its own named Spout source
-  would let a projection-mapping tool place them independently on real
-  projectors/LED panels instead of one flattened, already-composited
-  frame.
-- RAW format support / direct camera tethering (gPhoto2/PTP) for the
-  photo booth's input side, instead of `<input type=file>` only.
+  (background, subject, added objects) as its own named Spout source would let a
+  projection-mapping tool place them independently on real projectors/LED panels
+  instead of one flattened, already-composited frame.
+- RAW format support / direct camera tethering (gPhoto2/PTP) for the input side,
+  instead of `<input type=file>` only.
+
+---
+
+## Also in this repo
+
+**[Resolume live VJ bridge →](docs/resolume-bridge.md)** — the build this repo
+started as: a Resolume-to-generative-AI bridge that turns clip triggers, or
+Resolume's own live composition state, into image/video generations streamed
+back as a Spout source. It shares the ComfyUI plumbing and `spout_output.py`
+with the photo booth, and is kept because it still runs.

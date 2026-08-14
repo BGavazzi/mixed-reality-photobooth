@@ -277,6 +277,65 @@ def workflow_model_names() -> dict:
     return wanted
 
 
+def check_workflow_roles(resolve, source_name: str):
+    """Confirms the shipped workflow still has the nodes the backend patches.
+
+    Takes the resolver as an argument for the same reason every other check
+    here takes its facts: this has to be testable against a broken workflow
+    without shipping one. `resolve` is workflow_graph.load partially applied,
+    and is imported lazily by the caller -- doctor.py must keep working on a
+    bare interpreter, and workflow_graph is stdlib-only, so this costs nothing.
+    """
+    try:
+        resolved = resolve()
+    except Exception as exc:
+        return Finding(
+            FAIL, f"workflow: {source_name} is missing nodes the app needs",
+            f"  {ascii_only(exc)}",
+            "Re-export the workflow from ComfyUI with 'Save (API format)', "
+            "or run: python workflow_graph.py",
+        )
+    return Finding(
+        OK, f"workflow: {source_name} resolves all {len(resolved.roles)} roles",
+        f"  seed field: {resolved.seed_field}",
+    )
+
+
+def check_brand_kits(brands, expected_dirs: int):
+    """Reports loaded brand kits, and specifically catches the silent case.
+
+    load_brands() skips a malformed pack rather than raising -- correct
+    behaviour mid-event, where losing one client beats losing the booth, but
+    it means a typo shows up as a brand that simply isn't in the dropdown.
+    Comparing what loaded against what is on disk is the only way that
+    surfaces before someone goes looking for a client that vanished.
+    """
+    if expected_dirs == 0:
+        return Finding(
+            OK, "brand kits: none installed",
+            "  Optional. Without them the app is the free-prompt tool it "
+            "has always been; add a directory under brands/ to enable them.",
+        )
+    if len(brands) < expected_dirs:
+        return Finding(
+            FAIL, f"brand kits: only {len(brands)} of {expected_dirs} pack(s) loaded",
+            "  A pack with malformed brand.json is skipped at startup, so the "
+            "client just won't appear in the dropdown.\n"
+            f"  Loaded: {', '.join(sorted(brands)) or 'none'}",
+            "python -c \"import brand_kit; brand_kit.load_brands()\"   "
+            "(prints the reason each pack was skipped)",
+        )
+    detail_lines = []
+    for brand in brands.values():
+        logo = "logo" if brand.logo else "no logo"
+        detail_lines.append(f"  {brand.id}: {len(brand.looks)} looks, "
+                            f"seed {brand.seed_policy}, {logo}")
+    return Finding(
+        OK, f"brand kits: {len(brands)} loaded",
+        "\n".join(detail_lines),
+    )
+
+
 def available_model_names(address: str) -> dict:
     """Asks ComfyUI which model files it can actually see on disk -- the same
     enum the loader node itself would validate against."""
@@ -353,6 +412,30 @@ def main():
     if want_backends:
         findings.append(packages_finding("hosted backends", BACKEND_PACKAGES, is_installed,
                                           "requirements-backends.txt", level_if_missing=WARN))
+
+    # Both of these read repo files rather than the environment, so they are
+    # useful even with nothing installed and ComfyUI down -- which is exactly
+    # when someone runs this. Imported here rather than at module scope to keep
+    # the promise in the docstring literal: doctor.py must be runnable on a
+    # bare interpreter, and a checkout missing either module should degrade to
+    # a warning rather than a traceback.
+    try:
+        import workflow_graph
+        findings.append(check_workflow_roles(
+            lambda: workflow_graph.load(PHOTOSHOOT_WORKFLOW),
+            PHOTOSHOOT_WORKFLOW.name))
+    except ImportError as exc:
+        findings.append(Finding(WARN, "workflow: could not check node roles",
+                                f"  {ascii_only(exc)}"))
+
+    try:
+        import brand_kit
+        pack_dirs = [p for p in brand_kit.BRANDS_DIR.iterdir()
+                     if (p / "brand.json").exists()] if brand_kit.BRANDS_DIR.is_dir() else []
+        findings.append(check_brand_kits(brand_kit.load_brands(), len(pack_dirs)))
+    except ImportError as exc:
+        findings.append(Finding(WARN, "brand kits: could not check",
+                                f"  {ascii_only(exc)}"))
 
     comfy_finding, reachable = check_comfyui(args.comfy)
     findings.append(comfy_finding)

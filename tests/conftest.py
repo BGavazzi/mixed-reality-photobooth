@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from pathlib import Path
 
@@ -7,6 +8,33 @@ from PIL import Image, ImageDraw
 # The project is a flat set of top-level modules rather than an installed
 # package, so tests import them the same way the entry points do.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+def run_queued(coro_factory):
+    """Runs a coroutine with the server's generation queue started, then
+    waits for everything it enqueued to be submitted.
+
+    Generation submission moved behind a worker pool (job_queue.py), so a
+    test that calls a handler and immediately asserts on the backend is
+    asserting before the worker has run. This is the seam's cost, paid once
+    here rather than as a sleep in every test.
+
+    `coro_factory` is a zero-arg callable rather than a coroutine because the
+    coroutine has to be created inside the loop that will run it.
+    """
+    import web_server
+
+    async def main():
+        queue = web_server.GENERATION_QUEUE
+        await queue.start()
+        try:
+            result = await coro_factory()
+            await queue.drain()
+            return result
+        finally:
+            await queue.stop()
+
+    return asyncio.run(main())
 
 
 @pytest.fixture

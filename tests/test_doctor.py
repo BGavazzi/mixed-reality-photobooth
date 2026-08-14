@@ -254,6 +254,82 @@ def test_doctor_source_is_pure_ascii():
     assert not non_ascii, f"doctor.py must stay ASCII-only, found: {non_ascii}"
 
 
+# --- workflow roles ---------------------------------------------------------
+
+def test_a_resolvable_workflow_passes_and_names_the_seed_field():
+    class Resolved:
+        roles = {"a": "1", "b": "2"}
+        seed_field = "noise_seed"
+
+    finding = doctor.check_workflow_roles(lambda: Resolved(), "video.json")
+    assert finding.level == doctor.OK
+    assert "2 roles" in finding.title
+    assert "noise_seed" in finding.detail
+
+
+def test_an_unresolvable_workflow_is_a_hard_failure_with_the_fix_command():
+    """This one genuinely stops generation, so it must not be a warning."""
+    def boom():
+        raise ValueError("no ControlNetApplyAdvanced node")
+
+    finding = doctor.check_workflow_roles(boom, "photoshoot_bg_api.json")
+    assert finding.level == doctor.FAIL
+    assert "no ControlNetApplyAdvanced" in finding.detail
+    assert "workflow_graph.py" in finding.fix
+
+
+def test_workflow_role_failure_survives_a_localised_os_error():
+    def boom():
+        raise OSError("Nao foi possivel encontrar o arquivo — caminho invalido")
+
+    finding = doctor.check_workflow_roles(boom, "x.json")
+    assert finding.detail.isascii()
+
+
+def test_the_real_shipped_workflow_resolves():
+    """Runs the actual resolver against the actual file, which is the only
+    version of this check that can catch a bad re-export."""
+    import workflow_graph
+    finding = doctor.check_workflow_roles(
+        lambda: workflow_graph.load(doctor.PHOTOSHOOT_WORKFLOW),
+        doctor.PHOTOSHOOT_WORKFLOW.name)
+    assert finding.level == doctor.OK
+
+
+# --- brand kits -------------------------------------------------------------
+
+class FakeBrand:
+    def __init__(self, brand_id, looks=2, logo=True, seed_policy="locked"):
+        self.id = brand_id
+        self.looks = tuple(range(looks))
+        self.logo = object() if logo else None
+        self.seed_policy = seed_policy
+
+
+def test_no_brand_kits_installed_is_fine():
+    """Running without kits is the app's original behaviour, not a fault."""
+    finding = doctor.check_brand_kits({}, expected_dirs=0)
+    assert finding.level == doctor.OK
+    assert "Optional" in finding.detail
+
+
+def test_loaded_kits_are_summarised():
+    finding = doctor.check_brand_kits({"acme": FakeBrand("acme", looks=3)}, expected_dirs=1)
+    assert finding.level == doctor.OK
+    assert "acme: 3 looks" in finding.detail
+
+
+def test_a_skipped_pack_is_a_hard_failure_naming_the_shortfall():
+    """The silent case this check exists for: load_brands() drops a malformed
+    pack rather than raising, so the only symptom is a client missing from the
+    dropdown -- which nobody notices until they go looking for it."""
+    finding = doctor.check_brand_kits({"acme": FakeBrand("acme")}, expected_dirs=3)
+    assert finding.level == doctor.FAIL
+    assert "1 of 3" in finding.title
+    assert "acme" in finding.detail
+    assert finding.fix
+
+
 def test_doctor_imports_only_the_standard_library():
     """It has to run on a bare interpreter, before pip has done anything --
     that's the entire reason it's useful for install problems."""

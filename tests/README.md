@@ -17,13 +17,28 @@ They cover the parts of the pipeline that are pure logic and were previously
 verified only by eye during a live demo — mask cleanup, illumination
 estimation, resolution capping, ControlNet-strength heuristics, provenance
 extraction, cover-fit geometry, the Resolume prompt descriptors, the
-`/api/analyze` request handling, `doctor.py`'s diagnosis logic, and the
-multi-session job routing in `web_server.py` (against a fake backend, so the
-routing is tested without a GPU in the loop).
+`/api/analyze` request handling, `doctor.py`'s diagnosis logic, brand-kit
+parsing and prompt composition, workflow role resolution, the generation
+queue, and the multi-session job routing in `web_server.py` (against a fake
+backend, so the routing is tested without a GPU in the loop).
 
 `test_doctor.py` is the reason the checks in `doctor.py` take their facts as
 arguments rather than discovering them: a diagnostic can only be tested
 against a broken environment if it doesn't need to *be* in one.
+
+`test_brand_enforcement.py` is a different shape from the rest and worth
+reading as such: it drives the real websocket handlers with a recording
+backend to assert a *security-ish* property rather than a computed value --
+that the browser can only ever send `{brand_id, look_id, free text}`, and
+that a request smuggling its own `negative_prompt` or `seed` is ignored. If
+that stops holding, a modified client could drop a client's blocklist while
+every other brand-kit test still passed.
+
+`test_workflow_graph.py` is mostly about *refusing to guess*. It resolves
+workflow node ids from graph structure, and the dangerous failure is not
+"found nothing" (which raises) but "found the wrong node of the right kind" --
+writing a prompt into the negative conditioning produces a plausible bad
+image that reads as a model problem rather than a bug.
 
 ## Why this exists separately from the `verify_*.py` scripts
 

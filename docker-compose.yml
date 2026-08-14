@@ -1,0 +1,74 @@
+# Two services, because they are two different problems.
+#
+#   photobooth  -- the FastAPI app and the CV pipeline. CPU, small, rebuilt often.
+#   comfyui     -- the GPU renderer. Large, needs the NVIDIA container runtime,
+#                  and needs model weights that are not this repo's to ship.
+#
+# The split is the point: `docker compose up photobooth` against a ComfyUI
+# already running on the host (or on a GPU box across the LAN) is the common
+# case, and does not require the GPU profile below to work at all.
+#
+#   # app only, talking to a ComfyUI you already run
+#   docker compose up photobooth
+#
+#   # both, on a machine with an NVIDIA GPU and the container toolkit
+#   docker compose --profile gpu up
+#
+# -> http://127.0.0.1:8000
+
+services:
+  photobooth:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Overridden by the `gpu` profile's service name when running both.
+      # host.docker.internal resolves to the host from inside the container on
+      # Docker Desktop (Windows/macOS); on Linux the extra_hosts entry below
+      # provides the same name, since it isn't built in there.
+      COMFY_ADDRESS: "${COMFY_ADDRESS:-host.docker.internal:8188}"
+      GENERATION_WORKERS: "${GENERATION_WORKERS:-2}"
+      GENERATION_QUEUE_DEPTH: "${GENERATION_QUEUE_DEPTH:-64}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # rembg/MiDaS/OpenPose weights: ~500MB, fetched on first use. Without a
+      # volume every `docker compose up` after a rebuild re-downloads them,
+      # which turns a 5-second restart into a 5-minute one.
+      - model-cache:/models
+      # Brand kits are configuration, not code. Mounting them read-only means a
+      # client's kit can be added or corrected without rebuilding the image --
+      # and read-only because nothing in the app should ever write here.
+      - ./brands:/app/brands:ro
+    restart: unless-stopped
+
+  comfyui:
+    # Under a profile so the default `up` doesn't try to pull a multi-gigabyte
+    # image or fail on a machine with no NVIDIA runtime.
+    profiles: ["gpu"]
+    image: ghcr.io/ai-dock/comfyui:latest
+    ports:
+      - "8188:8188"
+    environment:
+      # --preview-method auto is what makes ComfyUI emit the binary
+      # mid-denoise preview frames this app relays to the browser. Without it
+      # the live preview silently degrades to progress numbers only.
+      COMFYUI_FLAGS: "--preview-method auto --listen 0.0.0.0"
+    volumes:
+      # Checkpoints are not shipped here and cannot be: RealVisXL and the SDXL
+      # depth ControlNet are ~7GB of third-party weights. Put them on the host
+      # under ./comfyui-models and they appear in the container.
+      #   comfyui-models/checkpoints/RealVisXL_V5.0_fp16.safetensors
+      #   comfyui-models/controlnet/diffusers_xl_depth_full.safetensors
+      - ./comfyui-models:/opt/ComfyUI/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  model-cache:
